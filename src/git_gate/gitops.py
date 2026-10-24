@@ -26,9 +26,11 @@ EMPTY = "empty"
 ALLOWED_KEYS = re.compile(
     r"^(?:"
     r"core\.(?:repositoryformatversion|filemode|bare|logallrefupdates|ignorecase"
-    r"|precomposeunicode|symlinks|autocrlf)"
+    r"|precomposeunicode|symlinks|autocrlf"
+    r"|hookspath)"  # the gate's git never reads this config, and runs no hooks
     r"|remote\.origin\.(?:url|fetch)"
-    r"|branch\..+\.(?:remote|merge|rebase|description|vscode-merge-base)"
+    r"|branch\..+\.(?:remote|merge|rebase|description|vscode-merge-base"
+    r"|github-pr-owner-number|github-pr-base-branch)"  # PR links the VS Code PR extension writes
     r"|extensions\.objectformat"
     r"|user\.(?:name|email)"
     r"|pull\.(?:rebase|ff)"

@@ -85,6 +85,14 @@ def test_config_key_allowlist(env, checkout, key, value):
         call(env, "fetch", repo="me/app", path=str(checkout))
 
 
+def test_everyday_config_keys_pass(env, checkout):
+    """Keys real clones carry (claude-skills has all of these) must not block the gate."""
+    git("config", "core.hooksPath", ".githooks", cwd=checkout)
+    git("config", "branch.feat/x.github-pr-owner-number", "PineappleEmperor#ha-skills#12", cwd=checkout)
+    git("config", "branch.feat/x.github-pr-base-branch", "PineappleEmperor#ha-skills#main", cwd=checkout)
+    call(env, "fetch", repo="me/app", path=str(checkout))
+
+
 def test_remote_url_must_match_repo(env, checkout):
     git("config", "remote.origin.url", "https://github.com/other/lib.git", cwd=checkout)
     with pytest.raises(Refused, match="remote.origin.url"):
