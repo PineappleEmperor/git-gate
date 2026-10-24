@@ -314,6 +314,14 @@ class Git:
                 heads[ref.removeprefix("refs/heads/")] = sha
         return heads
 
+    def workflows_differ(self, a: str, b: str, git_dir: Shadow, rules: Rules) -> bool:
+        out = self.run(
+            ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", a, b, "--", WORKFLOWS],
+            timeout=rules.git_timeout,
+            git_dir=git_dir,
+        )
+        return bool(out.stdout.strip("\0"))
+
     def workflow_touches(self, shas: list[str], git_dir: Path, rules: Rules) -> list[str]:
         """Commits among shas whose own changes touch .github/workflows/ (merges: dense combined)."""
         if not shas:

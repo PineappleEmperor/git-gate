@@ -347,6 +347,35 @@ def test_evil_merge_editing_workflow_refused(env, checkout):
         call(env, "push", repo="me/app", path=str(checkout), branch="topic")
 
 
+def test_merge_rolling_workflow_back_to_older_version_refused(env, checkout):
+    """Dense-combined diffs hide a merge that keeps one parent's older workflow; the tree check must not."""
+    seed = env.tmp / "seed"
+    old = commit(seed, ".github/workflows/ci.yml", "v1")
+    commit(seed, ".github/workflows/ci.yml", "v2")
+    git("push", "-q", env.url, "main", cwd=seed)
+    call(env, "fetch", repo="me/app", path=str(checkout))
+    git("switch", "-q", "-c", "side", old, cwd=checkout)
+    commit(checkout, "side.txt")
+    git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
+    commit(checkout, "topic.txt")
+    git("merge", "-q", "--no-commit", "side", cwd=checkout)
+    git("checkout", "side", "--", ".github/workflows/ci.yml", cwd=checkout)
+    git("commit", "-q", "--no-edit", cwd=checkout)
+    assert (checkout / ".github/workflows/ci.yml").read_text() == "v1"
+    with pytest.raises(Refused, match="workflows"):
+        call(env, "push", repo="me/app", path=str(checkout), branch="topic")
+
+
+def test_stale_fork_without_workflow_changes_passes(env, checkout):
+    """Main gaining a workflow change after the fork is not this branch's change."""
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "topic.txt")
+    seed = env.tmp / "seed"
+    commit(seed, ".github/workflows/ci.yml", "on: push")
+    git("push", "-q", env.url, "main", cwd=seed)
+    assert "Pushed" in call(env, "push", repo="me/app", path=str(checkout), branch="topic")
+
+
 def test_push_never_sends_tags(env, checkout):
     git("switch", "-q", "-c", "t", cwd=checkout)
     commit(checkout, "a.txt")

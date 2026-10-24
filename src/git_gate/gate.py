@@ -212,6 +212,16 @@ class Gate:
                 ["rev-list", local, *(["--not", base] if base else [])], timeout=t, git_dir=sd
             ).stdout.split()
             touched = self.git.workflow_touches(new, sd, rules)
+            if not touched and base:
+                # Per-commit diffs miss a merge that takes an older workflow from one parent, so also
+                # compare the whole tree with the remote branch, or with where it forked from default.
+                fork = (
+                    remote
+                    or self.git.run(["merge-base", base, local], timeout=t, git_dir=sd, check=False).stdout.strip()
+                    or base
+                )
+                if self.git.workflows_differ(fork, local, sd, rules):
+                    touched = [local]
             if touched:
                 raise Refused(
                     f"Commits {', '.join(c[:12] for c in touched)} touch .github/workflows/, which the gate never "
