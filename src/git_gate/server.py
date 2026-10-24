@@ -64,7 +64,7 @@ def build(gate: Gate | None = None) -> MCPServer:
     async def gh(repo: str, args: list[str]) -> str:
         """Run `gh <args>` against `repo` (forced; do not pass -R).
 
-        Allowed: pr view/list/diff/checks/create/edit/comment/review/close/reopen/ready/merge,
+        Allowed: pr view/list/diff/checks/create/edit/comment/review/close/reopen/ready,
         issue view/list/create/edit/comment/close/reopen, run list/view/watch/download/rerun/cancel,
         workflow list/view, release list/view/download, label list/create/edit, repo view,
         and api (GET only, endpoints under repos/{owner}/{repo}).

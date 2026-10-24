@@ -24,6 +24,7 @@ def test_repo_is_forced():
         ["pr", "view", "https://github.com/other/x/pull/1"],
         ["pr", "view", "github.com/other/x/pull/1"],
         ["pr", "merge", "1", "--admin"],
+        ["pr", "merge", "1", "--squash"],
         ["pr", "view", "1", "--web"],
         ["pr", "create", "--recover", "/etc/passwd"],
         ["pr", "list", "--owner", "other"],

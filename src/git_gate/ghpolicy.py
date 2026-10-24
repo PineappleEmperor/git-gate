@@ -17,7 +17,7 @@ READ = {
 }  # fmt: skip
 WRITE = {
     ("pr", "create"), ("pr", "edit"), ("pr", "comment"), ("pr", "review"), ("pr", "close"),
-    ("pr", "reopen"), ("pr", "ready"), ("pr", "merge"),
+    ("pr", "reopen"), ("pr", "ready"),
     ("issue", "create"), ("issue", "edit"), ("issue", "comment"), ("issue", "close"),
     ("issue", "reopen"),
     ("run", "rerun"), ("run", "cancel"),
@@ -30,6 +30,7 @@ REFUSED_HINTS = {
     ("release", "edit"): "releases move tags, which stay manual",
     ("release", "upload"): "release changes stay manual",
     ("issue", "develop"): "it creates a remote branch outside push's rules; push a branch instead",
+    ("pr", "merge"): "merging lands code on the base branch, which stays the user's to do",
     ("search", "issues"): "GitHub ORs repo: qualifiers, so it cannot be held to one repo; use issue list --search",
     ("search", "prs"): "GitHub ORs repo: qualifiers, so it cannot be held to one repo; use pr list --search",
 }
