@@ -103,9 +103,8 @@ class Git:
         check: bool = True,
         stdin: str | None = None,
     ) -> subprocess.CompletedProcess:
-        fds: tuple[int, ...] = ()
         if isinstance(git_dir, Shadow):
-            git_dir, fds = git_dir.path, (git_dir.objects_fd,)
+            git_dir = git_dir.path
         try:
             proc = subprocess.run(
                 [self.git, *args],
@@ -116,7 +115,6 @@ class Git:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                pass_fds=fds,
             )
         except subprocess.TimeoutExpired:
             raise Refused(f"git {args[0]} timed out after {timeout}s.") from None
@@ -238,11 +236,11 @@ class Git:
     def shadow(self, rules: Rules, repo: Repo):
         """A gate-owned GIT_DIR in which git never writes, or follows a path, into the agent's .git.
 
-        objects/ is the gate's own, with the agent's objects as an alternate reached through a
-        file descriptor opened here (/proc/self/fd/N, inherited by git), so swapping a directory
-        afterwards changes nothing. refs live in a packed-refs snapshot the gate reads itself,
-        skipping symlinks. New objects and refs are written back by `write_back`, through
-        directory handles, never through a path the agent can redirect.
+        objects/ is the gate's own: the agent's object files are hardlinked into it (copied across
+        filesystems), skipping info/, so an alternates file the agent plants is never read and
+        swapping a directory afterwards changes nothing. refs live in a packed-refs snapshot the
+        gate reads itself, skipping symlinks. New objects and refs are written back by
+        `write_back`, through directory handles, never through a path the agent can redirect.
         """
         key = hashlib.sha256(str(repo.gitdir).encode()).hexdigest()[:24]
         with self.lock(key):
@@ -254,7 +252,6 @@ class Git:
                     raise Refused(f"{repo.gitdir} moved while the gate was checking it.")
                 check_inside(rules, repo.gitdir, "Repository .git")
                 objects_fd = _open_dir("objects", fds, gfd)
-                _refuse_alternates(objects_fd, repo.gitdir)
                 refs_fd = _open_dir("refs", fds, gfd)
                 for name, fd in (("objects", objects_fd), ("refs", refs_fd)):
                     if fd_path(fd) != repo.gitdir / name:
@@ -266,7 +263,7 @@ class Git:
                 (d / "objects/info").mkdir(parents=True, mode=0o700)
                 (d / "objects/pack").mkdir()
                 (d / "refs").mkdir()
-                (d / "objects/info/alternates").write_text(f"/proc/self/fd/{objects_fd}\n")
+                _link_objects(objects_fd, d / "objects", skip={"info"})
                 version = "1" if repo.object_format == "sha256" else "0"
                 config = f"[core]\n\trepositoryformatversion = {version}\n\tbare = true\n\tlogallrefupdates = false\n"
                 if repo.object_format == "sha256":
@@ -354,20 +351,44 @@ def _open_dir(path: str | Path, fds: list[int], dir_fd: int | None = None) -> in
     return fd
 
 
-def _refuse_alternates(objects_fd: int, gitdir: Path) -> None:
-    """Alternates would let git read, and push, objects from any repository on disk."""
-    try:
-        info = os.open("info", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=objects_fd)
-    except FileNotFoundError:
-        return
-    except OSError:
-        raise Refused(f"{gitdir}/objects/info must be a real directory.") from None
-    try:
-        for name in ("alternates", "http-alternates"):
-            if _exists(info, name):
-                raise Refused(f"{gitdir}/objects/info/{name} exists; the gate does not follow alternates.")
-    finally:
-        os.close(info)
+def _link_objects(src_fd: int, dst: Path, skip: set[str] = frozenset()) -> None:
+    """Hardlink the agent's object files into a gate-owned dir, copying across filesystems.
+
+    Symlinks are skipped, and each link is checked after it is made: a file swapped for a
+    symlink between listing and linking yields a symlink, which is removed. Lock and temp
+    files of a concurrent git in the sandbox come along too; git ignores them.
+    """
+    dst.mkdir(mode=0o700, exist_ok=True)
+    for entry in os.scandir(src_fd):
+        name = entry.name
+        if name in skip or entry.is_symlink():
+            continue
+        target = dst / name
+        if entry.is_dir(follow_symlinks=False):
+            sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=src_fd)
+            try:
+                _link_objects(sub, target)
+            finally:
+                os.close(sub)
+            continue
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        try:
+            os.link(name, target, src_dir_fd=src_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue  # removed by a concurrent git in the sandbox
+        except OSError:
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=src_fd)
+            except OSError:
+                continue
+            with os.fdopen(fd, "rb") as f:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    continue
+                with open(target, "xb") as out:
+                    shutil.copyfileobj(f, out)
+        if not stat.S_ISREG(target.lstat().st_mode):
+            target.unlink()
 
 
 def _parse_packed(data: bytes) -> dict[str, str]:

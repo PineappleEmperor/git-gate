@@ -1,5 +1,6 @@
 import json
 import shutil
+import subprocess
 
 import pytest
 
@@ -376,11 +377,34 @@ def test_stale_fork_without_workflow_changes_passes(env, checkout):
     assert "Pushed" in call(env, "push", repo="me/app", path=str(checkout), branch="topic")
 
 
-def test_alternates_refused(env, checkout):
+def test_alternates_never_reach_the_gate(env, checkout):
+    """The attack: alternates point at a repo the sandbox can't read, and a commit names one of its blobs."""
+    secret = env.tmp / "secret"
+    secret.mkdir()
+    git("init", "-q", cwd=secret)
+    commit(secret, "key.txt", "TOP SECRET")
+    blob = git("rev-parse", "HEAD:key.txt", cwd=secret)
     (checkout / ".git/objects/info").mkdir(exist_ok=True)
-    (checkout / ".git/objects/info/alternates").write_text(f"{env.bare}/objects\n")
-    with pytest.raises(Refused, match="alternates"):
-        call(env, "fetch", repo="me/app", path=str(checkout))
+    (checkout / ".git/objects/info/alternates").write_text(f"{secret}/.git/objects\n")
+    tree = git("mktree", cwd=checkout, input=f"100644 blob {blob}\tleak.txt\n")
+    leak = git("commit-tree", tree, "-p", "HEAD", "-m", "leak", cwd=checkout)
+    git("update-ref", "refs/heads/leak", leak, cwd=checkout)
+    call(env, "fetch", repo="me/app", path=str(checkout))  # an alternates file alone is harmless
+    with pytest.raises(Refused, match="push"):
+        call(env, "push", repo="me/app", path=str(checkout), branch="leak")
+    with pytest.raises(subprocess.CalledProcessError):
+        git("cat-file", "-e", blob, cwd=env.bare)
+
+
+def test_objects_are_linked_not_followed(env, checkout):
+    """A symlink planted among the object files is skipped, not followed."""
+    outside = env.tmp / "outside.pack"
+    outside.write_text("not a pack")
+    (checkout / ".git/objects/pack/pack-evil.pack").symlink_to(outside)
+    sha = _new_upstream_commit(env)
+    call(env, "fetch", repo="me/app", path=str(checkout))
+    assert git("rev-parse", "refs/remotes/origin/main", cwd=checkout) == sha
+    assert outside.read_text() == "not a pack"
 
 
 def test_push_never_sends_tags(env, checkout):

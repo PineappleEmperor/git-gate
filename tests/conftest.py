@@ -8,7 +8,7 @@ from git_gate.gate import Gate
 TOKEN = "github_pat_TESTTOKEN0123456789"
 
 
-def git(*args: str, cwd: Path | None = None, env: dict | None = None) -> str:
+def git(*args: str, cwd: Path | None = None, env: dict | None = None, input: str | None = None) -> str:
     base = {
         "PATH": "/usr/bin:/bin",
         "HOME": str(cwd or Path.cwd()),
@@ -21,7 +21,7 @@ def git(*args: str, cwd: Path | None = None, env: dict | None = None) -> str:
     }
     out = subprocess.run(
         ["git", "-c", "init.defaultBranch=main", "-c", "protocol.file.allow=always", *args],
-        cwd=cwd, env=base | (env or {}), check=True, capture_output=True, text=True,
+        cwd=cwd, env=base | (env or {}), check=True, capture_output=True, text=True, input=input,
     )  # fmt: skip
     return out.stdout.strip()
 
