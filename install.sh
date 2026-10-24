@@ -32,25 +32,43 @@ die() { echo "install.sh: $*" >&2; exit 1; }
 
 [ "$(id -u)" -ne 0 ] || die "run as yourself; the script calls sudo where it needs root."
 
-# git against the dev repo through a throwaway GIT_DIR: the repo's own config, hooks, attributes
-# and replace refs are never read, because the sandbox can write them.
-SHADOW=
-shadow_git() {
-    if [ -z "$SHADOW" ]; then
-        [ -d "$REPO/.git" ] && [ ! -L "$REPO/.git" ] || die "$REPO/.git is not a directory."
-        SHADOW=$(mktemp -d)
-        printf '[core]\n\trepositoryformatversion = 0\n\tbare = true\n' > "$SHADOW/config"
-        echo "ref: refs/heads/main" > "$SHADOW/HEAD"
-        for n in objects refs packed-refs; do ln -s "$REPO/.git/$n" "$SHADOW/$n"; done
-    fi
-    env -i PATH=/usr/bin:/bin HOME="$SHADOW" LANG=C.UTF-8 GIT_DIR="$SHADOW" \
+# The dev repo is sandbox-writable, so it is only read through a throwaway GIT_DIR (shadow/: its
+# config, hooks, attributes and replace refs are never read) and only once: the commits are
+# fetched from it into private.git, which hashes every object it receives. The review and the
+# install both come from private.git, so swapping object files in the dev repo after you have
+# read the diff changes nothing.
+WORK=
+git_in() {
+    dir=$1; shift
+    env -i PATH=/usr/bin:/bin HOME="$WORK" LANG=C.UTF-8 GIT_DIR="$WORK/$dir" \
         GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
-        git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat --no-pager "$@"
+        git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat \
+        -c protocol.file.allow=always -c transfer.fsckObjects=true --no-pager "$@"
+}
+shadow_git() { git_in shadow "$@"; }
+priv_git() { git_in private.git "$@"; }
+
+prepare() {
+    [ -d "$REPO/.git" ] && [ ! -L "$REPO/.git" ] || die "$REPO/.git is not a directory."
+    WORK=$(mktemp -d)
+    mkdir "$WORK/shadow"
+    printf '[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowAnySHA1InWant = true\n' \
+        > "$WORK/shadow/config"
+    echo "ref: refs/heads/main" > "$WORK/shadow/HEAD"
+    for n in objects refs packed-refs; do ln -s "$REPO/.git/$n" "$WORK/shadow/$n"; done
+    git_in private.git init -q --bare "$WORK/private.git"
+}
+
+# Copy one commit and everything it needs into private.git, verifying every object's hash.
+take() {
+    [ "$(shadow_git cat-file -t "$1" 2>/dev/null)" = commit ] || return 1
+    priv_git fetch -q --no-tags "$WORK/shadow" "$1" || die "fetching $1 from $REPO failed its integrity check."
+    [ "$(priv_git cat-file -t "$1")" = commit ] || die "$1 did not arrive intact."
 }
 
 STAGE=
 cleanup() {
-    [ -z "$SHADOW" ] || rm -rf "$SHADOW"
+    [ -z "$WORK" ] || rm -rf "$WORK"
     [ -z "$STAGE" ] || sudo rm -rf "$STAGE"
 }
 trap cleanup EXIT INT TERM
@@ -83,27 +101,28 @@ cmd_list() {
 cmd_install() {
     sha=$1
     check_sha "$sha"
-    [ "$(shadow_git cat-file -t "$sha" 2>/dev/null)" = commit ] || die "$sha is not a commit in $REPO."
     [ ! -e "$RELEASES/$sha" ] || die "$RELEASES/$sha already exists; use rollback to switch to it."
+    prepare
+    take "$sha" || die "$sha is not a commit in $REPO."
 
-    if shadow_git ls-tree -r "$sha" | awk '$1 == "120000" || $1 == "160000" { found = 1 } END { exit !found }'; then
+    if priv_git ls-tree -r "$sha" | awk '$1 == "120000" || $1 == "160000" { found = 1 } END { exit !found }'; then
         die "$sha contains symlinks or submodules; refusing to extract it as root."
     fi
 
     "$PYTHON" -c 'import sys; sys.exit(sys.version_info[:2] != (3, 14))' || die "$PYTHON is not Python 3.14."
 
     cur=$(current_sha)
-    if [ -n "$cur" ] && [ "$(shadow_git cat-file -t "$cur" 2>/dev/null)" = commit ]; then
+    if [ -n "$cur" ] && take "$cur"; then
         base=$cur
         echo "Diff from current release $cur to $sha:"
     else
-        base=$(shadow_git hash-object -t tree /dev/null)
+        base=$(priv_git hash-object -t tree /dev/null)
         echo "No current release in this repo's history; showing every file in $sha:"
     fi
-    shadow_git diff --stat "$base" "$sha"
+    priv_git diff --stat "$base" "$sha"
     printf 'Review the full diff? [Y/n] '
     read -r ans
-    case $ans in [nN]*) ;; *) shadow_git diff "$base" "$sha" | ${PAGER:-less} ;; esac
+    case $ans in [nN]*) ;; *) priv_git diff "$base" "$sha" | ${PAGER:-less} ;; esac
     printf 'Install %s? [y/N] ' "$sha"
     read -r ans
     case $ans in [yY]*) ;; *) die "not installed." ;; esac
@@ -112,7 +131,7 @@ cmd_install() {
     STAGE=$RELEASES/.new-$sha
     sudo rm -rf "$STAGE"
     sudo install -d -o root -g root -m 0755 "$STAGE"
-    shadow_git archive --format=tar "$sha" | sudo tar -x -C "$STAGE" --no-same-owner --no-same-permissions
+    priv_git archive --format=tar "$sha" | sudo tar -x -C "$STAGE" --no-same-owner --no-same-permissions
     sudo $ROOT_ENV "$PYTHON" -I -m venv "$STAGE/.venv"
     sudo $ROOT_ENV "$STAGE/.venv/bin/python" -I -m pip install --quiet --disable-pip-version-check \
         --require-hashes --only-binary :all: --no-deps -r "$STAGE/requirements.lock"
