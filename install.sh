@@ -1,0 +1,149 @@
+#!/bin/sh
+# Install a reviewed git-gate commit into /opt/git-gate/releases/<sha> and point `current` at it.
+#
+# Run this as yourself from your own terminal, never from an agent session. It calls sudo for
+# the steps that write /opt/git-gate.
+#
+# The working tree of ~/git-gate is writable from the sandbox, so do not run its copy of this
+# script. First install: extract it from the commit you reviewed, read it, then run it:
+#
+#   git -C ~/git-gate cat-file blob <sha>:install.sh > ~/git-gate-install.sh
+#
+# Later installs: run the root-owned copy in the live release, /opt/git-gate/current/install.sh.
+#
+# Usage:
+#   install.sh install <sha> [--repo DIR] [--python PATH]
+#   install.sh rollback <sha>
+#   install.sh list
+set -eu
+
+ROOT=${GIT_GATE_ROOT:-/opt/git-gate}
+RELEASES=$ROOT/releases
+REPO=$HOME/git-gate
+PYTHON=$HOME/.pyenv/versions/3.14.4/bin/python3.14
+ROOT_ENV="env -i PATH=/usr/bin:/bin LANG=C.UTF-8 PIP_CONFIG_FILE=/dev/null PIP_NO_CACHE_DIR=1"
+# Keep a proxy and its CA, if you use one, for pip under sudo. Nothing else crosses over.
+for v in HTTPS_PROXY https_proxy NO_PROXY no_proxy PIP_CERT SSL_CERT_FILE; do
+    eval "val=\${$v:-}"
+    [ -z "$val" ] || ROOT_ENV="$ROOT_ENV $v=$val"
+done
+
+die() { echo "install.sh: $*" >&2; exit 1; }
+
+[ "$(id -u)" -ne 0 ] || die "run as yourself; the script calls sudo where it needs root."
+
+# git against the dev repo through a throwaway GIT_DIR: the repo's own config, hooks, attributes
+# and replace refs are never read, because the sandbox can write them.
+SHADOW=
+shadow_git() {
+    if [ -z "$SHADOW" ]; then
+        [ -d "$REPO/.git" ] && [ ! -L "$REPO/.git" ] || die "$REPO/.git is not a directory."
+        SHADOW=$(mktemp -d)
+        printf '[core]\n\trepositoryformatversion = 0\n\tbare = true\n' > "$SHADOW/config"
+        echo "ref: refs/heads/main" > "$SHADOW/HEAD"
+        for n in objects refs packed-refs; do ln -s "$REPO/.git/$n" "$SHADOW/$n"; done
+    fi
+    env -i PATH=/usr/bin:/bin HOME="$SHADOW" LANG=C.UTF-8 GIT_DIR="$SHADOW" \
+        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+        git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat --no-pager "$@"
+}
+
+STAGE=
+cleanup() {
+    [ -z "$SHADOW" ] || rm -rf "$SHADOW"
+    [ -z "$STAGE" ] || sudo rm -rf "$STAGE"
+}
+trap cleanup EXIT INT TERM
+
+check_sha() {
+    echo "$1" | grep -Eq '^[0-9a-f]{40}$' || die "give the full 40-character commit sha."
+}
+
+current_sha() {
+    [ -L "$ROOT/current" ] && basename "$(readlink "$ROOT/current")" || true
+}
+
+switch_to() {
+    [ -d "$RELEASES/$1" ] || die "no release $1 in $RELEASES."
+    sudo ln -sfn "releases/$1" "$ROOT/current.new"
+    sudo mv -T "$ROOT/current.new" "$ROOT/current"
+    echo "current -> releases/$1. Restart Claude Code sessions to pick it up."
+}
+
+cmd_list() {
+    cur=$(current_sha)
+    [ -d "$RELEASES" ] || { echo "(no releases)"; return; }
+    for d in "$RELEASES"/*/; do
+        [ -d "$d" ] || continue
+        s=$(basename "$d")
+        if [ "$s" = "$cur" ]; then echo "* $s"; else echo "  $s"; fi
+    done
+}
+
+cmd_install() {
+    sha=$1
+    check_sha "$sha"
+    [ "$(shadow_git cat-file -t "$sha" 2>/dev/null)" = commit ] || die "$sha is not a commit in $REPO."
+    [ ! -e "$RELEASES/$sha" ] || die "$RELEASES/$sha already exists; use rollback to switch to it."
+
+    if shadow_git ls-tree -r "$sha" | awk '$1 == "120000" || $1 == "160000" { found = 1 } END { exit !found }'; then
+        die "$sha contains symlinks or submodules; refusing to extract it as root."
+    fi
+
+    "$PYTHON" -c 'import sys; sys.exit(sys.version_info[:2] != (3, 14))' || die "$PYTHON is not Python 3.14."
+
+    cur=$(current_sha)
+    if [ -n "$cur" ] && [ "$(shadow_git cat-file -t "$cur" 2>/dev/null)" = commit ]; then
+        base=$cur
+        echo "Diff from current release $cur to $sha:"
+    else
+        base=$(shadow_git hash-object -t tree /dev/null)
+        echo "No current release in this repo's history; showing every file in $sha:"
+    fi
+    shadow_git diff --stat "$base" "$sha"
+    printf 'Review the full diff? [Y/n] '
+    read -r ans
+    case $ans in [nN]*) ;; *) shadow_git diff "$base" "$sha" | ${PAGER:-less} ;; esac
+    printf 'Install %s? [y/N] ' "$sha"
+    read -r ans
+    case $ans in [yY]*) ;; *) die "not installed." ;; esac
+
+    sudo install -d -o root -g root -m 0755 "$ROOT" "$RELEASES"
+    STAGE=$RELEASES/.new-$sha
+    sudo rm -rf "$STAGE"
+    sudo install -d -o root -g root -m 0755 "$STAGE"
+    shadow_git archive --format=tar "$sha" | sudo tar -x -C "$STAGE" --no-same-owner --no-same-permissions
+    sudo $ROOT_ENV "$PYTHON" -I -m venv "$STAGE/.venv"
+    sudo $ROOT_ENV "$STAGE/.venv/bin/python" -I -m pip install --quiet --disable-pip-version-check \
+        --require-hashes --only-binary :all: --no-deps -r "$STAGE/requirements.lock"
+    echo "$RELEASES/$sha/src" | sudo tee "$STAGE/.venv/lib/python3.14/site-packages/git_gate.pth" > /dev/null
+    sudo chown -R root:root "$STAGE"
+    sudo chmod -R go-w "$STAGE"
+    sudo mv -T "$STAGE" "$RELEASES/$sha"
+    STAGE=
+
+    "$RELEASES/$sha/.venv/bin/python" -I -c 'import git_gate.server' || die "release does not import; current unchanged."
+    switch_to "$sha"
+}
+
+action=${1:-}
+[ $# -gt 0 ] && shift
+case $action in
+    install)
+        [ $# -ge 1 ] || die "usage: install.sh install <sha> [--repo DIR] [--python PATH]"
+        sha=$1; shift
+        while [ $# -gt 0 ]; do
+            case $1 in
+                --repo) REPO=$2; shift 2 ;;
+                --python) PYTHON=$2; shift 2 ;;
+                *) die "unknown option $1" ;;
+            esac
+        done
+        cmd_install "$sha" ;;
+    rollback)
+        [ $# -eq 1 ] || die "usage: install.sh rollback <sha>"
+        check_sha "$1"
+        switch_to "$1" ;;
+    list) cmd_list ;;
+    *) die "usage: install.sh install <sha> | rollback <sha> | list" ;;
+esac

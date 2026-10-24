@@ -1,0 +1,7 @@
+#!/bin/sh
+# Launcher for an installed release (/opt/git-gate/releases/<sha>/bin/git-gate).
+# Resolves its own path first, so a running server keeps its release when `current` moves.
+set -eu
+self=$(readlink -f "$0")
+release=${self%/bin/git-gate}
+exec "$release/.venv/bin/python" -I -m git_gate "$@"
