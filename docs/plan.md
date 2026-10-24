@@ -17,14 +17,15 @@ where the build adds to or tightens the design. Written 2026-10-24.
 
 | Subcommand | Uses | Gate |
 |---|---|---|
-| `pr create`, `pr view`, `pr edit`, `pr comment`, `pr merge`, `pr list`, `pr review`, `pr diff`, `pr checks`, `pr close`, `pr ready` | many | allowed (`merge --admin` refused) |
+| `pr create`, `pr view`, `pr edit`, `pr comment`, `pr list`, `pr review`, `pr diff`, `pr checks`, `pr close`, `pr ready` | many | allowed |
+| `pr merge` | 14 | **refused**: a merge lands code on the base branch without a push, so it would sidestep push's protected-branch rule. Merging stays the user's. |
 | `issue view`, `issue list`, `issue create`, `issue comment`, `issue edit`, `issue close` | many | allowed |
 | `api` (GET, e.g. `repos/home-assistant/core/contents/...`) | 22 | allowed: GET forced, endpoint must be inside the forced repo |
 | `api -X PATCH .../pulls/{n} -F body=@file` | 1 (pineapple-pages `commits.md`, workaround for `pr edit`) | **refused**; use `pr edit --body-file`. The skill doc should drop the workaround. |
 | `release download`, `release view` | 8 | allowed; download goes through a gate temp dir |
 | `release create`, `release edit`, `release upload` | 25 (mostly third-party plugins) | **refused**: they create or move tags, which stay manual |
 | `run list`, `run view`, `run watch`, `workflow view` | 8 | allowed |
-| `search issues` | 9 | allowed with `--repo` forced |
+| `search issues` | 9 | **refused**: GitHub ORs repeated `repo:` qualifiers, so forcing `--repo` does not contain it. Use `issue list --search` / `pr list --search`, which refuse `repo:`, `org:`, `user:`, `owner:` and `is:public/private`. |
 | `label create` | 2 | allowed |
 | `repo clone`, `pr checkout` | 6 | refused; use the `clone` tool, or `fetch` + local checkout |
 | `auth *`, `extension install` | 18 | refused |
@@ -57,7 +58,11 @@ where the build adds to or tightens the design. Written 2026-10-24.
    GitHub's `protected` flag, or any active ruleset rule on the branch. Workflow check: every new
    commit (reachable from the SHA, not from the remote branch or, for a new branch, the default
    branch) is diffed against its parent with rename detection off. Merges use `--cc`, so a
-   clean merge of `main` passes and an evil merge editing a workflow does not.
+   clean merge of `main` passes and an evil merge editing a workflow does not. `--cc` hides a
+   merge that keeps one parent's *older* workflow, so the whole `.github/workflows` tree is also
+   compared with the remote branch, or with the fork point from the default branch.
+   Repositories with `objects/info/alternates` are refused: git would read, and push, objects
+   from any repository on disk.
 5. **`prune` refuses if the branch moved after its PR closed.** It needs at least one PR from the
    branch, no open PR, and the branch tip equal to the latest closed PR's head SHA, so unreviewed
    commits pushed after a close are not deleted.
@@ -108,8 +113,10 @@ copy of the script is sandbox-writable, so it is never the one run: the first in
 extracted from the reviewed commit (`git cat-file blob <sha>:install.sh`), later ones run the
 root-owned `/opt/git-gate/current/install.sh`.
 
-1. Reads the commit through a shadow git dir (as above), so the dev repo's config, hooks and
-   attributes never run, and prints the diff against the commit `current` points at.
+1. Fetches the commit (and the current release's) through a shadow git dir, so the dev repo's
+   config, hooks and attributes never run, into a private temporary repo that hashes every
+   object it receives. The diff against `current` and the archive both come from that copy,
+   so swapping object files in the dev repo after the review changes nothing.
 2. Asks for confirmation, then `git archive`s the commit to a temp dir.
 3. With `sudo`: extracts into `/opt/git-gate/releases/<sha>/` (refuses if it exists, or if the
    tree holds symlinks or submodules), builds `.venv` from `requirements.lock` with
