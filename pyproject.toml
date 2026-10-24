@@ -1,0 +1,19 @@
+[project]
+name = "git-gate"
+version = "0.1.0"
+description = "GitHub access for sandboxed agents through an MCP server that holds the token."
+requires-python = ">=3.14"
+dependencies = ["mcp==2.1.1"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+src = ["src", "tests"]
+extend-exclude = [".claude", ".tmp"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
