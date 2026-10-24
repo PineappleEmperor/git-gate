@@ -254,6 +254,7 @@ class Git:
                     raise Refused(f"{repo.gitdir} moved while the gate was checking it.")
                 check_inside(rules, repo.gitdir, "Repository .git")
                 objects_fd = _open_dir("objects", fds, gfd)
+                _refuse_alternates(objects_fd, repo.gitdir)
                 refs_fd = _open_dir("refs", fds, gfd)
                 for name, fd in (("objects", objects_fd), ("refs", refs_fd)):
                     if fd_path(fd) != repo.gitdir / name:
@@ -351,6 +352,22 @@ def _open_dir(path: str | Path, fds: list[int], dir_fd: int | None = None) -> in
         raise Refused(f"{path} must be a real directory ({e.strerror}).") from None
     fds.append(fd)
     return fd
+
+
+def _refuse_alternates(objects_fd: int, gitdir: Path) -> None:
+    """Alternates would let git read, and push, objects from any repository on disk."""
+    try:
+        info = os.open("info", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=objects_fd)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise Refused(f"{gitdir}/objects/info must be a real directory.") from None
+    try:
+        for name in ("alternates", "http-alternates"):
+            if _exists(info, name):
+                raise Refused(f"{gitdir}/objects/info/{name} exists; the gate does not follow alternates.")
+    finally:
+        os.close(info)
 
 
 def _parse_packed(data: bytes) -> dict[str, str]:

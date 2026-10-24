@@ -376,6 +376,13 @@ def test_stale_fork_without_workflow_changes_passes(env, checkout):
     assert "Pushed" in call(env, "push", repo="me/app", path=str(checkout), branch="topic")
 
 
+def test_alternates_refused(env, checkout):
+    (checkout / ".git/objects/info").mkdir(exist_ok=True)
+    (checkout / ".git/objects/info/alternates").write_text(f"{env.bare}/objects\n")
+    with pytest.raises(Refused, match="alternates"):
+        call(env, "fetch", repo="me/app", path=str(checkout))
+
+
 def test_push_never_sends_tags(env, checkout):
     git("switch", "-q", "-c", "t", cwd=checkout)
     commit(checkout, "a.txt")
