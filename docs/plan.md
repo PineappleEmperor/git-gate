@@ -41,13 +41,15 @@ where the build adds to or tightens the design. Written 2026-10-24.
    `denyWrite: **/.git/config` to rule out a swap between check and use. A glob deny can only
    protect files that exist when the sandbox starts; a repo cloned or `git init`ed mid-session has
    an unprotected config. So the gate runs git with `GIT_DIR` set to a gate-owned *shadow* dir
-   (`~/.local/state/git-gate/shadow/<hash>/`) holding its own `config` and `HEAD`, with `objects`,
-   `refs` and `packed-refs` symlinked into the agent's `.git`. No `hooks/`, `info/` or `commondir`
-   means hooks, attributes and config from the repo cannot reach git at all. The key allowlist check
-   stays, as tamper detection and to bind the path to the repo through `remote.origin.url`.
-   Consequences: `fetch` never prunes (pruning a packed ref would rewrite `packed-refs` inside the
-   shadow), so it lists stale remote-tracking branches for the agent to delete with
-   `git branch -dr`. Shallow repos are refused.
+   (`~/.local/state/git-gate/shadow/<hash>/`) holding its own `config`, `HEAD`, `objects/` and
+   refs. The agent's object files are hardlinked in (copied across filesystems), skipping
+   `objects/info/`, and its refs are a `packed-refs` snapshot the gate reads itself, skipping
+   symlinks. No `hooks/`, `info/`, `commondir` or alternates means nothing the agent writes is read
+   as configuration or followed as a path. After a fetch the gate copies new packs and `origin/*`
+   refs back through directory handles. The key allowlist check stays, as tamper detection and to
+   bind the path to the repo through `remote.origin.url`. Consequences: `fetch` never prunes, so it
+   lists stale remote-tracking branches for the agent to delete with `git branch -dr`. Shallow
+   repos are refused.
 3. **`clone` builds the repo in a gate-owned staging dir and moves it into place.** It writes
    `.git/config` itself, fetches every branch, sets `HEAD` and the default branch, and does **not**
    check out. The agent runs `git -C <path> reset --hard` inside the sandbox, so untrusted tree
@@ -61,8 +63,8 @@ where the build adds to or tightens the design. Written 2026-10-24.
    clean merge of `main` passes and an evil merge editing a workflow does not. `--cc` hides a
    merge that keeps one parent's *older* workflow, so the whole `.github/workflows` tree is also
    compared with the remote branch, or with the fork point from the default branch.
-   Repositories with `objects/info/alternates` are refused: git would read, and push, objects
-   from any repository on disk.
+   An `objects/info/alternates` file in the agent's repo is never read (see 2), so it cannot make
+   git read, and push, objects from another repository on disk.
 5. **`prune` refuses if the branch moved after its PR closed.** It needs at least one PR from the
    branch, no open PR, and the branch tip equal to the latest closed PR's head SHA, so unreviewed
    commits pushed after a close are not deleted.
@@ -131,9 +133,8 @@ root-owned `/opt/git-gate/current/install.sh`.
 
 ## Residual risks
 
-- `objects`/`refs` in the agent repo are checked as real directories, but a swap to a symlink
-  after the check would let git write object or ref files elsewhere in the user's home. They are
-  data writes, not execution, and file names are git-controlled.
+- Hardlinked object files are the agent's own inodes, so the agent can still rewrite an object's
+  bytes in place. That corrupts only its own repository's data; it cannot point git elsewhere.
 - `fetch.fsckObjects` is on; a repo with historical malformed objects will refuse to fetch.
 - LFS content arrives as pointer files: the gate defines no filter drivers.
 - Each release's `.venv` is root-owned, but a venv runs its base interpreter, and pyenv 3.14.4
