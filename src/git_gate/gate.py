@@ -44,6 +44,7 @@ FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
 # What GitHub says when a token without the Workflows permission pushes a change to .github/workflows.
 WORKFLOW_SCOPE = "create or update workflow"
 MAX_NAMED = 20  # protected files named in a refusal; the handover record and screen hold them all
+PROC = Path("/proc")
 
 
 class InternalError(Exception):
@@ -136,9 +137,10 @@ class Gate:
             self._audit(tool, kwargs, outcome, token)
 
     def _audit(self, tool: str, kwargs: dict, outcome: str, token: str | None) -> None:
-        line = json.dumps(
-            {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "args": kwargs, "outcome": outcome}
-        )
+        line = json.dumps({
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "args": kwargs, "outcome": outcome,
+            "session": _session(), "cwd": _cwd(),
+        })  # fmt: skip
         with open(self.state / "audit.log", "a") as f:
             f.write(_scrub(line, token) + "\n")
 
@@ -567,6 +569,25 @@ def _refusal_for(found: Protected) -> str:
     if found.commits:
         reason += f" Commit(s) {', '.join(c[:12] for c in found.commits)} change them."
     return reason
+
+
+def _session(proc: Path = PROC) -> str:
+    """The calling conversation: its relay's pid and start time (/proc stat field 22), so a reused pid
+    is a new session. The relay is this process's parent; without /proc, its pid alone."""
+    ppid = os.getppid()
+    try:
+        # The process name, in parentheses, may hold spaces and ")": the fields start after the last ")".
+        return f"{ppid}-{int((proc / str(ppid) / 'stat').read_text().rpartition(')')[2].split()[19])}"
+    except OSError, ValueError, IndexError:
+        return str(ppid)
+
+
+def _cwd() -> str | None:
+    """The conversation's project folder: the relay runs there and its child inherits it; None if gone."""
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
 
 
 def utf8_safe(text: str) -> str:
