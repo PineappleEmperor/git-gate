@@ -11,9 +11,11 @@ import pytest
 import git_gate.gate as gate_module
 from conftest import TOKEN, call, commit, git, make_bundle, push
 from git_gate import Refused
+from git_gate.config import load_rules
 from git_gate.gate import Gate
 from git_gate.github import GitHub
 from git_gate.handover import Handovers
+from git_gate.mirror import Mirror
 
 
 def remote_ref(env, branch: str) -> str:
@@ -207,7 +209,7 @@ def _setup_extra_path(env, checkout):
     return "skill", "skills", main_sha(env), None
 
 
-@pytest.mark.parametrize(
+REFUSALS = pytest.mark.parametrize(
     "setup",
     [
         _setup_default,
@@ -218,10 +220,25 @@ def _setup_extra_path(env, checkout):
         _path_case(".github/workflows/ci.yml"),
         _path_case(".githooks/pre-commit"),
         _path_case(".pre-commit-config.yaml"),
+        _path_case(".claude/settings.json"),
         _setup_extra_path,
     ],
-    ids=["default", "pattern", "github", "ruleset", "rewrite", "workflows", "githooks", "pre-commit", "extra"],
+    ids=[
+        "default",
+        "pattern",
+        "github",
+        "ruleset",
+        "rewrite",
+        "workflows",
+        "githooks",
+        "pre-commit",
+        "claude",
+        "extra",
+    ],
 )
+
+
+@REFUSALS
 def test_push_refusals_create_handovers(env, checkout, setup):
     branch, reason, base, lease = setup(env, checkout)
     tip = commit(checkout, "tip.txt")
@@ -239,6 +256,51 @@ def test_push_refusals_create_handovers(env, checkout, setup):
     assert staging_empty(env)
     audit = [json.loads(line) for line in (env.state / "audit.log").read_text().splitlines()]
     assert audit[-1]["outcome"] == "handover"
+
+
+@REFUSALS
+def test_handover_record_matches_the_refusal(env, checkout, setup):
+    """What the gate refused for is what the record holds, so the screen shows what was decided."""
+    branch, _, _, _ = setup(env, checkout)
+    commit(checkout, "tip.txt")
+    remote = remote_ref(env, branch) or None
+    default_tip = main_sha(env)
+    with pytest.raises(Refused) as e:
+        push(env, checkout, branch)
+    msg = str(e.value)
+    h = Handovers(env.state).get(int(re.findall(r"gitgatepush (\d+)", msg)[0]))
+    named = re.search(r"under handover paths: (.*?)\.(?= |\n|$)", msg)
+    assert h.protected == (tuple(named.group(1).split(", ")) if named else ())
+    assert h.patterns == load_rules(env.cfg).repo("me/app").handover_paths
+    assert h.exclude == tuple(c for c in (remote, default_tip) if c)
+
+
+def test_keep_failure_leaves_no_open_record(env, checkout, monkeypatch):
+    def boom(*args, **kwargs):
+        raise Refused("could not pin")
+
+    monkeypatch.setattr(Mirror, "keep", boom)
+    git("switch", "-q", "-c", "ci", cwd=checkout)
+    commit(checkout, ".github/workflows/ci.yml", "on: push")
+    with pytest.raises(Refused, match="could not pin"):
+        push(env, checkout, "ci")
+    assert Handovers(env.state).open() == []
+
+
+def test_handover_base_is_never_another_branch(env, checkout):
+    """An agent can push any branch; the display base is the fork with the default branch only."""
+    fork = main_sha(env)
+    git("switch", "-q", "-c", "aaa", cwd=checkout)
+    commit(checkout, "aaa.txt")
+    assert "Pushed" in push(env, checkout, "aaa")
+    aaa = remote_ref(env, "aaa")
+    git("switch", "-q", "-c", "zzz", cwd=checkout)
+    commit(checkout, ".github/workflows/ci.yml", "on: push")
+    with pytest.raises(Refused) as e:
+        push(env, checkout, "zzz")
+    h = Handovers(env.state).get(int(re.findall(r"gitgatepush (\d+)", str(e.value))[0]))
+    assert h.base == fork != aaa
+    assert h.exclude == (fork,)
 
 
 def test_new_branch_handover_records_fork_point(env, checkout):

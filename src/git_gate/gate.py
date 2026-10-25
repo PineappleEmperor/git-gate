@@ -22,7 +22,7 @@ from git_gate.config import Rules, check_enabled, config_dir, load_rules, load_t
 from git_gate.github import PROTECTING_RULES, GitHub
 from git_gate.gitops import EMPTY, MAX_STDERR, Git
 from git_gate.handover import Handovers
-from git_gate.mirror import MAX_HAVE, Mirror
+from git_gate.mirror import MAX_HAVE, Mirror, Protected, comparison
 from git_gate.paths import copy_in, copy_tree_into, open_dir, read_workspace_file, require_absolute, write_out
 
 MAX_OUTPUT = 200_000
@@ -30,6 +30,7 @@ MAX_BUNDLE = 512 << 20
 RATE_LIMIT = 60
 RATE_WINDOW = 60
 FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
+MAX_NAMED = 20  # protected files named in a refusal; the handover record and screen hold them all
 
 
 class HandedOver(Refused):
@@ -139,7 +140,7 @@ class Gate:
             return f"{branch} is covered by ruleset rules: {', '.join(sorted(rules_on))}."
         return None
 
-    def _refuse_protected(self, rules: Rules, api: GitHub, repo: str, branch: str, default: str) -> None:
+    def _require_unprotected(self, rules: Rules, api: GitHub, repo: str, branch: str, default: str) -> None:
         reason = self._protection(rules, api, repo, branch, default)
         if reason:
             raise Refused(reason)
@@ -274,23 +275,30 @@ class Gate:
                     advice.append(
                         f"If the rewrite was not meant, fetch, rebase or merge origin/{branch} and push again instead."
                     )
+                # The comparison commits, fixed once (D2): the branch on GitHub and the default
+                # branch's tip after sync. No other branch is ever one: agents can push those.
                 default_tip = heads.get(default)
-                new = self.mirror.new_commits(repo, sha, remote or default_tip, rules)
+                fork = self.mirror.fork_point(repo, sha, default_tip, rules)
                 patterns = repo_rules.handover_paths
-                touched = self.mirror.touched(repo, sha, remote, default_tip, patterns, rules)
-                if touched:
-                    reasons.append(
-                        f"Commit(s) {', '.join(c[:12] for c in touched)} touch a handover path ({', '.join(patterns)})."
-                    )
+                found = self.mirror.protected_changes(repo, sha, remote, default_tip, patterns, rules)
+                if found:
+                    reasons.append(_refusal_for(found))
                 if reasons:
-                    base = remote or self._fork_point(repo, sha, heads, default, rules)
-                    h = self.handovers.create(repo, branch, sha, base, lease, " ".join(reasons))
-                    self.mirror.keep(repo, h.ref, sha, rules)
+                    h = self.handovers.create(
+                        repo, branch, sha, remote or fork, lease, " ".join(reasons),
+                        patterns=patterns, protected=found.files, exclude=comparison(remote, default_tip),
+                    )  # fmt: skip
+                    try:
+                        self.mirror.keep(repo, h.ref, sha, rules)
+                    except BaseException:
+                        self.handovers.close(h.id)  # a record must never name a commit the mirror may lose
+                        raise
                     raise HandedOver(
                         f"Not pushed: {' '.join(reasons)} That push is the user's. The gate kept {sha[:12]} as "
                         f"handover {h.id}; hand the user this command, which shows the commits and asks before "
                         f"pushing from their own terminal:\n\ngitgatepush {h.id}" + "".join(f"\n\n{a}" for a in advice)
                     )
+                new = self.mirror.new_commits(repo, sha, remote or default_tip, rules)
                 proc = self.mirror.push(repo, sha, branch, token, rules)
         if proc.returncode != 0:
             raise Refused(f"git push was rejected:\n{(proc.stdout + proc.stderr).strip()[-MAX_STDERR:]}")
@@ -308,22 +316,12 @@ class Gate:
             lines.append("This push deploys.")
         return "\n".join(lines)
 
-    def _fork_point(self, repo: str, sha: str, heads: dict[str, str], default: str, rules: Rules) -> str | None:
-        """Where a new branch leaves GitHub's history: its merge-base with the default branch.
-
-        None only when GitHub has no branches. Without a common ancestor, the default branch's tip.
-        """
-        target = heads.get(default) or next(iter(sorted(heads.items())), (None, None))[1]
-        if target is None:
-            return None
-        return self.mirror.merge_base(repo, sha, target, rules) or target
-
     def prune(self, rules: Rules, token: str, repo: str, branch: str) -> str:
         rules.require_write(repo)
         self.git.check_branch(branch, rules)
         api = self.github(token)
         default = api.default_branch(repo)
-        self._refuse_protected(rules, api, repo, branch, default)
+        self._require_unprotected(rules, api, repo, branch, default)
         info = api.branch(repo, branch)
         if info is None:
             raise Refused(f"{repo} has no branch {branch}.")
@@ -407,6 +405,15 @@ class Gate:
             "BROWSER": "false",
             "NO_COLOR": "1",
         }
+
+
+def _refusal_for(found: Protected) -> str:
+    shown = found.files[:MAX_NAMED]
+    more = f" and {len(found.files) - MAX_NAMED} more" if len(found.files) > MAX_NAMED else ""
+    reason = f"It changes {len(found.files)} file(s) under handover paths: {', '.join(shown)}{more}."
+    if found.commits:
+        reason += f" Commit(s) {', '.join(c[:12] for c in found.commits)} change them."
+    return reason
 
 
 def _scrub(text: str, token: str | None) -> str:

@@ -1,16 +1,17 @@
 import io
 import json
+import re
 import shlex
 import stat
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from conftest import TOKEN, commit, git
+from conftest import TOKEN, commit, git, push
 from git_gate import Refused
-from git_gate.config import Rules
+from git_gate.config import DEFAULT_HANDOVER_PATHS, Rules
 from git_gate.handover import EXPIRES, Handover, Handovers, main, push_command
-from git_gate.mirror import Mirror
+from git_gate.mirror import Mirror, comparison
 
 REPO = "me/app"
 DAY = 24 * 3600
@@ -48,18 +49,22 @@ def sha(n: int = 1) -> str:
     return f"{n:x}".rjust(40, "a")
 
 
+STORED = {"patterns": DEFAULT_HANDOVER_PATHS, "protected": (), "exclude": ()}
+
+
 def make(hs: Handovers, **kw) -> Handover:
     args = {"repo": REPO, "branch": "feat", "sha": sha(), "base": None, "lease": None, "reason": "protected"}
-    return hs.create(**(args | kw))
+    return hs.create(**(args | STORED | kw))
 
 
 # --- records ------------------------------------------------------------------------------
 
 
 def test_create_get_open_close(env, hs):
-    h = make(hs, base=sha(2), lease=sha(3), reason="needs a force")
+    h = make(hs, base=sha(2), lease=sha(3), reason="needs a force", protected=("a", "b"), exclude=(sha(3), sha(4)))
     assert (h.id, h.repo, h.branch, h.sha, h.base, h.lease) == (1, REPO, "feat", sha(), sha(2), sha(3))
     assert h.reason == "needs a force"
+    assert (h.patterns, h.protected, h.exclude) == (DEFAULT_HANDOVER_PATHS, ("a", "b"), (sha(3), sha(4)))
     assert hs.get(h.id) == h
     other = make(hs, branch="topic")
     assert hs.open() == [h, other]
@@ -107,8 +112,15 @@ def test_unreadable_record_is_not_open(env, hs):
     h = make(hs)
     (env.state / "handovers/9.json").write_text("{not json")
     (env.state / "handovers/10.json").write_text(json.dumps({"id": 10}))
+    record = json.loads((env.state / f"handovers/{h.id}.json").read_text())
+    without = {k: v for k, v in record.items() if k != "protected"}  # a record older than the stored list
+    bad_exclude = record | {"exclude": ["main"]}
+    bad_pattern = record | {"patterns": ["a\nb"]}
+    bad_name = record | {"protected": [5]}
+    for n, data in ((11, without), (12, bad_exclude), (13, bad_pattern), (14, bad_name)):
+        (env.state / f"handovers/{n}.json").write_text(json.dumps(data | {"id": n}))
     assert hs.open() == [h]
-    for bad in (9, 10):
+    for bad in (9, 10, 11, 12, 13, 14):
         with pytest.raises(Refused, match="unreadable"):
             hs.get(bad)
 
@@ -119,11 +131,11 @@ def test_unreadable_record_is_not_open(env, hs):
 def test_push_command_shapes(tmp_path):
     mirror = tmp_path / "me/app.git"
     url = "git@github.com:me/app.git"
-    plain = Handover(1, REPO, "feat", sha(), None, None, "protected", 0.0)
+    plain = Handover(1, REPO, "feat", sha(), None, None, "protected", 0.0, (), (), ())
     assert push_command(plain, mirror, url) == [
         "git", "-c", "core.hooksPath=/dev/null", f"--git-dir={mirror}", "push", url, f"{sha()}:refs/heads/feat",
     ]  # fmt: skip
-    rewrite = Handover(2, REPO, "feat", sha(), sha(2), sha(3), "rewrite", 0.0)
+    rewrite = Handover(2, REPO, "feat", sha(), sha(2), sha(3), "rewrite", 0.0, (), (), ())
     assert push_command(rewrite, mirror, url) == [
         "git", "-c", "core.hooksPath=/dev/null", f"--git-dir={mirror}", "push",
         f"--force-with-lease=refs/heads/feat:{sha(3)}", url, f"{sha()}:refs/heads/feat",
@@ -143,33 +155,27 @@ def stage(env, m, rules, checkout, branch="feat", *, base=None, lease=None, reas
     """Commit on `branch`, import it into the mirror as a push would, pin it and record the handover."""
     git("switch", "-q", "-c", branch, cwd=checkout)
     commit(checkout, f"{branch}.txt", message=f"add {branch}")
-    git(
-        "bundle",
-        "create",
-        "-q",
-        str(env.state / "staging" / f"{branch}.bundle"),
-        branch,
-        "--not",
-        "--remotes=origin",
-        cwd=checkout,
-    )
-    with m.lock(REPO):
-        m.sync(REPO, TOKEN, rules)
-        tip = m.import_bundle(REPO, env.state / "staging" / f"{branch}.bundle", branch, rules)
-        h = Handovers(env.state).create(REPO, branch, tip, base, lease, reason)
-        m.keep(REPO, f"refs/gate/handover/{h.id}", tip, rules)
-    return h
+    return stage_here(env, m, rules, checkout, branch, base=base, lease=lease, reason=reason)
 
 
-def stage_here(env, m, rules, checkout, branch, *, base=None, lease=None, reason="protected branch"):
+def stage_here(env, m, rules, checkout, branch, *, base=None, lease=None, reason="protected branch", repo=REPO):
     """Like `stage`, for a branch already checked out with its commits made."""
     path = env.state / "staging" / f"{branch}.bundle"
     git("bundle", "create", "-q", str(path), branch, "--not", "--remotes=origin", cwd=checkout)
-    with m.lock(REPO):
-        m.sync(REPO, TOKEN, rules)
-        tip = m.import_bundle(REPO, path, branch, rules)
-        h = Handovers(env.state).create(REPO, branch, tip, base, lease, reason)
-        m.keep(REPO, h.ref, tip, rules)
+    with m.lock(repo):
+        heads = m.sync(repo, TOKEN, rules)
+        tip = m.import_bundle(repo, path, branch, rules)
+    return record(env, m, rules, heads, branch, tip, base=base, lease=lease, reason=reason, repo=repo)
+
+
+def record(env, m, rules, heads, branch, tip, *, base=None, lease=None, reason="protected", repo=REPO, **stored):
+    """Record and pin a handover the way the gate's push does, storing what `protected_changes` found."""
+    remote, default = heads.get(branch), heads.get("main")
+    found = m.protected_changes(repo, tip, remote, default, DEFAULT_HANDOVER_PATHS, rules)
+    kw = {"patterns": DEFAULT_HANDOVER_PATHS, "protected": found.files, "exclude": comparison(remote, default)}
+    with m.lock(repo):
+        h = Handovers(env.state).create(repo, branch, tip, base, lease, reason, **(kw | stored))
+        m.keep(repo, h.ref, tip, rules)
     return h
 
 
@@ -273,10 +279,9 @@ def test_main_strips_terminal_escapes(env, m, rules, checkout):
         cwd=checkout,
     )
     with m.lock(REPO):
-        m.sync(REPO, TOKEN, rules)
+        heads = m.sync(REPO, TOKEN, rules)
         tip = m.import_bundle(REPO, env.state / "staging" / "evil.bundle", "evil", rules)
-        h = Handovers(env.state).create(REPO, "evil", tip, None, None, "protected")
-        m.keep(REPO, f"refs/gate/handover/{h.id}", tip, rules)
+    h = record(env, m, rules, heads, "evil", tip)
     _, out = run(env, [str(h.id)], "n\n")
     assert "innocent" in out and "subject" in out
     assert "\x1b" not in out and "\x07" not in out
@@ -377,18 +382,18 @@ def test_purging_an_expired_handover_drops_its_mirror_ref(env, m, rules, checkou
     with m.lock(REPO):
         m.sync(REPO, TOKEN, rules)
         tip = m.import_bundle(REPO, env.state / "staging" / "f.bundle", "feat", rules)
-        old = Handovers(env.state, clock=clock, mirror=m).create(REPO, "feat", tip, None, None, "protected")
+        old = Handovers(env.state, clock=clock, mirror=m).create(REPO, "feat", tip, None, None, "protected", **STORED)
         m.keep(REPO, old.ref, tip, rules)
     assert mirror_refs(m) == old.ref
 
     hs = Handovers(env.state, clock=Clock(clock.now + 10 * DAY), mirror=m)
-    young = hs.create(REPO, "feat", tip, None, None, "protected")
+    young = hs.create(REPO, "feat", tip, None, None, "protected", **STORED)
     with m.lock(REPO):
         m.keep(REPO, young.ref, tip, rules)
     assert sorted(mirror_refs(m).split()) == [old.ref, young.ref]  # not expired yet
 
     hs = Handovers(env.state, clock=Clock(clock.now + 15 * DAY), mirror=m)
-    hs.create(REPO, "other", tip, None, None, "protected")
+    hs.create(REPO, "other", tip, None, None, "protected", **STORED)
     assert mirror_refs(m) == young.ref  # old expired and dropped; young (5 days old) kept
 
 
@@ -479,10 +484,9 @@ def test_main_says_how_many_commits_are_not_shown(env, m, rules, checkout):
     )
     base = git("rev-parse", "origin/main", cwd=checkout)
     with m.lock(REPO):
-        m.sync(REPO, TOKEN, rules)
+        heads = m.sync(REPO, TOKEN, rules)
         tip = m.import_bundle(REPO, env.state / "staging" / "big.bundle", "big", rules)
-        h = Handovers(env.state).create(REPO, "big", tip, base, None, "protected")
-        m.keep(REPO, h.ref, tip, rules)
+    h = record(env, m, rules, heads, "big", tip, base=base)
     _, out = run(env, [str(h.id)], "n\n")
     assert "step 54" in out and "step 5" in out
     assert "step 4\n" not in out
@@ -516,10 +520,9 @@ def test_main_lists_every_file_the_push_changes(env, m, rules, checkout):
     )
     base = git("rev-parse", "origin/main", cwd=checkout)
     with m.lock(REPO):
-        m.sync(REPO, TOKEN, rules)
+        heads = m.sync(REPO, TOKEN, rules)
         tip = m.import_bundle(REPO, env.state / "staging" / "w.bundle", "wide", rules)
-        h = Handovers(env.state).create(REPO, "wide", tip, base, None, "touches .github/workflows")
-        m.keep(REPO, h.ref, tip, rules)
+    h = record(env, m, rules, heads, "wide", tip, base=base, reason="touches .github/workflows")
     _, out = run(env, [str(h.id)], "n\n")
     assert "12 more commits not shown" in out
     assert "innocent" not in out  # the log is capped ...
@@ -565,21 +568,18 @@ def test_main_without_base_and_an_empty_mirror_uses_the_empty_tree(env, m, rules
     commit(src, "b.txt")
     git("bundle", "create", "-q", str(env.state / "staging" / "e.bundle"), "main", cwd=src)
     with m.lock("me/empty"):
-        m.sync("me/empty", TOKEN, rules)
+        heads = m.sync("me/empty", TOKEN, rules)
         tip = m.import_bundle("me/empty", env.state / "staging" / "e.bundle", "main", rules)
-        h = Handovers(env.state).create("me/empty", "main", tip, None, None, "protected")
-        m.keep("me/empty", h.ref, tip, rules)
+    h = record(env, m, rules, heads, "main", tip, repo="me/empty")
     _, out = run(env, [str(h.id)], "n\n")
     assert "a.txt" in out and "b.txt" in out and "2 files changed" in out
 
 
 def test_main_with_nothing_new_lists_no_files(env, m, rules):
-    with m.lock(REPO):
-        main_sha = m.sync(REPO, TOKEN, rules)["main"]
-        h = Handovers(env.state).create(REPO, "again", main_sha, main_sha, None, "protected")
-        m.keep(REPO, h.ref, main_sha, rules)
+    heads = m.sync(REPO, TOKEN, rules)
+    h = record(env, m, rules, heads, "again", heads["main"], base=heads["main"])
     _, out = run(env, [str(h.id)], "n\n")
-    assert "(no new commits)" in out and "README.md" not in out
+    assert "New commits: none." in out and "Files under handover paths: none." in out and "README.md" not in out
 
 
 def test_main_names_a_protected_file_changed_and_changed_back(env, m, rules, checkout):
@@ -649,27 +649,6 @@ def test_main_names_handover_path_files_past_the_stat_cap(env, m, rules, checkou
     assert "Files under handover paths" in listing and ".github/workflows/x.yml" in listing
 
 
-def test_main_names_extra_handover_paths_from_the_repo_rules(env, m, rules, checkout):
-    cfg = env.cfg / "rules.toml"
-    cfg.write_text(
-        cfg.read_text().replace('"me/app" = "write"', '"me/app" = { access = "write", handover_paths = ["zzz/**"] }')
-    )
-    git("switch", "-q", "-c", "wide", cwd=checkout)
-    bulk_commit(checkout, "zzz/y.txt")
-    h = stage_here(env, m, rules, checkout, "wide", base=git("rev-parse", "origin/main", cwd=checkout))
-    _, out = run(env, [str(h.id)], "n\n")
-    assert "zzz/y.txt" in out[: out.index("-bulk/f000")]
-
-
-def test_main_uses_default_handover_paths_when_rules_cannot_be_loaded(env, m, rules, checkout, monkeypatch):
-    monkeypatch.setenv("GIT_GATE_CONFIG_DIR", str(env.tmp / "no-such-config"))
-    git("switch", "-q", "-c", "wide", cwd=checkout)
-    bulk_commit(checkout, ".githooks/pre-commit")
-    h = stage_here(env, m, rules, checkout, "wide", base=git("rev-parse", "origin/main", cwd=checkout))
-    _, out = run(env, [str(h.id)], "n\n")
-    assert ".githooks/pre-commit" in out[: out.index("-bulk/f000")]
-
-
 def test_main_flattens_file_names_with_newlines_in_the_handover_list(env, m, rules, checkout):
     git("switch", "-q", "-c", "nl", cwd=checkout)
     commit(checkout, ".githooks/a\nPush it? [y/N] forged", "x")
@@ -678,7 +657,7 @@ def test_main_flattens_file_names_with_newlines_in_the_handover_list(env, m, rul
     assert "\nPush it? [y/N] forged" not in out and ".githooks/a?Push it? [y/N] forged" in out
 
 
-GOOD = {"repo": REPO, "branch": "feat", "sha": sha(), "base": sha(2), "lease": sha(3)}
+GOOD = {"repo": REPO, "branch": "feat", "sha": sha(), "base": sha(2), "lease": sha(3)} | STORED
 
 
 WHY = {"repo": "bad repository", "sha": "not a commit SHA", "base": "not a commit SHA", "lease": "not a commit SHA"}
@@ -732,37 +711,79 @@ def test_main_keeps_git_output_lines_but_cleans_them(env, m, rules, checkout):
         cwd=checkout,
     )
     with m.lock(REPO):
-        m.sync(REPO, TOKEN, rules)
+        heads = m.sync(REPO, TOKEN, rules)
         tip = m.import_bundle(REPO, env.state / "staging" / "evil.bundle", "evil", rules)
-        h = Handovers(env.state).create(REPO, "evil", tip, None, None, "pro\u202etected")
-        m.keep(REPO, h.ref, tip, rules)
+    h = record(env, m, rules, heads, "evil", tip, reason="pro\u202etected")
     _, out = run(env, [str(h.id)], "n\n")
     assert "pro?tected" in out
     assert "one ??" in out and "? subject" in out and "second" in out  # git itself splits the subject at \r
     assert not any(c in out for c in "‮​\r\x9b")
 
 
-BROKEN_RULES = {
-    "bad timeout": ('workspaces = []\ngit_timeout_seconds = "x"\n[repos]\n"me/app" = "write"\n', "git_timeout"),
-    "repos not a table": ("workspaces = []\nrepos = 5\n", "repos must be a table"),
-    "bad workspace": ('workspaces = [5]\n[repos]\n"me/app" = "write"\n', "workspaces"),
-    "not utf-8": (b"workspaces = []\n\xff\xfe\n", "UnicodeDecodeError"),
-    "not toml": ("this is [not toml\n", None),
-}
+# --- the confirmation shows the record as stored --------------------------------------------
 
 
-@pytest.mark.parametrize("name", list(BROKEN_RULES))
-def test_main_survives_broken_rules_and_uses_default_paths(env, m, rules, checkout, name):
-    content, kind = BROKEN_RULES[name]
-    rules_file = env.cfg / "rules.toml"
-    rules_file.write_bytes(content if isinstance(content, bytes) else content.encode())
-    git("switch", "-q", "-c", "wide", cwd=checkout)
-    bulk_commit(checkout, ".github/workflows/x.yml")
-    h = stage_here(env, m, rules, checkout, "wide", base=git("rev-parse", "origin/main", cwd=checkout))
-    code, out = run(env, [str(h.id)], "n\n")
-    assert code == 1 and "Not pushed" in out  # declined, not crashed
-    assert ".github/workflows/x.yml" in out[: out.index("-bulk/f000")]
-    notes = [line for line in out.splitlines() if "default handover paths" in line]
-    assert len(notes) == 1 and "rules" in notes[0]
-    if kind:
-        assert kind in notes[0]
+def test_main_prints_stored_protected_files_first_and_uncapped(env, m, rules, checkout, monkeypatch):
+    monkeypatch.setenv("GIT_GATE_CONFIG_DIR", str(env.tmp / "no-such-config"))
+    names = tuple(f".github/workflows/w{i:03}.yml" for i in range(150))
+    git("switch", "-q", "-c", "feat", cwd=checkout)
+    commit(checkout, "feat.txt")
+    h = stage_here(env, m, rules, checkout, "feat")
+    path = env.state / f"handovers/{h.id}.json"
+    path.write_text(json.dumps(json.loads(path.read_text()) | {"protected": list(names)}))
+    _, out = run(env, [str(h.id)], "n\n")
+    head = out[: out.index("New commits")]
+    assert "Files under handover paths (150):" in head
+    assert all(f"  {name}\n" in head for name in names)
+    assert "Note:" not in out
+
+
+def test_main_always_prints_the_protected_section(env, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    assert h.protected == ()
+    _, out = run(env, [str(h.id)], "n\n")
+    assert "Files under handover paths: none." in out
+
+
+def test_main_discloses_a_rollback_merge(env, checkout):
+    """The gate refuses a merge that keeps an older workflow; the screen must name that workflow."""
+    seed = env.tmp / "seed"
+    commit(seed, ".github/workflows/ci.yml", "v1", message="v1")
+    git("push", "-q", env.url, "main", cwd=seed)
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "feat", "origin/main", cwd=checkout)
+    commit(seed, ".github/workflows/ci.yml", "v2", message="v2 fix")
+    git("push", "-q", env.url, "main", cwd=seed)
+    commit(checkout, "a.txt", message="feature")
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("merge", "-q", "--no-ff", "-s", "ours", "origin/main", "-m", "merge main (keeps v1)", cwd=checkout)
+    with pytest.raises(Refused) as e:
+        push(env, checkout, "feat")
+    id = int(re.findall(r"gitgatepush (\d+)", str(e.value))[0])
+    code, out = run(env, [str(id)], "n\n")
+    assert code == 1
+    assert "Files under handover paths (1):\n  .github/workflows/ci.yml\n" in out
+
+
+def test_main_rewrite_lists_what_it_removes(env, checkout):
+    git("switch", "-q", "-c", "feat", cwd=checkout)
+    commit(checkout, "one.txt", message="first doomed commit")
+    commit(checkout, "two.txt", message="second doomed commit")
+    assert "Pushed" in push(env, checkout, "feat")
+    git("reset", "-q", "--hard", "origin/main", cwd=checkout)
+    commit(checkout, "three.txt", message="the replacement")
+    with pytest.raises(Refused) as e:
+        push(env, checkout, "feat")
+    id = int(re.findall(r"gitgatepush (\d+)", str(e.value))[0])
+    _, out = run(env, [str(id)], "n\n")
+    assert "REPLACES" in out and "Removes 2 commit(s) from feat:" in out
+    assert "first doomed commit" in out and "second doomed commit" in out
+    assert out.index("Removes 2") < out.index("Files under handover paths") < out.index("New commits (1):")
+    assert out.index("New commits (1):") < out.index("the replacement")
+
+
+def test_main_second_run_of_a_closed_id(env, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    assert run(env, [str(h.id)], "y\n")[0] == 0
+    code, out = run(env, [str(h.id)], "y\n")
+    assert code == 1 and "No open handover" in out

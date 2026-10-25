@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from git_gate import Refused
@@ -23,8 +24,20 @@ INIT_TIMEOUT = 60
 INCOMING = "refs/gate/incoming/"
 HANDOVER_REF = re.compile(r"^refs/gate/handover/[0-9]+$")
 OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+LINK_MODES = ("120000", "160000")  # symlink, gitlink
 MISSING_PREREQS = ("lacks these prerequisite commits", "Repository lacks")
 BUNDLE_HOWTO = "git bundle create <file> {branch} --not --remotes=origin"
+
+
+@dataclass(frozen=True)
+class Protected:
+    """What `Mirror.protected_changes` found: every protected file, and the commits whose own diffs hit one."""
+
+    files: tuple[str, ...]
+    commits: tuple[str, ...]
+
+    def __bool__(self) -> bool:
+        return self.files != ()
 
 
 class Mirror:
@@ -223,30 +236,36 @@ class Mirror:
         args = ["rev-list", _oid(sha), *(["--not", _oid(base)] if base else [])]
         return self._git(repo, rules, args).stdout.split()
 
-    def touched(
-        self, repo: str, sha: str, remote: str | None, default_tip: str | None, patterns, rules: Rules
-    ) -> list[str]:
-        """Commits of this push whose own changes touch a path matching `patterns`.
+    def fork_point(self, repo: str, sha: str, default_tip: str | None, rules: Rules) -> str | None:
+        """Where sha leaves the default branch: their merge-base, or None without a tip or common history."""
+        return self.merge_base(repo, sha, default_tip, rules) if default_tip else None
 
-        Only commits new to both the branch (`remote`) and the default branch (`default_tip`) are
-        diffed: what the default branch already holds is the user's. Merges are diffed
-        dense-combined (`--cc`), which hides a merge that keeps one parent's older file, so when no
-        commit is named the tree is also compared: a protected path that differs from both the
-        default branch's current tip and the branch on GitHub names sha itself. sha is also named
-        when its tree holds a symlink at, inside or above a handover path.
+    def protected_changes(
+        self, repo: str, sha: str, remote: str | None, default_tip: str | None, patterns, rules: Rules
+    ) -> Protected:
+        """Every file under a handover pattern that pushing sha would change: the only such decision.
+
+        - Commits new to both the branch (`remote`) and the default branch (`default_tip`) are diffed
+          one by one (merges dense-combined, `--cc`); what the default branch holds is the user's.
+        - `--cc` hides a merge that keeps one parent's older file, so the trees are compared too: a
+          protected path counts when it differs from the default branch's current tip (the empty
+          tree without one) and, when the branch exists, from the branch on GitHub.
+        - Every symlink or gitlink in sha's tree that can lead into a handover path counts, changed
+          by this push or not, since an edit through it is an edit of what it reaches.
+
+        Nothing here depends on what the bundle claimed: only sha, remote and default_tip.
         """
         exclude = comparison(remote, default_tip)
-        shas = self._git(repo, rules, ["rev-list", _oid(sha), *_not(exclude)]).stdout.split()
-        hits = self._commit_touches(repo, shas, patterns, rules)
-        if not hits:
-            net = self._changed(repo, default_tip or self._empty_tree(repo, rules), sha, patterns, rules)
-            if remote:
-                net &= self._changed(repo, remote, sha, patterns, rules)
-            if net:
-                hits = [sha]
-        if sha not in hits and any(reaches(p, patterns) for p in self._symlinks(repo, sha, rules)):
-            hits.append(sha)
-        return hits
+        shas = self._git(repo, rules, ["rev-list", "--reverse", _oid(sha), *_not(exclude)]).stdout.split()
+        per_commit = self._commit_touches(repo, shas, patterns, rules)
+        net = self._changed(repo, default_tip or self._empty_tree(repo, rules), sha, patterns, rules)
+        if net and remote:
+            net &= self._changed(repo, remote, sha, patterns, rules)
+        links = {p for p in self._links(repo, sha, rules) if reaches(p, patterns)}
+        files = set(net) | links
+        for paths in per_commit.values():
+            files.update(paths)
+        return Protected(tuple(sorted(files)), tuple(c for c in shas if per_commit.get(c)))
 
     def _changed(self, repo: str, a: str, b: str, patterns, rules: Rules) -> set[str]:
         """The protected paths that differ between two commits (or trees)."""
@@ -259,33 +278,29 @@ class Mirror:
     def _empty_tree(self, repo: str, rules: Rules) -> str:
         return self._git(repo, rules, ["hash-object", "-t", "tree", "--stdin"], stdin="").stdout.strip()
 
-    def _symlinks(self, repo: str, sha: str, rules: Rules) -> list[str]:
+    def _links(self, repo: str, sha: str, rules: Rules) -> list[str]:
+        """Paths of the symlinks (120000) and gitlinks (160000) in sha's tree."""
         out = self._git(repo, rules, ["ls-tree", "-r", "-z", "--full-tree", _oid(sha)]).stdout
-        links = []
-        for entry in out.split("\0"):
-            meta, _, path = entry.partition("\t")
-            if meta.startswith("120000 "):
-                links.append(path)
-        return links
+        return [path for meta, _, path in (e.partition("\t") for e in out.split("\0")) if meta[:6] in LINK_MODES]
 
-    def _commit_touches(self, repo: str, shas: list[str], patterns, rules: Rules) -> list[str]:
+    def _commit_touches(self, repo: str, shas: list[str], patterns, rules: Rules) -> dict[str, list[str]]:
+        """commit -> the protected paths its own diff touches. Unframed output fails closed."""
         if not shas:
-            return []
+            return {}
         out = self._git(
             repo, rules,
             ["diff-tree", "--stdin", "-z", "-r", "--no-renames", "--name-only", "--cc", "--root"],
             stdin="\n".join(_oid(s) for s in shas) + "\n",
         ).stdout  # fmt: skip
-        tokens = [t for t in out.split("\0") if t]
         wanted = set(shas)
-        current, hits = None, []
-        for token in tokens:
+        current, hits = None, {}
+        for token in (t for t in out.split("\0") if t):
             if token in wanted:
                 current = token
-            elif current and current not in hits and protected(token, patterns):
-                hits.append(current)
-        if not hits and any(t not in wanted and protected(t, patterns) for t in tokens):
-            hits.append(shas[0])  # output git framed in a way this parser did not expect: fail closed
+            elif protected(token, patterns):
+                # A path before any commit header means output this parser did not expect: blame
+                # the first commit rather than drop the path.
+                hits.setdefault(current or shas[0], []).append(token)
         return hits
 
     # --- handover refs ------------------------------------------------------------------
