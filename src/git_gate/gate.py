@@ -118,6 +118,7 @@ class Gate:
         started = time.monotonic()
         cwd = _cwd()
         token = None
+        access = None  # the session's access to the repo, for audit.log
         outcome = "ok"
         message = None  # what the agent is told when the outcome is not ok, scrubbed
         try:
@@ -128,7 +129,9 @@ class Gate:
             except TypeError as e:
                 raise Refused(f"{tool}: {e}.") from None
             rules, token = self._load()
+            access = "no-session" if rules.version == 2 else None
             rules = rules.scoped(cwd)
+            access = rules.level(kwargs.get("repo"))
             result = fn(rules, token, **kwargs)
             return utf8_safe(_scrub(result, token))
         except HandedOver as e:
@@ -146,16 +149,23 @@ class Gate:
             message = utf8_safe(_scrub(f"{type(e).__name__}: {e}", token))
             raise InternalError(message) from e
         finally:
-            self._audit(tool, kwargs, outcome, token, message, int((time.monotonic() - started) * 1000))
+            ms = int((time.monotonic() - started) * 1000)
+            self._audit(tool, kwargs, outcome, token, message, ms, cwd, access)
 
-    def _audit(self, tool: str, kwargs: dict, outcome: str, token: str | None, message: str | None, ms: int) -> None:
+    def _audit(
+        self, tool: str, kwargs: dict, outcome: str, token: str | None, message: str | None, ms: int,
+        cwd: str | None, access: str | None,
+    ) -> None:  # fmt: skip
         """One line per call. `reason` is the first line of what the agent was told, without the
-        untrusted-content marker a refusal carrying GitHub's text starts with."""
+        untrusted-content marker a refusal carrying GitHub's text starts with. `access` is the
+        calling session's access to the repo under v2 rules ("write", "read", "none", or
+        "no-session" when the folder is no session's), and null under v1 or before rules are read."""
         reason = message.strip().partition("\n")[0][:MAX_REASON] if message is not None else None
         try:
             line = json.dumps({
                 "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "args": _logged_args(kwargs, token),
-                "outcome": outcome, "reason": reason, "ms": ms, "session": _session(), "cwd": _cwd(),
+                "outcome": outcome, "reason": reason, "ms": ms, "session": _session(), "cwd": cwd,
+                "access": access,
             })  # fmt: skip
             audit(self.state, _scrub(line, token))
         except Exception as e:

@@ -89,6 +89,9 @@ call's line:
 - `ms`: how long the call took, in milliseconds.
 - `session`: the conversation, as its relay's `<pid>-<start time>`.
 - `cwd`: the conversation's project folder, or null.
+- `access`: with session rules, the calling session's access to the call's repo: `write`, `read`,
+  `none`, or `no-session` when the project folder is no session's. Null with v1 rules, and for a
+  call refused before the rules were read.
 
 A `gitgatepush` line has `time`, `tool` (`gitgatepush`), `id`, `repo`, `branch`, `sha` and `outcome`
 (`pushed` or `failed`). Lines from older releases lack the newer fields.
