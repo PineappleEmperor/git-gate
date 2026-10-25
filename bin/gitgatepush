@@ -1,0 +1,8 @@
+#!/bin/sh
+# Launcher for an installed release (/opt/git-gate/releases/<sha>/bin/gitgatepush), run by the user
+# as `gitgatepush [<id>]`, outside the sandbox. Linked from /usr/local/bin by install.sh.
+# Resolves its own path first, so a running command keeps its release when `current` moves.
+set -eu
+self=$(readlink -f "$0")
+release=${self%/bin/gitgatepush}
+exec "$release/.venv/bin/python" -I -m git_gate handover "$@"
