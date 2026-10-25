@@ -12,6 +12,13 @@ from git_gate.github import GitHub
 from git_gate.writes import UNTRUSTED
 
 BODY = "<body>"  # stands for the body file each test writes
+RUN = {"id": 5, "head_branch": "feat", "event": "push", "head_repository": {"full_name": "me/app"}}
+RUN_READS = [
+    api_call.run("me/app", 5),
+    api_call.default_branch("me/app"),
+    api_call.branch("me/app", "feat"),
+    api_call.rule_types("me/app", "feat"),
+]
 
 
 @pytest.fixture
@@ -23,7 +30,9 @@ def api(env):
     for name in ("mark_ready", "labels", "assignees", "request_reviewers", "run_action", "label"):
         getattr(fake, name).return_value = None
     fake.default_branch.return_value = "main"
-    fake.run.return_value = {"id": 5, "head_branch": "feat"}
+    fake.run.return_value = dict(RUN)
+    fake.branch.return_value = {"sha": "a" * 40, "protected": False}
+    fake.rule_types.return_value = set()
 
     def factory(token):
         assert token == TOKEN
@@ -46,7 +55,7 @@ def _fill(kwargs, body):
 
 def writes(api):
     """The calls that change something on GitHub."""
-    return [c for c in api.method_calls if c[0] not in ("default_branch", "run")]
+    return [c for c in api.method_calls if c[0] not in ("default_branch", "run", "branch", "rule_types")]
 
 
 CASES = [
@@ -112,25 +121,13 @@ CASES = [
     ),
     ("triage", {"number": 7, "add_labels": ["bug"]}, [api_call.labels("me/app", 7, ["bug"], [])]),
     ("triage", {"number": 7, "remove_reviewers": ["dave"]}, [api_call.request_reviewers("me/app", 7, [], ["dave"])]),
-    (
-        "workflow_run",
-        {"action": "rerun", "run_id": 5},
-        [api_call.run("me/app", 5), api_call.default_branch("me/app"), api_call.run_action("me/app", 5, "rerun")],
-    ),
+    ("workflow_run", {"action": "rerun", "run_id": 5}, [*RUN_READS, api_call.run_action("me/app", 5, "rerun")]),
     (
         "workflow_run",
         {"action": "rerun_failed", "run_id": 5},
-        [
-            api_call.run("me/app", 5),
-            api_call.default_branch("me/app"),
-            api_call.run_action("me/app", 5, "rerun_failed"),
-        ],
+        [*RUN_READS, api_call.run_action("me/app", 5, "rerun_failed")],
     ),
-    (
-        "workflow_run",
-        {"action": "cancel", "run_id": 5},
-        [api_call.run("me/app", 5), api_call.default_branch("me/app"), api_call.run_action("me/app", 5, "cancel")],
-    ),
+    ("workflow_run", {"action": "cancel", "run_id": 5}, [*RUN_READS, api_call.run_action("me/app", 5, "cancel")]),
     (
         "label",
         {"action": "create", "name": "needs info", "color": "a1B2c3", "description": "Waiting on the reporter"},
@@ -478,13 +475,65 @@ def test_label_edit_new_name_checked(env, api):
 # --- workflow runs -----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("action", ["rerun", "rerun_failed", "cancel"])
-@pytest.mark.parametrize("branch", ["main", "release/1.2", None, ""])
-def test_workflow_run_on_default_branch_refused(env, api, action, branch):
-    api.run.return_value = {"id": 5, "head_branch": branch}
-    with pytest.raises(Refused, match="web UI"):
+def _refused_run(env, api, action="rerun"):
+    with pytest.raises(Refused, match="web UI") as e:
         call(env, "workflow_run", repo="me/app", action=action, run_id=5)
     assert writes(api) == []
+    assert str(e.value).startswith(UNTRUSTED + "\n")  # it quotes what GitHub said about the run
+    return str(e.value)
+
+
+@pytest.mark.parametrize("action", ["rerun", "rerun_failed", "cancel"])
+@pytest.mark.parametrize("branch", ["main", "release/1.2", None, "", 7])
+def test_workflow_run_on_default_branch_refused(env, api, action, branch):
+    api.run.return_value = RUN | {"head_branch": branch}
+    _refused_run(env, api, action)
+
+
+@pytest.mark.parametrize("action", ["rerun", "rerun_failed", "cancel"])
+@pytest.mark.parametrize(
+    "event", ["release", "workflow_dispatch", "schedule", "deployment", "pull_request_target", "workflow_run", None]
+)
+def test_workflow_run_other_events_refused(env, api, action, event):
+    """Only push and pull_request runs are tied to a branch an agent can push; the rest may deploy."""
+    api.run.return_value = RUN | {"event": event}
+    _refused_run(env, api, action)
+
+
+def test_workflow_run_on_a_tag_push_refused(env, api):
+    api.run.return_value = RUN | {"head_branch": "v1.2.0"}
+    api.branch.side_effect = lambda repo, branch: None if branch == "v1.2.0" else {"sha": "a" * 40, "protected": False}
+    assert "v1.2.0" in _refused_run(env, api)
+
+
+def test_workflow_run_on_a_deleted_branch_refused(env, api):
+    api.branch.return_value = None
+    _refused_run(env, api)
+
+
+def test_workflow_run_on_a_branch_protected_on_github_refused(env, api):
+    api.branch.return_value = {"sha": "a" * 40, "protected": True}
+    assert "protected on GitHub" in _refused_run(env, api)
+
+
+@pytest.mark.parametrize("rule", ["update", "non_fast_forward", "required_deployments"])
+def test_workflow_run_on_a_ruleset_branch_refused(env, api, rule):
+    api.rule_types.return_value = {rule, "creation"}
+    assert rule in _refused_run(env, api)
+
+
+@pytest.mark.parametrize("head", [{"full_name": "evil/app"}, None, {}, "me/app"])
+def test_workflow_run_from_a_fork_refused(env, api, head):
+    api.run.return_value = RUN | {"event": "pull_request", "head_repository": head}
+    _refused_run(env, api)
+
+
+@pytest.mark.parametrize("event", ["push", "pull_request"])
+def test_workflow_run_on_a_feature_branch_allowed(env, api, event):
+    api.run.return_value = RUN | {"event": event, "head_repository": {"full_name": "Me/App"}}
+    out = call(env, "workflow_run", repo="me/app", action="rerun", run_id=5)
+    assert writes(api) == [api_call.run_action("me/app", 5, "rerun")]
+    assert out.startswith(UNTRUSTED + "\n")
 
 
 # --- what GitHub says, and what the agent is told ----------------------------------------------
@@ -505,8 +554,15 @@ def test_github_message_reaches_the_agent(env, body):
 
 
 def test_every_post_sends_a_json_body(env):
-    gh = _real_client(env, {("GET", "repos/me/app/actions/runs/5"): {"head_branch": "feat"}})
-    gh.default_branch = lambda repo: "main"
+    gh = _real_client(
+        env,
+        {
+            ("GET", "repos/me/app/actions/runs/5"): RUN,
+            ("GET", "repos/me/app"): {"default_branch": "main"},
+            ("GET", "repos/me/app/branches/feat"): {"commit": {"sha": "a" * 40}, "protected": False},
+            ("GET", "repos/me/app/rules/branches/feat"): [],
+        },
+    )
     call(env, "workflow_run", repo="me/app", action="rerun", run_id=5)
     assert gh._opener.calls[-1] == ("POST", "repos/me/app/actions/runs/5/rerun", {})
 

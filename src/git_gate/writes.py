@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from git_gate import Refused
 from git_gate.config import Rules
-from git_gate.github import GitHub
+from git_gate.github import PROTECTING_RULES, FromGitHub, GitHub
 from git_gate.gitops import Git
 from git_gate.paths import read_workspace_file
 
@@ -48,6 +48,7 @@ LABEL_ACTIONS = {
     "create": ({"name"}, {"color", "description"}, set()),
     "edit": ({"name"}, {"color", "description", "new_name"}, {"color", "description", "new_name"}),
 }
+RUN_EVENTS = {"push", "pull_request"}  # runs tied to a branch; others may be deploys, schedules or forks' code
 RUN_ACTIONS = {"rerun": "Reran", "rerun_failed": "Reran the failed jobs of", "cancel": "Cancelled"}
 NOT_ACTIONS = {
     "approve": "Approving is the user's: the token acts as the user, so an approval here would be the user "
@@ -68,6 +69,31 @@ class Context:
     token: str
     api: GitHub
     git: Git
+
+
+def protection(
+    rules: Rules, api: GitHub, repo: str, branch: str, default: str, *, must_exist: bool = False
+) -> str | None:
+    """Why `branch` is the user's, or None: the one protection rule for push, prune and workflow_run.
+
+    The default branch, a protected_branches match in rules.toml, GitHub's protected flag and
+    ruleset rules that guard updates each make it the user's; with `must_exist`, so does a branch
+    GitHub no longer has. API failures raise: they are not answers.
+    """
+    if branch == default:
+        return f"{branch} is the default branch of {repo}."
+    for pattern in rules.protected_branches:
+        if fnmatch.fnmatchcase(branch, pattern):
+            return f"{branch} matches protected pattern {pattern!r} in rules.toml."
+    info = api.branch(repo, branch)
+    if info is None and must_exist:
+        return f"{repo} has no branch {branch}."
+    if info and info["protected"]:
+        return f"{branch} is protected on GitHub."
+    rules_on = api.rule_types(repo, branch) & PROTECTING_RULES
+    if rules_on:
+        return f"{branch} is covered by ruleset rules: {', '.join(sorted(rules_on))}."
+    return None
 
 
 # --- checks ------------------------------------------------------------------------------------
@@ -268,29 +294,30 @@ def triage(
 
 
 def workflow_run(ctx: Context, repo: str, action: str, run_id: int) -> str:
-    """Rerun or cancel a run, but never one on the default branch or a protected branch: rerunning
-    an old deploy redeploys old code, and cancelling one can leave a deploy half done."""
+    """Rerun or cancel a run only when it is a push or pull_request run of this repo, on a branch
+    that still exists and that push could update itself. Anywhere else a run may deploy:
+    rerunning an old deploy redeploys old code, and cancelling one can leave it half done."""
     ctx.rules.require_write(repo)
     if not isinstance(action, str) or action not in RUN_ACTIONS:
         raise Refused(f"workflow_run has no action {_show(action)}; use one of {', '.join(RUN_ACTIONS)}.")
     n = _number(run_id, "run_id")
     api = ctx.api
-    branch = api.run(repo, n).get("head_branch")
-    default = api.default_branch(repo)
-    web = f"https://github.com/{repo}/actions/runs/{n}"
-    reason = None
-    if not isinstance(branch, str) or not branch:
-        reason = "GitHub names no branch for it"
-    elif branch == default:
-        reason = f"it ran on {branch}, the default branch of {repo}"
+    run = api.run(repo, n)
+    branch, event, head = run.get("head_branch"), run.get("event"), run.get("head_repository")
+    source = head.get("full_name") if isinstance(head, dict) else None
+    if not isinstance(event, str) or event not in RUN_EVENTS:
+        reason = f"it was started by a {_show(event)} event, not a push or pull request."
+    elif not isinstance(source, str) or source.lower() != repo.lower():
+        reason = f"it ran code from {_show(source)}, not from a branch of {repo}."
+    elif not isinstance(branch, str) or not branch:
+        reason = "GitHub names no branch for it."
     else:
-        for pattern in ctx.rules.protected_branches:
-            if fnmatch.fnmatchcase(branch, pattern):
-                reason = f"it ran on {branch}, which matches protected pattern {pattern!r} in rules.toml"
-                break
+        reason = protection(ctx.rules, api, repo, branch, api.default_branch(repo), must_exist=True)
+    web = f"https://github.com/{repo}/actions/runs/{n}"
     if reason:
-        raise Refused(
-            f"Not touching run {n}: {reason}. Rerunning a run there can redeploy old code, and cancelling one "
+        # The reason quotes what GitHub said about the run, so it is marked as GitHub content.
+        raise FromGitHub(
+            f"Not touching run {n}: {reason} Rerunning a run there can redeploy old code, and cancelling one "
             f"can leave a deploy half done, so that is the user's: ask them to do it in the web UI at {web}"
         )
     api.run_action(repo, n, action)

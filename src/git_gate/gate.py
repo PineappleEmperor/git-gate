@@ -1,7 +1,6 @@
 """The gate's tools. Each call re-reads rules and token."""
 
 import fcntl
-import fnmatch
 import functools
 import hashlib
 import inspect
@@ -21,7 +20,7 @@ from pathlib import Path
 
 from git_gate import Refused, ghpolicy, writes
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
-from git_gate.github import PROTECTING_RULES, FromGitHub, GitHub
+from git_gate.github import FromGitHub, GitHub
 from git_gate.gitops import EMPTY, MAX_STDERR, Git
 from git_gate.handover import Handovers
 from git_gate.mirror import MAX_HAVE, Mirror, Protected, comparison
@@ -157,23 +156,8 @@ class Gate:
             f.truncate()
             f.write("".join(f"{t!r}\n" for t in stamps))
 
-    def _protection(self, rules: Rules, api: GitHub, repo: str, branch: str, default: str) -> str | None:
-        """Why `branch` is the user's to push, or None. API failures raise: they are not answers."""
-        if branch == default:
-            return f"{branch} is the default branch of {repo}."
-        for pattern in rules.protected_branches:
-            if fnmatch.fnmatchcase(branch, pattern):
-                return f"{branch} matches protected pattern {pattern!r} in rules.toml."
-        info = api.branch(repo, branch)
-        if info and info["protected"]:
-            return f"{branch} is protected on GitHub."
-        rules_on = api.rule_types(repo, branch) & PROTECTING_RULES
-        if rules_on:
-            return f"{branch} is covered by ruleset rules: {', '.join(sorted(rules_on))}."
-        return None
-
     def _require_unprotected(self, rules: Rules, api: GitHub, repo: str, branch: str, default: str) -> None:
-        reason = self._protection(rules, api, repo, branch, default)
+        reason = writes.protection(rules, api, repo, branch, default)
         if reason:
             raise Refused(reason)
 
@@ -290,7 +274,7 @@ class Gate:
             copy_in(rules, bundle, staged, MAX_BUNDLE, "bundle")
             api = self.github(token)
             default = api.default_branch(repo)
-            protected = self._protection(rules, api, repo, branch, default)
+            protected = writes.protection(rules, api, repo, branch, default)
             with self.mirror.lock(repo):
                 heads = self.mirror.sync(repo, token, rules)
                 sha = self.mirror.import_bundle(repo, staged, branch, rules)
