@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 
@@ -74,7 +75,7 @@ def test_import_bundle_returns_branch_sha(env, m, rules, checkout):
     git("switch", "-q", "-c", "feat", cwd=checkout)
     commit(checkout, "a.txt")
     tip = commit(checkout, "b.txt")
-    b = bundle(checkout, env.tmp / "push.bundle", "feat")
+    b = bundle(checkout, env.state / "tmp" / "push.bundle", "feat")
     m.sync(REPO, TOKEN, rules)
     assert m.import_bundle(REPO, b, "feat", rules) == tip
     mgit(m, "cat-file", "-e", f"{tip}^{{commit}}")
@@ -86,15 +87,17 @@ def test_import_twice_and_nested_names(env, m, rules, checkout):
     git("switch", "-q", "-c", "feat", cwd=checkout)
     commit(checkout, "a.txt")
     m.sync(REPO, TOKEN, rules)
-    m.import_bundle(REPO, bundle(checkout, env.tmp / "1.bundle", "feat"), "feat", rules)
+    m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / "1.bundle", "feat"), "feat", rules)
     git("switch", "-q", "--detach", cwd=checkout)
     git("branch", "-q", "-D", "feat", cwd=checkout)
     git("switch", "-q", "-c", "feat/x", cwd=checkout)
     tip = commit(checkout, "b.txt")
-    assert m.import_bundle(REPO, bundle(checkout, env.tmp / "2.bundle", "feat/x"), "feat/x", rules) == tip
+    assert m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / "2.bundle", "feat/x"), "feat/x", rules) == tip
     git("commit", "-q", "--amend", "-m", "rewritten", cwd=checkout)
     rewritten = git("rev-parse", "HEAD", cwd=checkout)
-    assert m.import_bundle(REPO, bundle(checkout, env.tmp / "3.bundle", "feat/x"), "feat/x", rules) == rewritten
+    assert (
+        m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / "3.bundle", "feat/x"), "feat/x", rules) == rewritten
+    )
     assert mgit(m, "for-each-ref", "--format=%(refname)", "refs/gate/") == "refs/gate/incoming/feat/x"
 
 
@@ -110,7 +113,7 @@ def test_import_refuses_extra_refs(env, m, rules, checkout, extra):
         refs, branch = ["other"], "feat"
     else:
         refs, branch = ["feat", *extra], "feat"
-    b = bundle(checkout, env.tmp / "push.bundle", *refs)
+    b = bundle(checkout, env.state / "tmp" / "push.bundle", *refs)
     m.sync(REPO, TOKEN, rules)
     with pytest.raises(Refused, match="exactly one ref"):
         m.import_bundle(REPO, b, branch, rules)
@@ -121,10 +124,10 @@ def test_import_refuses_corrupt_bundle(env, m, rules, checkout):
     git("switch", "-q", "-c", "feat", cwd=checkout)
     commit(checkout, "a.txt", "some content " * 50)
     m.sync(REPO, TOKEN, rules)
-    m.import_bundle(REPO, bundle(checkout, env.tmp / "good.bundle", "feat"), "feat", rules)
+    m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / "good.bundle", "feat"), "feat", rules)
     assert mgit(m, "for-each-ref", "refs/gate/incoming/") != ""
     commit(checkout, "b.txt", "other content " * 50)
-    b = bundle(checkout, env.tmp / "bad.bundle", "feat")
+    b = bundle(checkout, env.state / "tmp" / "bad.bundle", "feat")
     data = bytearray(b.read_bytes())
     start = data.index(b"PACK") + 12
     for i in range(start + 8, min(start + 40, len(data) - 20)):
@@ -136,7 +139,7 @@ def test_import_refuses_corrupt_bundle(env, m, rules, checkout):
 
 
 def test_import_refuses_non_bundle(env, m, rules):
-    b = env.tmp / "junk.bundle"
+    b = env.state / "tmp" / "junk.bundle"
     b.write_text("not a bundle\n")
     with pytest.raises(Refused, match="not a git bundle"):
         m.import_bundle(REPO, b, "feat", rules)
@@ -149,7 +152,7 @@ def test_import_missing_prerequisites(env, m, rules, checkout):
     git("update-ref", "refs/remotes/origin/gone", unpushed, cwd=checkout)
     git("switch", "-q", "-c", "feat", cwd=checkout)
     commit(checkout, "feat.txt")
-    b = bundle(checkout, env.tmp / "push.bundle", "feat")
+    b = bundle(checkout, env.state / "tmp" / "push.bundle", "feat")
     m.sync(REPO, TOKEN, rules)
     with pytest.raises(Refused) as e:
         m.import_bundle(REPO, b, "feat", rules)
@@ -161,8 +164,39 @@ def test_import_missing_prerequisites(env, m, rules, checkout):
 
 
 def test_import_refuses_bad_branch_name(env, m, rules):
+    b = env.state / "tmp" / "x.bundle"
+    b.write_text("x")
     with pytest.raises(Refused, match="branch name"):
-        m.import_bundle(REPO, env.tmp / "x.bundle", "-x", rules)
+        m.import_bundle(REPO, b, "-x", rules)
+
+
+def _no_git(*args, **kwargs):
+    raise AssertionError("git ran on a refused bundle path")
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink", "outside", "fifo", "via-symlinked-dir", "missing"])
+def test_import_requires_regular_file_in_state(env, m, rules, checkout, monkeypatch, kind):
+    """git fetch would read a directory as a repository; only a regular file in gate storage is unbundled."""
+    git("switch", "-q", "-c", "feat", cwd=checkout)
+    commit(checkout, "a.txt")
+    good = bundle(checkout, env.state / "tmp" / "good.bundle", "feat")
+    target = env.state / "tmp" / f"{kind}.bundle"
+    if kind == "directory":
+        target.mkdir()
+    elif kind == "symlink":
+        target.symlink_to(good)
+    elif kind == "outside":
+        target = bundle(checkout, env.tmp / "outside.bundle", "feat")
+    elif kind == "fifo":
+        os.mkfifo(target)
+    elif kind == "via-symlinked-dir":
+        bundle(checkout, env.tmp / "elsewhere.bundle", "feat")
+        (env.state / "tmp" / "out").symlink_to(env.tmp)
+        target = env.state / "tmp" / "out" / "elsewhere.bundle"
+    m.path(REPO)
+    monkeypatch.setattr(m.git, "run", _no_git)
+    with pytest.raises(Refused, match="bundle"):
+        m.import_bundle(REPO, target, "feat", rules)
 
 
 # --- export --------------------------------------------------------------------------------
@@ -282,7 +316,7 @@ def test_ancestry_helpers(env, m, rules, checkout):
     commit(checkout, "a.txt")
     tip = commit(checkout, "b.txt")
     m.sync(REPO, TOKEN, rules)
-    m.import_bundle(REPO, bundle(checkout, env.tmp / "p.bundle", "feat"), "feat", rules)
+    m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / "p.bundle", "feat"), "feat", rules)
     upstream = seed_push(env, "up.txt")
     m.sync(REPO, TOKEN, rules)
     assert m.is_ancestor(REPO, base, tip, rules) is True
@@ -294,7 +328,7 @@ def test_ancestry_helpers(env, m, rules, checkout):
     assert m.new_commits(REPO, base, upstream, rules) == []
     git("switch", "-q", "--orphan", "lonely", cwd=checkout)
     orphan = commit(checkout, "o.txt")
-    m.import_bundle(REPO, bundle(checkout, env.tmp / "o.bundle", "lonely"), "lonely", rules)
+    m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / "o.bundle", "lonely"), "lonely", rules)
     assert m.merge_base(REPO, orphan, tip, rules) is None
     with pytest.raises(Refused):
         m.is_ancestor(REPO, "--all", tip, rules)
@@ -306,7 +340,7 @@ def test_ancestry_helpers(env, m, rules, checkout):
 def _touched(env, m, rules, checkout, branch, patterns=DEFAULT_HANDOVER_PATHS):
     """Bundle `branch` from the checkout, import it, and run the checks as push will."""
     heads = m.sync(REPO, TOKEN, rules)
-    sha = m.import_bundle(REPO, bundle(checkout, env.tmp / f"{branch}.bundle", branch), branch, rules)
+    sha = m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / f"{branch}.bundle", branch), branch, rules)
     base = heads.get(branch) or heads.get("main")
     return sha, m.touched(REPO, m.new_commits(REPO, sha, base, rules), base, sha, patterns, rules)
 
@@ -391,7 +425,7 @@ def test_touched_root_commit_without_base(env, m, rules, checkout):
     git("switch", "-q", "--orphan", "fresh", cwd=checkout)
     root = commit(checkout, ".githooks/pre-commit")
     m.sync(REPO, TOKEN, rules)
-    sha = m.import_bundle(REPO, bundle(checkout, env.tmp / "f.bundle", "fresh"), "fresh", rules)
+    sha = m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / "f.bundle", "fresh"), "fresh", rules)
     assert sha == root
     assert m.touched(REPO, m.new_commits(REPO, sha, None, rules), None, sha, DEFAULT_HANDOVER_PATHS, rules) == [root]
 
@@ -422,7 +456,20 @@ def test_touched_ignores_replace_refs(env, m, rules, checkout):
         ("skills/x.md", ("skills/**",), True),
         ("docs/.pre-commit-config.yaml", (), False),
         (".github/dependabot.yml", (), False),
-        (".GITHUB/workflows/ci.yml", (), False),
+        (".GITHUB/workflows/ci.yml", (), True),
+        (".GitHooks/pre-commit", (), True),
+        (".Pre-Commit-Config.YAML", (), True),
+        ("Skills/X.md", ("skills/**",), True),
+        ("skills/x.md", ("SKILLS/**",), True),
+        # patterns are normalised
+        ("skills/x.md", ("/skills/**",), True),
+        ("skills/x.md", ("skills/",), True),
+        ("skills/x.md", ("./skills/**",), True),
+        ("skills", ("/skills/**",), True),
+        ("skills", ("skills/",), True),
+        ("skills", ("./skills/**",), True),
+        ("skills/x.md", ("./",), True),
+        ("skillset/x.md", ("skills/",), False),
     ],
 )
 def test_touched_patterns(env, m, rules, checkout, path, extra, hit):
@@ -450,7 +497,7 @@ def test_push_from_mirror(env, m, rules, checkout):
     tip = commit(checkout, "a.txt")
     git("tag", "v1", cwd=checkout)
     m.sync(REPO, TOKEN, rules)
-    sha = m.import_bundle(REPO, bundle(checkout, env.tmp / "p.bundle", "feat"), "feat", rules)
+    sha = m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / "p.bundle", "feat"), "feat", rules)
     proc = m.push(REPO, sha, "feat", TOKEN, rules)
     assert isinstance(proc, subprocess.CompletedProcess)
     assert proc.returncode == 0, proc.stderr
@@ -509,4 +556,65 @@ def test_import_under_github_protocol_allowlist(env, rules, checkout, tmp_path):
     m = Mirror(Git(tmp_path / "s", "https://github.com"), tmp_path / "s")
     git("switch", "-q", "--orphan", "fresh", cwd=checkout)
     root = commit(checkout, "a.txt")
-    assert m.import_bundle(REPO, bundle(checkout, env.tmp / "f.bundle", "fresh"), "fresh", rules) == root
+    b = bundle(checkout, tmp_path / "s/tmp/f.bundle", "fresh")
+    assert m.import_bundle(REPO, b, "fresh", rules) == root
+
+
+# --- symlinks into handover paths ----------------------------------------------------------
+
+
+def link(repo: Path, path: str, target: str) -> str:
+    (repo / path).parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(target, repo / path)
+    git("add", path, cwd=repo)
+    git("commit", "-q", "-m", f"link {path}", cwd=repo)
+    return git("rev-parse", "HEAD", cwd=repo)
+
+
+def _seed_link(env, path: str, target: str, files: dict[str, str]) -> None:
+    seed = env.tmp / "seed"
+    for name, content in files.items():
+        commit(seed, name, content)
+    link(seed, path, target)
+    git("push", "-q", env.url, "main", cwd=seed)
+
+
+@pytest.mark.parametrize(
+    ("path", "target", "files", "edit"),
+    [
+        (".githooks", "scripts", {"scripts/pre-commit": "#!/bin/sh"}, "scripts/x"),
+        (".pre-commit-config.yaml", "tools/pc.yaml", {"tools/pc.yaml": "repos: []"}, "tools/pc.yaml"),
+        (".github", "ci", {"ci/workflows/ci.yml": "on: push"}, "ci/workflows/ci.yml"),
+        (".github/workflows", "../ci", {"ci/ci.yml": "on: push"}, "ci/ci.yml"),
+    ],
+)
+def test_touched_tip_with_symlink_into_handover_path(env, m, rules, checkout, path, target, files, edit):
+    """A symlink at or above a handover path makes any edit through it a handover-path change."""
+    _seed_link(env, path, target, files)
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
+    sha = commit(checkout, edit, "changed")
+    assert _touched(env, m, rules, checkout, "topic")[1] == [sha]
+
+
+def test_touched_commit_adding_dotgithub_symlink(env, m, rules, checkout):
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "ci/workflows/ci.yml", "on: push")
+    sha = link(checkout, ".github", "ci")
+    assert _touched(env, m, rules, checkout, "topic")[1] == [sha]
+
+
+def test_touched_symlink_matching_extra_pattern_case_insensitively(env, m, rules, checkout):
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "real/x.md")
+    sha = link(checkout, "Skills", "real")
+    assert _touched(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + ("skills/**",))[1] == [sha]
+
+
+def test_touched_ordinary_symlinks_pass(env, m, rules, checkout):
+    _seed_link(env, "docs/readme", "../README.md", {"docs/index.md": "hi"})
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
+    commit(checkout, "README.md", "changed")
+    link(checkout, "github", "docs")
+    assert _touched(env, m, rules, checkout, "topic")[1] == []

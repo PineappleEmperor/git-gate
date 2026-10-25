@@ -9,6 +9,7 @@ path. Methods do not lock: callers hold `lock(repo)` around each sequence of cal
 import os
 import re
 import shutil
+import stat
 import subprocess
 from contextlib import contextmanager
 from itertools import takewhile
@@ -31,6 +32,7 @@ BUNDLE_HOWTO = "git bundle create <file> {branch} --not --remotes=origin"
 class Mirror:
     def __init__(self, git: Git, state: Path):
         self.git = git
+        self.state = state
         self.root = state / "mirrors"
         self.template = state / "template"
 
@@ -100,11 +102,11 @@ class Mirror:
     def import_bundle(self, repo: str, bundle: Path, branch: str, rules: Rules) -> str:
         """Unbundle refs/heads/<branch> into refs/gate/incoming/<branch>; return its commit.
 
-        Call after `sync`, so prerequisites the bundle needs from GitHub are already here.
+        Call after `sync`, so prerequisites the bundle needs from GitHub are already here. The
+        bundle must be a regular file in gate storage: git would read a directory as a repository.
         """
+        bundle = self._stored_file(bundle)
         self.git.check_branch(branch, rules)
-        if not bundle.is_absolute():
-            raise Refused("The bundle path must be absolute.")
         ref = f"refs/heads/{branch}"
         listed = self._git(repo, rules, ["bundle", "list-heads", str(bundle)], check=False)
         if listed.returncode != 0:
@@ -146,6 +148,21 @@ class Mirror:
             self._clear_incoming(repo, rules)
             raise Refused(f"{ref} in the bundle must point at a commit; it points at a {kind or 'missing'} object.")
         return sha
+
+    def _stored_file(self, bundle: Path) -> Path:
+        """The bundle's real path, if it is a regular file (not a symlink) inside the state dir."""
+        if not bundle.is_absolute():
+            raise Refused("The bundle path must be absolute.")
+        try:
+            st = os.lstat(bundle)
+        except OSError as e:
+            raise Refused(f"Cannot read the bundle at {bundle}: {e.strerror}.") from None
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused(f"The bundle at {bundle} must be a regular file.")
+        real = bundle.resolve()
+        if not real.is_relative_to(self.state.resolve()):
+            raise Refused(f"The bundle at {bundle} is not in the gate's storage.")
+        return real
 
     def _clear_incoming(self, repo: str, rules: Rules) -> None:
         refs = self._git(repo, rules, ["for-each-ref", "--format=%(refname)", INCOMING]).stdout.split()
@@ -216,7 +233,9 @@ class Mirror:
 
         Merges are diffed dense-combined (`--cc`), which hides a merge that keeps one parent's older
         file, so when no commit is named the whole tree is also compared with where sha forked from
-        base; a difference there names sha itself.
+        base; a difference there names sha itself. sha is also named when its tree holds a symlink at,
+        inside or above a handover path, since an edit to its target is an edit through that path.
+        Matching ignores case.
         """
         hits = self._commit_touches(repo, shas, patterns, rules)
         if not hits and base:
@@ -227,7 +246,18 @@ class Mirror:
             ).stdout  # fmt: skip
             if any(_matches(p, patterns) for p in out.split("\0") if p):
                 hits = [sha]
+        if sha not in hits and any(_link_reaches(p, patterns) for p in self._symlinks(repo, sha, rules)):
+            hits.append(sha)
         return hits
+
+    def _symlinks(self, repo: str, sha: str, rules: Rules) -> list[str]:
+        out = self._git(repo, rules, ["ls-tree", "-r", "-z", "--full-tree", _oid(sha)]).stdout
+        links = []
+        for entry in out.split("\0"):
+            meta, _, path = entry.partition("\t")
+            if meta.startswith("120000 "):
+                links.append(path)
+        return links
 
     def _commit_touches(self, repo: str, shas: list[str], patterns, rules: Rules) -> list[str]:
         if not shas:
@@ -259,15 +289,39 @@ class Mirror:
         self._git(repo, rules, ["update-ref", "-d", _handover_ref(ref)])
 
 
+def _normalise(pattern: str) -> str:
+    """Case-folded, without "./" or "/" segments; a trailing "/" (or nothing at all) means everything below."""
+    parts = [part for part in pattern.casefold().split("/") if part not in ("", ".")]
+    if pattern.endswith("/") or not parts:
+        parts.append("**")
+    return "/".join(parts)
+
+
+def _literal(pattern: str) -> str:
+    """A normalised pattern's leading components up to the first glob (all of it if there is none)."""
+    return "/".join(takewhile(lambda part: not GLOB.search(part), pattern.split("/")))
+
+
 def _matches(path: str, patterns) -> bool:
-    """`PurePosixPath.full_match`, plus the file sitting where a pattern's directory would be."""
+    """`PurePosixPath.full_match` ignoring case, plus a file where a pattern's directory would be."""
+    path = path.casefold()
     p = PurePosixPath(path)
-    for pattern in patterns:
+    for pattern in map(_normalise, patterns):
         if p.full_match(pattern):
             return True
-        parts = pattern.split("/")
-        literal = list(takewhile(lambda s: not GLOB.search(s), parts))
-        if literal and len(literal) < len(parts) and path == "/".join(literal):
+        literal = _literal(pattern)
+        if literal and literal != pattern and path == literal:
+            return True
+    return False
+
+
+def _link_reaches(path: str, patterns) -> bool:
+    """A symlink matching a pattern, or at or above its literal directory, leads into a handover path."""
+    if _matches(path, patterns):
+        return True
+    path = path.casefold()
+    for literal in (_literal(_normalise(pattern)) for pattern in patterns):
+        if literal and (literal == path or literal.startswith(path + "/")):
             return True
     return False
 
