@@ -1,6 +1,10 @@
 """MCP stdio server exposing the gate's tools."""
 
+import json
+import subprocess
+from collections.abc import Callable
 from functools import partial
+from pathlib import Path
 
 import anyio.to_thread
 from mcp.server.mcpserver import MCPServer
@@ -8,6 +12,51 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from git_gate import Refused
 from git_gate.gate import Gate
+
+RELAY_TIMEOUT = 4 * 3600  # a backstop only; each call enforces the timeouts in rules.toml
+
+
+class Relay:
+    """Runs each call in a fresh process from the release `current` points to when it arrives.
+
+    An installed server lives as long as its conversation; relaying means a new install applies
+    to the next call in every open conversation. The tool list itself stays this release's. If
+    `current` is rolled back to a release from before the relay, the call runs here instead.
+    """
+
+    def __init__(self, root: Path, fallback: Callable[[], Gate] = Gate):
+        self.root = root
+        self._fallback = fallback
+        self._gate: Gate | None = None
+
+    @classmethod
+    def for_installed(cls) -> Relay | None:
+        release = Path(__file__).resolve().parents[2]
+        root = release.parent.parent
+        if release.parent.name != "releases" or not (root / "current").is_symlink():
+            return None
+        return cls(root)
+
+    def __call__(self, tool: str, kwargs: dict) -> str:
+        target = (self.root / "current").resolve()
+        if not (target / "src/git_gate/call.py").is_file():
+            self._gate = self._gate or self._fallback()
+            return self._gate.call(tool, getattr(self._gate, tool), **kwargs)
+        try:
+            proc = subprocess.run(
+                [str(target / "bin/git-gate"), "call", tool],
+                input=json.dumps(kwargs),
+                capture_output=True,
+                text=True,
+                timeout=RELAY_TIMEOUT,
+            )
+            result = json.loads(proc.stdout)
+        except OSError, ValueError, subprocess.TimeoutExpired:
+            raise Refused(f"git-gate release {target.name[:12]} gave no answer.") from None
+        if "ok" in result:
+            return result["ok"]
+        raise Refused(result.get("refused") or result.get("error") or "git-gate returned nothing.")
+
 
 INSTRUCTIONS = """\
 GitHub access for this sandbox. The token lives outside it; use these tools instead of git
@@ -23,13 +72,18 @@ Force-push, tags and workflow changes are the user's: hand them the command the 
 """
 
 
-def build(gate: Gate | None = None) -> MCPServer:
-    gate = gate or Gate()
+def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
+    if relay is None:
+        gate = gate or Gate()
     server = MCPServer("git-gate", instructions=INSTRUCTIONS)
 
     async def run(tool: str, **kwargs) -> str:
+        if relay is not None:
+            call = partial(relay, tool, kwargs)
+        else:
+            call = partial(gate.call, tool, getattr(gate, tool), **kwargs)
         try:
-            return await anyio.to_thread.run_sync(partial(gate.call, tool, getattr(gate, tool), **kwargs))
+            return await anyio.to_thread.run_sync(call)
         except Refused as e:
             raise ToolError(str(e)) from None
 
@@ -77,4 +131,4 @@ def build(gate: Gate | None = None) -> MCPServer:
 
 
 def main() -> None:
-    build().run("stdio")
+    build(relay=Relay.for_installed()).run("stdio")
