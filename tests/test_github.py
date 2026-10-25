@@ -33,6 +33,10 @@ class FakeOpener:
         reply = self.replies.get((req.get_method(), path), {"html_url": URL})
         if isinstance(reply, int):
             raise urllib.error.HTTPError(req.full_url, reply, "status", {}, None)
+        if isinstance(reply, tuple):  # (status, message, headers): an error with a GitHub-style body
+            status, message, headers = reply
+            fp = io.BytesIO(json.dumps({"message": message}).encode())
+            raise urllib.error.HTTPError(req.full_url, status, "status", headers, fp)
         return FakeResponse(json.dumps(reply).encode())
 
 
@@ -42,9 +46,40 @@ def make(replies=None):
     return gh
 
 
-def test_rules_403_means_no_rules():
-    gh = make({("GET", "repos/me/app/rules/branches/main"): 403})
+RULES = ("GET", "repos/me/app/rules/branches/main")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Upgrade to GitHub Pro or make this repository public to enable this feature.",
+        "Upgrade to GitHub Pro to enable this feature.",
+        "Make this repository public to enable it.",
+    ],
+)
+def test_rules_plan_limit_403_means_no_rules(message):
+    gh = make({RULES: (403, message, {})})
     assert gh.rule_types("me/app", "main") == set()
+
+
+@pytest.mark.parametrize(
+    ("message", "headers"),
+    [
+        ("API rate limit exceeded for user.", {"x-ratelimit-remaining": "0"}),
+        ("Resource protected by organization SAML enforcement.", {"x-github-sso": "required; url=x"}),
+        ("Resource not accessible by personal access token", {}),
+    ],
+)
+def test_rules_other_403_refuses(message, headers):
+    gh = make({RULES: (403, message, headers)})
+    with pytest.raises(Refused, match="403"):
+        gh.rule_types("me/app", "main")
+
+
+def test_rules_403_without_a_readable_body_refuses():
+    gh = make({RULES: 403})
+    with pytest.raises(Refused, match="403"):
+        gh.rule_types("me/app", "main")
 
 
 def test_rules_404_means_no_rules():

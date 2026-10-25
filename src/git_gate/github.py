@@ -4,6 +4,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 
 from git_gate import Refused
 
@@ -15,6 +16,11 @@ PROTECTING_RULES = {
     "required_status_checks",
     "required_deployments",
 }
+
+
+def _plan_limit(message: str) -> bool:
+    """True when a 403 says the plan cannot use the feature, rather than that the call was blocked."""
+    return "Upgrade to GitHub Pro" in message or "make this repository public" in message.lower()
 
 
 class _SameHostRedirects(urllib.request.HTTPRedirectHandler):
@@ -33,8 +39,15 @@ class GitHub:
         self.timeout = timeout
         self._opener = urllib.request.build_opener(_SameHostRedirects)
 
-    def _request(self, method: str, path: str, data: dict | None = None, absent: tuple[int, ...] = ()):
-        """JSON in and out. Statuses listed in `absent` mean "nothing there" and return None."""
+    def _request(
+        self,
+        method: str,
+        path: str,
+        data: dict | None = None,
+        absent: tuple[int, ...] = (),
+        absent_if: Callable[[int, str], bool] | None = None,
+    ):
+        """JSON in and out. Statuses in `absent`, or an error `absent_if(status, message)` accepts, give None."""
         req = urllib.request.Request(
             f"{self.api}/{path}",
             data=json.dumps(data).encode() if data is not None else None,
@@ -51,12 +64,20 @@ class GitHub:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 body = resp.read()
         except urllib.error.HTTPError as e:
-            if e.code in absent:
+            if e.code in absent or (absent_if and absent_if(e.code, self._message(e))):
                 return None
             raise Refused(f"GitHub {method} {path} returned {e.code}.") from None
         except urllib.error.URLError as e:
             raise Refused(f"GitHub {method} {path} failed: {e.reason}.") from None
         return json.loads(body) if body else {}
+
+    @staticmethod
+    def _message(error: urllib.error.HTTPError) -> str:
+        """The `message` of GitHub's JSON error body, or "" when there is none."""
+        try:
+            return str(json.loads(error.read()).get("message", ""))
+        except OSError, ValueError, AttributeError:
+            return ""
 
     @staticmethod
     def _branch(branch: str) -> str:
@@ -73,8 +94,14 @@ class GitHub:
         return {"sha": data["commit"]["sha"], "protected": bool(data.get("protected"))}
 
     def rule_types(self, repo: str, branch: str) -> set[str]:
-        # Free-plan private repos answer 403 ("Upgrade to GitHub Pro"): no rules there, not an error.
-        data = self._request("GET", f"repos/{repo}/rules/branches/{self._branch(branch)}", absent=(403, 404))
+        # Free-plan private repos answer 403 "Upgrade to GitHub Pro": no rules there. Any other 403
+        # (rate limit, SSO, missing permission) says nothing about the rules, so it must not read as "none".
+        data = self._request(
+            "GET",
+            f"repos/{repo}/rules/branches/{self._branch(branch)}",
+            absent=(404,),
+            absent_if=lambda status, message: status == 403 and _plan_limit(message),
+        )
         return {r.get("type", "") for r in data or []}
 
     def pulls_from(self, repo: str, branch: str) -> list[dict]:
