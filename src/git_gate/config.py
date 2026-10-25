@@ -11,6 +11,9 @@ from git_gate import Refused
 
 REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
 ACCESS_LEVELS = ("read", "write")
+DEFAULT_HANDOVER_PATHS = (".github/workflows/**", ".githooks/**", ".pre-commit-config.yaml")
+REPO_KEYS = ("access", "handover_paths", "push_deploys")
+OFF_SWITCH_MESSAGE = "git-gate is switched off: remove ~/.config/git-gate/disabled to turn it back on."
 
 
 def config_dir() -> Path:
@@ -22,25 +25,59 @@ def state_dir() -> Path:
 
 
 @dataclass(frozen=True)
+class RepoRules:
+    access: str  # "read" | "write"
+    handover_paths: tuple[str, ...]
+    push_deploys: bool
+
+
+@dataclass(frozen=True)
 class Rules:
     workspaces: tuple[Path, ...]
-    repos: dict[str, str]  # lower-case "owner/name" -> "read" | "write"
+    repos: dict[str, RepoRules]  # lower-case "owner/name"
     protected_branches: tuple[str, ...] = ("main", "master")
     git_timeout: int = 300
     gh_timeout: int = 1800
     forbidden: tuple[Path, ...] = field(default=())
 
-    def access(self, repo: str) -> str:
+    def repo(self, repo: str) -> RepoRules:
         if not REPO_RE.match(repo) or repo.endswith(".git") or ".." in repo:
             raise Refused(f"'{repo}' is not an owner/name repository.")
-        level = self.repos.get(repo.lower())
-        if level is None:
+        rules = self.repos.get(repo.lower())
+        if rules is None:
             raise Refused(f"{repo} is not on the git-gate repo allowlist (rules.toml [repos]).")
-        return level
+        return rules
+
+    def access(self, repo: str) -> str:
+        return self.repo(repo).access
 
     def require_write(self, repo: str) -> None:
         if self.access(repo) != "write":
             raise Refused(f"{repo} is read-only in rules.toml; this call needs write access.")
+
+
+def _parse_repo(path: Path, name: str, entry: object) -> RepoRules:
+    if isinstance(entry, str):
+        entry = {"access": entry}
+    if not isinstance(entry, dict):
+        raise Refused(f"{path}: bad repo entry {name!r} = {entry!r}.")
+    unknown = sorted(set(entry) - set(REPO_KEYS))
+    if unknown:
+        raise Refused(f"{path}: repo {name!r} has unknown keys {unknown}; allowed: {list(REPO_KEYS)}.")
+    if entry.get("access") not in ACCESS_LEVELS:
+        raise Refused(f'{path}: repo {name!r} needs access = "read" or "write".')
+    extra = entry.get("handover_paths", [])
+    if not isinstance(extra, list) or not all(isinstance(p, str) and p for p in extra):
+        raise Refused(f"{path}: repo {name!r} handover_paths must be a list of path patterns.")
+    push_deploys = entry.get("push_deploys", False)
+    if not isinstance(push_deploys, bool):
+        raise Refused(f"{path}: repo {name!r} push_deploys must be true or false.")
+    return RepoRules(entry["access"], DEFAULT_HANDOVER_PATHS + tuple(extra), push_deploys)
+
+
+def check_enabled(cfg: Path | None = None) -> None:
+    if ((cfg or config_dir()) / "disabled").exists():
+        raise Refused(OFF_SWITCH_MESSAGE)
 
 
 def load_rules(cfg: Path | None = None, extra_forbidden: tuple[Path, ...] = ()) -> Rules:
@@ -54,10 +91,10 @@ def load_rules(cfg: Path | None = None, extra_forbidden: tuple[Path, ...] = ()) 
         raise Refused(f"{path} is not valid TOML: {e}") from None
 
     repos = {}
-    for name, level in data.get("repos", {}).items():
-        if not REPO_RE.match(name) or level not in ACCESS_LEVELS:
-            raise Refused(f"{path}: bad repo entry {name!r} = {level!r}.")
-        repos[name.lower()] = level
+    for name, entry in data.get("repos", {}).items():
+        if not REPO_RE.match(name):
+            raise Refused(f"{path}: bad repo entry {name!r} = {entry!r}.")
+        repos[name.lower()] = _parse_repo(path, name, entry)
 
     forbidden = tuple(p.resolve() for p in (cfg, state_dir(), Path("/opt/git-gate"), *extra_forbidden))
     workspaces = []
