@@ -135,6 +135,47 @@ protected_branches = ["main", "master", "release/*"]
 - `handover_paths`: globs added to the defaults for that repo.
 - `push_deploys`: the push reply says plainly that this push deploys.
 
+## Session scoping
+
+Added after the rework (decided by the user): each conversation is sandboxed to its own repo
+unless the user grants it more, for reads as well as writes.
+
+- **A session is a project folder.** The gate names the calling session by the call process's
+  cwd: the relay's, which Claude Code sets when the conversation starts and which the child that
+  runs the call inherits. No tool argument can name it, and the agent's shell cannot move it. The
+  session is the one whose folder is the longest that holds the cwd, so a worktree under
+  `<folder>/.tmp/` belongs to `<folder>`. A cwd that is unknown or in no session's folder gets no
+  access, and the refusal names the folder and `gitgaterules`.
+- **Rules v2.** A rules file with `[sessions]` is v2: `[sessions."<folder>"]` with `repo` (its own,
+  write), `write` and `read` grants of repos or `@group`s, `[groups]` of named repo lists, and
+  `[repos."<owner/name>"]` for `handover_paths` and `push_deploys` only. A session's access to a repo
+  is the strongest of its grants, so overlaps from groups (a group holding the session's own repo)
+  are fine; the same repo written in both `read` and `write` of one session is an error. The
+  session's folder is its only workspace. A file without `[sessions]` is v1 and behaves as before.
+- **Fail closed.** Every problem in the file refuses every call, and `gitgaterules check` lists them
+  all, with line numbers where it can find them.
+- **`gitgaterules`** is the user's command, like `gitgatepush`: the gate exposes no tool for it. It
+  checks, shows and edits the file, and migrates v1. Every edit is validated by the gate's own loader,
+  backed up, written atomically and shown as a diff; the file is rewritten canonically, comments
+  dropped. Lists are deduplicated only where the gate itself treats entries as equal (repo names
+  ignore case, handover paths compare in canonical form, branch patterns only when identical).
+- **Migration does not trust git config.** A workspace's origin is the agent's to change, so it is
+  only a suggestion: `migrate --write` asks before each folder-to-repo pairing (no by default), needs
+  the repo's name typed for a repo claimed by two folders or a folder whose `.git` leads outside it,
+  and without a terminal takes only pairings named with `--yes-pairings`.
+- **Output from files and git is escaped** in everything `gitgaterules` prints, value by value, so
+  a folder name or remote URL cannot start a line of its own; URLs lose their credentials, query and
+  fragment.
+- **Audit.** Each line has `access`: the session's access to the call's repo (`write`, `read`,
+  `none`), `no-session`, or null under v1.
+
+What the cwd does not protect against: a conversation the user starts in a session's folder is that
+session, whoever starts it; a session folder nested inside another is also inside the outer
+session's workspace, which the outer conversation's own sandbox can already write; and a server
+started some other way than the user's registration, such as from a project's `.mcp.json`, runs
+wherever it is started. `.mcp.json` is write-protected in the sandbox and a default handover path,
+so an agent can neither add one nor push one.
+
 ## Relay
 
 Ships in the same release as the rework (the user agreed), so open conversations need their gate
