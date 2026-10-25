@@ -257,17 +257,28 @@ class Mirror:
 
         Nothing here depends on what the bundle claimed: only sha, remote and default_tip.
         """
-        exclude = comparison(remote, default_tip)
-        shas = self._git(repo, rules, ["rev-list", "--reverse", _oid(sha), *_not(exclude)]).stdout.split()
-        per_commit = self._commit_touches(repo, shas, patterns, rules)
+        shas = self._git(
+            repo, rules, ["rev-list", "--reverse", _oid(sha), *_not(comparison(remote, default_tip))]
+        ).stdout.split()
+        files, hit = set(), set()
+        if shas:
+            out = self._git(
+                repo, rules,
+                ["diff-tree", "--stdin", "-z", "-r", "--no-renames", "--name-only", "--cc", "--root"],
+                stdin="\n".join(shas) + "\n",
+            ).stdout  # fmt: skip
+            wanted, current = set(shas), None
+            for token in (t for t in out.split("\0") if t):
+                if token in wanted:
+                    current = token  # diff-tree names each commit before its paths
+                elif protected(token, patterns):
+                    files.add(token)
+                    hit.add(current or shas[0])  # a path before any commit: unexpected framing, blame one
         net = self._changed(repo, default_tip or self._empty_tree(repo, rules), sha, patterns, rules)
         if net and remote:
             net &= self._changed(repo, remote, sha, patterns, rules)
-        links = {p for p in self._links(repo, sha, rules) if reaches(p, patterns)}
-        files = set(net) | links
-        for paths in per_commit.values():
-            files.update(paths)
-        return Protected(tuple(sorted(files)), tuple(c for c in shas if per_commit.get(c)))
+        files |= net | {p for p in self._links(repo, sha, rules) if reaches(p, patterns)}
+        return Protected(tuple(sorted(files)), tuple(c for c in shas if c in hit))
 
     def _changed(self, repo: str, a: str, b: str, patterns, rules: Rules) -> set[str]:
         """The protected paths that differ between two commits (or trees)."""
@@ -284,26 +295,6 @@ class Mirror:
         """Paths of the symlinks (120000) and gitlinks (160000) in sha's tree."""
         out = self._git(repo, rules, ["ls-tree", "-r", "-z", "--full-tree", _oid(sha)]).stdout
         return [path for meta, _, path in (e.partition("\t") for e in out.split("\0")) if meta[:6] in LINK_MODES]
-
-    def _commit_touches(self, repo: str, shas: list[str], patterns, rules: Rules) -> dict[str, list[str]]:
-        """commit -> the protected paths its own diff touches. Unframed output fails closed."""
-        if not shas:
-            return {}
-        out = self._git(
-            repo, rules,
-            ["diff-tree", "--stdin", "-z", "-r", "--no-renames", "--name-only", "--cc", "--root"],
-            stdin="\n".join(_oid(s) for s in shas) + "\n",
-        ).stdout  # fmt: skip
-        wanted = set(shas)
-        current, hits = None, {}
-        for token in (t for t in out.split("\0") if t):
-            if token in wanted:
-                current = token
-            elif protected(token, patterns):
-                # A path before any commit header means output this parser did not expect: blame
-                # the first commit rather than drop the path.
-                hits.setdefault(current or shas[0], []).append(token)
-        return hits
 
     # --- handover refs ------------------------------------------------------------------
 
