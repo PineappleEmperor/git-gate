@@ -31,10 +31,15 @@ BUNDLE_HOWTO = "git bundle create <file> {branch} --not --remotes=origin"
 
 @dataclass(frozen=True)
 class Protected:
-    """What `Mirror.protected_changes` found: every protected file, and the commits whose own diffs hit one."""
+    """What `Mirror.protected_changes` found: every protected file, and the commits whose own diffs hit one.
+
+    `stale` holds the files among them that the branch never changed: they differ only because the
+    default branch changed them after the fork, so the fix is a rebase, not a handover.
+    """
 
     files: tuple[str, ...]
     commits: tuple[str, ...]
+    stale: tuple[str, ...] = ()
 
     def __bool__(self) -> bool:
         return self.files != ()
@@ -254,6 +259,9 @@ class Mirror:
           tree without one) and, when the branch exists, from the branch on GitHub.
         - Every symlink or gitlink in sha's tree that can lead into a handover path counts, changed
           by this push or not, since an edit through it is an edit of what it reaches.
+        - A file found only by the tree check, which no new commit touches and which is the same at
+          the fork point (merge-base of sha and `default_tip`) as at sha, is also `stale`: the
+          default branch changed it after the fork. Links are never stale; rebasing keeps them.
 
         Nothing here depends on what the bundle claimed: only sha, remote and default_tip.
         """
@@ -277,8 +285,12 @@ class Mirror:
         net = self._changed(repo, default_tip or self._empty_tree(repo, rules), sha, patterns, rules)
         if net and remote:
             net &= self._changed(repo, remote, sha, patterns, rules)
-        files |= net | {p for p in self._links(repo, sha, rules) if reaches(p, patterns)}
-        return Protected(tuple(sorted(files)), tuple(c for c in shas if c in hit))
+        links = {p for p in self._links(repo, sha, rules) if reaches(p, patterns)}
+        stale = net - files - links
+        fork = self.fork_point(repo, sha, default_tip, rules) if stale else None
+        stale = stale - self._changed(repo, fork, sha, patterns, rules) if fork else set()
+        files |= net | links
+        return Protected(tuple(sorted(files)), tuple(c for c in shas if c in hit), tuple(sorted(stale)))
 
     def _changed(self, repo: str, a: str, b: str, patterns, rules: Rules) -> set[str]:
         """The protected paths that differ between two commits (or trees)."""

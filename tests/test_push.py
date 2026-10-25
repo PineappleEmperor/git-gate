@@ -121,16 +121,64 @@ def test_clean_merge_of_main_with_workflow_change_passes(env, checkout):
     assert "Pushed" in push(env, checkout, "topic")
 
 
-def test_stale_fork_with_old_workflows_is_handed_over(env, checkout):
-    """Main gaining a workflow fix after the fork: the branch would run the old workflow on GitHub."""
+def test_stale_fork_with_old_workflows_is_refused_with_rebase_advice(env, checkout):
+    """Main gaining a workflow fix after the fork: the branch would run the old workflow on GitHub.
+
+    The branch never changed the file, so the agent is told to rebase; nothing is handed over (I2).
+    """
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "topic.txt")
     seed = env.tmp / "seed"
     commit(seed, ".github/workflows/ci.yml", "on: push")
     git("push", "-q", env.url, "main", cwd=seed)
-    with pytest.raises(Refused, match=r"gitgatepush \d+"):
+    with pytest.raises(Refused) as e:
         push(env, checkout, "topic")
+    msg = str(e.value)
+    assert "gitgatepush" not in msg and "It changes" not in msg
+    assert ".github/workflows/ci.yml" in msg and "does not change" in msg
+    assert "fetch, then rebase or merge origin/main, and push again" in msg
+    assert Handovers(env.state).open() == []
     assert remote_ref(env, "topic") == ""
+    assert json.loads((env.state / "audit.log").read_text().splitlines()[-1])["outcome"] == "refused"
+
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("rebase", "-q", "origin/main", cwd=checkout)
+    assert "Pushed" in push(env, checkout, "topic")
+
+
+def test_stale_fork_changing_the_same_workflow_is_handed_over(env, checkout):
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, ".github/workflows/ci.yml", "on: pull_request")
+    seed = env.tmp / "seed"
+    commit(seed, ".github/workflows/ci.yml", "on: push")
+    git("push", "-q", env.url, "main", cwd=seed)
+    with pytest.raises(Refused, match=r"gitgatepush \d+") as e:
+        push(env, checkout, "topic")
+    assert "It changes 1 file(s) under handover paths: .github/workflows/ci.yml." in str(e.value)
+    assert "rebase or merge origin/main" not in str(e.value)
+    assert len(Handovers(env.state).open()) == 1
+
+
+def test_stale_fork_with_its_own_workflow_change_rebases_first(env, checkout):
+    """Stale files refuse the push outright; the branch's own change is handed over once it is rebased."""
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, ".github/workflows/release.yml", "on: tag")
+    seed = env.tmp / "seed"
+    commit(seed, ".github/workflows/ci.yml", "on: push")
+    git("push", "-q", env.url, "main", cwd=seed)
+    with pytest.raises(Refused) as e:
+        push(env, checkout, "topic")
+    assert "gitgatepush" not in str(e.value) and "rebase or merge origin/main" in str(e.value)
+    assert "ci.yml" in str(e.value) and "release.yml" not in str(e.value)
+    assert Handovers(env.state).open() == []
+
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("rebase", "-q", "origin/main", cwd=checkout)
+    with pytest.raises(Refused, match=r"gitgatepush \d+") as e:
+        push(env, checkout, "topic")
+    assert "It changes 1 file(s) under handover paths: .github/workflows/release.yml." in str(e.value)
+    (h,) = Handovers(env.state).open()
+    assert h.protected == (".github/workflows/release.yml",)
 
 
 def test_stale_fork_without_workflow_drift_passes(env, checkout):

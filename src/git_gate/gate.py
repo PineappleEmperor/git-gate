@@ -294,6 +294,13 @@ class Gate:
                 remote = heads.get(branch)
                 if remote == sha:
                     return f"{branch} is already at {sha[:12]} on {repo}."
+                # The comparison commits, fixed once (D2): the branch on GitHub and the default
+                # branch's tip after sync. No other branch is ever one: agents can push those.
+                default_tip = heads.get(default)
+                patterns = repo_rules.handover_paths
+                found = self.mirror.protected_changes(repo, sha, remote, default_tip, patterns, rules)
+                if found.stale:
+                    raise Refused(_stale_refusal(branch, default, found.stale))
                 reasons = [protected] if protected else []
                 advice = []
                 lease = None
@@ -303,12 +310,7 @@ class Gate:
                     advice.append(
                         f"If the rewrite was not meant, fetch, rebase or merge origin/{branch} and push again instead."
                     )
-                # The comparison commits, fixed once (D2): the branch on GitHub and the default
-                # branch's tip after sync. No other branch is ever one: agents can push those.
-                default_tip = heads.get(default)
                 fork = self.mirror.fork_point(repo, sha, default_tip, rules)
-                patterns = repo_rules.handover_paths
-                found = self.mirror.protected_changes(repo, sha, remote, default_tip, patterns, rules)
                 if found:
                     reasons.append(_refusal_for(found))
                 if reasons:
@@ -531,6 +533,17 @@ def _gh_config(work: Path, token: str) -> Path:
         with os.fdopen(fd, "w") as f:
             f.write(text)
     return config
+
+
+def _stale_refusal(branch: str, default: str, stale: tuple[str, ...]) -> str:
+    """No handover: the branch is older than the default branch at these files, and a rebase fixes that."""
+    shown = stale[:MAX_NAMED]
+    more = f" and {len(stale) - MAX_NAMED} more" if len(stale) > MAX_NAMED else ""
+    return (
+        f"Not pushed: {branch} does not change {len(stale)} file(s) under handover paths that {default} has "
+        f"changed since {branch} forked from it: {', '.join(shown)}{more}. Pushing it would put their older "
+        f"versions on GitHub. No handover was kept: fetch, then rebase or merge origin/{default}, and push again."
+    )
 
 
 def _refusal_for(found: Protected) -> str:

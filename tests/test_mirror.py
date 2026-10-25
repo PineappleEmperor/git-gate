@@ -502,12 +502,51 @@ def test_protected_changes_rollback_merge_names_the_file(env, m, rules, checkout
     assert _changes(env, m, rules, checkout, "topic")[1] == Protected((WF,), ())
 
 
-def test_protected_changes_stale_fork_with_old_workflows_is_protected(env, m, rules, checkout):
-    """Main gaining a workflow fix after the fork: a new branch there would run the old workflows."""
+def test_protected_changes_stale_fork_with_old_workflows_is_stale(env, m, rules, checkout):
+    """Main gaining a workflow fix after the fork: a new branch there would run the old workflows.
+
+    The branch never touched the file, so it is stale (I2): the agent rebases, the user is not asked.
+    """
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "topic.txt")
     seed_push(env, WF, "on: push")
-    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((WF,), ())
+    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((WF,), (), stale=(WF,))
+
+
+def test_protected_changes_stale_fork_that_changes_the_file_itself_is_not_stale(env, m, rules, checkout):
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    own = commit(checkout, WF, "on: pull_request")
+    seed_push(env, WF, "on: push")
+    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((WF,), (own,), stale=())
+
+
+def test_protected_changes_stale_fork_splits_own_and_stale_files(env, m, rules, checkout):
+    release = ".github/workflows/release.yml"
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    own = commit(checkout, release, "on: tag")
+    seed_push(env, WF, "on: push")
+    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((WF, release), (own,), stale=(WF,))
+
+
+def test_protected_changes_stale_fork_change_and_revert_is_not_stale(env, m, rules, checkout):
+    """A branch that edited a file and put it back still touched it: its commits are the user's to judge."""
+    seed_push(env, WF, "v1")
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
+    edit = commit(checkout, WF, "v-agent")
+    revert = commit(checkout, WF, "v1")
+    seed_push(env, WF, "v2")
+    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((WF,), (edit, revert), stale=())
+
+
+def test_protected_changes_unchanged_symlink_on_a_stale_fork_is_not_stale(env, m, rules, checkout):
+    """Rebasing cannot remove a link the default branch holds too: it stays a handover."""
+    _seed_link(env, ".github", "ci", {"ci/workflows/ci.yml": "v1"})
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
+    commit(checkout, "topic.txt")
+    seed_push(env, "ci/workflows/ci.yml", "v2")
+    assert _changes(env, m, rules, checkout, "topic")[1] == Protected((".github",), (), stale=())
 
 
 def test_protected_changes_stale_fork_without_workflow_drift_passes(env, m, rules, checkout):
