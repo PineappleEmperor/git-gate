@@ -64,6 +64,22 @@ def test_relay_turns_answers_into_refusals(tmp_path, answer, message):
         Relay(tmp_path)("gh", {})
 
 
+@pytest.mark.parametrize("key", ["ok", "refused", "error"])
+def test_relay_answers_are_valid_utf8(tmp_path, key):
+    """A child's JSON may escape a lone surrogate; json.loads brings it back, so the relay must clean it."""
+    _release(tmp_path, "r", {key: ".githooks/\udcff gitgatepush 1"})
+    _point(tmp_path, "r")
+    relay = Relay(tmp_path)
+    if key == "ok":
+        text = relay("push", {})
+    else:
+        with pytest.raises(Refused) as e:
+            relay("push", {})
+        text = str(e.value)
+    text.encode("utf-8")
+    assert ".githooks/? gitgatepush 1" in text
+
+
 def test_relay_reports_a_release_that_gives_no_answer(tmp_path):
     rel = _release(tmp_path, "r", {})
     (rel / "bin/git-gate").write_text("#!/bin/sh\necho not json\n")

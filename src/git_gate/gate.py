@@ -87,13 +87,13 @@ class Gate:
             self._rate_limit(kwargs.get("repo"))
             rules, token = self._load()
             result = fn(rules, token, **kwargs)
-            return _scrub(result, token)
+            return utf8_safe(_scrub(result, token))
         except HandedOver as e:
             outcome = "handover"
-            raise Refused(_scrub(str(e), token)) from None
+            raise Refused(utf8_safe(_scrub(str(e), token))) from None
         except Refused as e:
             outcome = "refused"
-            raise Refused(_scrub(str(e), token)) from None
+            raise Refused(utf8_safe(_scrub(str(e), token))) from None
         except Exception:
             outcome = "error"
             raise
@@ -431,6 +431,16 @@ def _refusal_for(found: Protected) -> str:
     if found.commits:
         reason += f" Commit(s) {', '.join(c[:12] for c in found.commits)} change them."
     return reason
+
+
+def utf8_safe(text: str) -> str:
+    """Text that encodes as strict UTF-8: each lone surrogate becomes "?".
+
+    git output is decoded with surrogateescape, so a file name that is not UTF-8 arrives as lone
+    surrogates. A tool reply goes out as JSON, whose encoder refuses them, and a refused reply
+    takes down the whole stdio server rather than one call.
+    """
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def _scrub(text: str, token: str | None) -> str:

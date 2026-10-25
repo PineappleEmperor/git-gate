@@ -312,6 +312,8 @@ def test_push_with_a_non_utf8_name_is_handed_over(env, checkout):
         push(env, checkout, "raw")
     h = Handovers(env.state).get(int(re.findall(r"gitgatepush (\d+)", str(e.value))[0]))
     assert h.protected == (".githooks/\udcff",)
+    str(e.value).encode("utf-8")  # the reply goes out as strict UTF-8 JSON
+    assert ".githooks/?" in str(e.value)
 
 
 def test_new_branch_handover_records_fork_point(env, checkout):

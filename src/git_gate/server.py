@@ -13,7 +13,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from git_gate import Refused
 from git_gate.config import state_dir
-from git_gate.gate import Gate
+from git_gate.gate import Gate, utf8_safe
 
 RELAY_TIMEOUT = 4 * 3600  # a backstop only; each call enforces the timeouts in rules.toml
 
@@ -59,9 +59,10 @@ class Relay:
             log = self._log_child_failure(tool, proc)
             where = f"; its stderr and exit code are in {log}" if log else ""
             raise Refused(f"git-gate release {target.name[:12]} gave no answer{where}.")
+        # json.loads turns a child's escaped lone surrogate back into one; it must not reach the wire.
         if "ok" in result:
-            return result["ok"]
-        raise Refused(result.get("refused") or result.get("error") or "git-gate returned nothing.")
+            return utf8_safe(result["ok"])
+        raise Refused(utf8_safe(result.get("refused") or result.get("error") or "git-gate returned nothing."))
 
     @staticmethod
     def _answer(stdout: str) -> dict | None:
