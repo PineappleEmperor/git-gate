@@ -156,7 +156,7 @@ def since_date(text: str) -> str:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Summarise git-gate's audit.log (and audit.log.1).")
+    parser = argparse.ArgumentParser(description="Summarise git-gate's audit.log and its rotated files.")
     parser.add_argument("log", nargs="?", type=Path, default=default_log(), help="default: %(default)s")
     parser.add_argument("--since", type=since_date, metavar="YYYY-MM-DD", help="only lines from this day on")
     args = parser.parse_args(argv)

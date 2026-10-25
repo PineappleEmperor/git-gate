@@ -183,3 +183,10 @@ def test_cell(tmp_path):
     assert report.cell("a\x00b\x7fc\x85d") == "a\\x00b\\x7fc\\x85d"
     assert report.cell("\u200b\udcff\U000e0041") == "\\u200b\\udcff\\U000e0041"  # zero-width, lone surrogate, tag
     assert report.cell("x" * 1000) == "x" * report.MAX_CELL + "…"
+
+
+def test_help_names_the_rotated_files(capsys):
+    with pytest.raises(SystemExit):
+        report.main(["--help"])
+    out = capsys.readouterr().out
+    assert "audit.log.1" not in out and "rotated" in out
