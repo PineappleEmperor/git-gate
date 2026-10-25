@@ -33,7 +33,8 @@ class GitHub:
         self.timeout = timeout
         self._opener = urllib.request.build_opener(_SameHostRedirects)
 
-    def _request(self, method: str, path: str, missing_ok: bool = False):
+    def _request(self, method: str, path: str, absent: tuple[int, ...] = ()):
+        """Statuses listed in `absent` mean "nothing there" and return None."""
         req = urllib.request.Request(
             f"{self.api}/{path}",
             method=method,
@@ -48,7 +49,7 @@ class GitHub:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 body = resp.read()
         except urllib.error.HTTPError as e:
-            if missing_ok and e.code == 404:
+            if e.code in absent:
                 return None
             raise Refused(f"GitHub {method} {path} returned {e.code}.") from None
         except urllib.error.URLError as e:
@@ -64,13 +65,14 @@ class GitHub:
 
     def branch(self, repo: str, branch: str) -> dict | None:
         """{'sha': ..., 'protected': bool}, or None when the branch does not exist."""
-        data = self._request("GET", f"repos/{repo}/branches/{self._branch(branch)}", missing_ok=True)
+        data = self._request("GET", f"repos/{repo}/branches/{self._branch(branch)}", absent=(404,))
         if data is None:
             return None
         return {"sha": data["commit"]["sha"], "protected": bool(data.get("protected"))}
 
     def rule_types(self, repo: str, branch: str) -> set[str]:
-        data = self._request("GET", f"repos/{repo}/rules/branches/{self._branch(branch)}", missing_ok=True)
+        # Free-plan private repos answer 403 ("Upgrade to GitHub Pro"): no rules there, not an error.
+        data = self._request("GET", f"repos/{repo}/rules/branches/{self._branch(branch)}", absent=(403, 404))
         return {r.get("type", "") for r in data or []}
 
     def pulls_from(self, repo: str, branch: str) -> list[dict]:
