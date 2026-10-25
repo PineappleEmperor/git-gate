@@ -271,9 +271,11 @@ def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
         if output:
             say(output, lines=True)
         if proc.returncode != 0:
+            _audit(mirror.state, h, "failed", say)
             say(f"git push failed (exit {proc.returncode}). Handover {h.id} is still open.")
             return proc.returncode or 1
         handovers.close(h.id)
+        _audit(mirror.state, h, "pushed", say)
         try:
             mirror.drop(h.repo, h.ref, rules)
         except Refused as e:
@@ -281,6 +283,20 @@ def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
             return 0
     say(f"Pushed. Handover {h.id} is closed.")
     return 0
+
+
+def _audit(state: Path, h: Handover, outcome: str, say) -> None:
+    """One audit.log line per handover push, beside the gate's own lines for the tool calls."""
+    line = json.dumps({
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": "gitgatepush", "id": h.id, "repo": h.repo,
+        "branch": h.branch, "sha": h.sha, "outcome": outcome,
+    })  # fmt: skip
+    try:
+        fd = os.open(state / "audit.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        say(f"Warning: could not write {state / 'audit.log'}: {e.strerror}.")
 
 
 def _check(h: Handover, git: Git, rules: Rules) -> None:

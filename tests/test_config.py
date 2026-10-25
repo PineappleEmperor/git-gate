@@ -155,3 +155,19 @@ def test_identifiers_fullmatch(tmp_path):
         mirror._oid(sha + "\n")
     with pytest.raises(Refused):
         mirror._handover_ref("refs/gate/handover/7\n")
+
+
+def test_off_switch_dangling_symlink(tmp_path):
+    """An off switch must fail closed: a symlink to nothing still switches the gate off."""
+    (tmp_path / "disabled").symlink_to(tmp_path / "missing")
+    with pytest.raises(Refused) as e:
+        check_enabled(tmp_path)
+    assert str(e.value) == "git-gate is switched off: remove ~/.config/git-gate/disabled to turn it back on."
+
+
+def test_check_enabled_defaults_to_config_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_GATE_CONFIG_DIR", str(tmp_path))
+    assert check_enabled() is None
+    (tmp_path / "disabled").touch()
+    with pytest.raises(Refused, match="switched off"):
+        check_enabled()

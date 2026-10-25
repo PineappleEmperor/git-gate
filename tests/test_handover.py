@@ -808,3 +808,31 @@ def test_main_ids_fullmatch(env, hs):
     h = make(hs)
     code, out = run(env, [f"{h.id}\n"], "y\n")
     assert code == 2 and "usage" in out
+
+
+def audit_lines(env) -> list[dict]:
+    return [json.loads(line) for line in (env.state / "audit.log").read_text().splitlines()]
+
+
+def test_main_audits_the_push(env, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    assert run(env, [str(h.id)], "n\n")[0] == 1
+    assert not (env.state / "audit.log").exists()  # declining pushes nothing, so there is nothing to log
+    assert run(env, [str(h.id)], "y\n")[0] == 0
+    last = audit_lines(env)[-1]
+    assert last["tool"] == "gitgatepush" and last["outcome"] == "pushed"
+    assert (last["id"], last["repo"], last["branch"], last["sha"]) == (h.id, REPO, "feat", h.sha)
+    assert stat.S_IMODE((env.state / "audit.log").stat().st_mode) == 0o600
+
+    git("switch", "-q", "main", cwd=checkout)
+    failing = stage(env, m, rules, checkout, "other")
+    seed = env.tmp / "seed"
+    git("push", "-q", env.url, f"{commit(seed, 'moved.txt')}:refs/heads/other", cwd=seed)
+    assert run(env, [str(failing.id)], "y\n")[0] != 0
+    last = audit_lines(env)[-1]
+    assert (last["tool"], last["outcome"], last["id"], last["sha"]) == (
+        "gitgatepush",
+        "failed",
+        failing.id,
+        failing.sha,
+    )

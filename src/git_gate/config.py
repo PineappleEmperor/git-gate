@@ -130,7 +130,8 @@ def _timeout(path: Path, data: dict, key: str, default: int) -> int:
 
 
 def check_enabled(cfg: Path | None = None) -> None:
-    if ((cfg or config_dir()) / "disabled").exists():
+    """Refuse while <config>/disabled exists in any form: a dangling symlink still switches off."""
+    if os.path.lexists((cfg or config_dir()) / "disabled"):
         raise Refused(OFF_SWITCH_MESSAGE)
 
 
