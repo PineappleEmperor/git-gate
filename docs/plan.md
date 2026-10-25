@@ -1,3 +1,10 @@
+> **Superseded in part (2026-10-25).** The rework design,
+> [docs/superpowers/specs/2026-10-25-gate-rework-design.md](superpowers/specs/2026-10-25-gate-rework-design.md),
+> replaces this file's git and `gh` mechanics: pushes and fetches go through bundles and the gate's
+> mirror, `gh` is read-only, and writes are typed tools (`pr`, `issue`, `triage`, `workflow_run`,
+> `label`). The `gh` tables below describe the earlier build. The token, config, install layout and
+> residual-risk sections still hold unless the rework design says otherwise.
+
 # git-gate: build plan
 
 Follows `docs/design.md` (agreed 2026-10-24). This file resolves its open items and records

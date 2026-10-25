@@ -113,9 +113,9 @@ settings such as `core.sshCommand` would run unsandboxed even with hooks off. In
   `/usr/local/bin/gitgatepush` to `/opt/git-gate/current/bin/gitgatepush`, root-owned, so it works
   in any shell and an agent cannot change what it runs.
 - `gitgatepush <id>` shows the repo, branch and commit list, asks for confirmation, then pushes from
-  the mirror with the user's SSH key: `git --git-dir=<mirror> push [--force-with-lease=…]
-  git@github.com:<owner>/<repo>.git <sha>:refs/heads/<branch>`, with hooks off and the gate's own
-  git config. `gitgatepush` with no id lists open handovers.
+  the mirror with the user's own git config and SSH key, hooks off: `git --git-dir=<mirror> push
+  [--force-with-lease=…] git@github.com:<owner>/<repo>.git <sha>:refs/heads/<branch>`.
+  `gitgatepush` with no id lists open handovers.
 - Expiry and cleanup of old handovers are the builder's.
 
 ## Rules file
