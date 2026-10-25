@@ -224,7 +224,13 @@ class Git:
             raise Refused(f"{real}/.git/config has keys outside the gate's allowlist: {', '.join(bad)}.")
         values = dict(entries)
         urls = [v for k, v in entries if k == "remote.origin.url"]
-        expected = {self.url(repo).lower(), self.url(repo).lower().removesuffix(".git")}
+        # The URL only proves which repo this is; the gate always connects to self.url(repo) itself,
+        # so the SSH spellings of the same repo are as good as the HTTPS one.
+        expected = {self.url(repo)}
+        if self.base_url.startswith("https://"):
+            host = self.base_url.removeprefix("https://")
+            expected |= {f"git@{host}:{repo}.git", f"ssh://git@{host}/{repo}.git"}
+        expected = {u.lower() for e in expected for u in (e, e.removesuffix(".git"))}
         if len(urls) != 1 or urls[0].lower() not in expected:
             raise Refused(f"{real} remote.origin.url must be {self.url(repo)}; found {urls or 'none'}.")
         if values.get("core.bare", "false").lower() in ("true", "yes", "on", "1"):

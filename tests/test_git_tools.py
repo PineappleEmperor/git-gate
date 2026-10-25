@@ -6,6 +6,7 @@ import pytest
 
 from conftest import TOKEN, call, commit, git
 from git_gate import Refused
+from git_gate.gitops import Git
 
 # --- clone ---------------------------------------------------------------------------------
 
@@ -91,6 +92,30 @@ def test_everyday_config_keys_pass(env, checkout):
     git("config", "branch.feat/x.github-pr-owner-number", "PineappleEmperor#ha-skills#12", cwd=checkout)
     git("config", "branch.feat/x.github-pr-base-branch", "PineappleEmperor#ha-skills#main", cwd=checkout)
     call(env, "fetch", repo="me/app", path=str(checkout))
+
+
+@pytest.mark.parametrize(
+    "url,ok",
+    [
+        ("https://github.com/me/app.git", True),
+        ("https://github.com/me/app", True),
+        ("git@github.com:me/app.git", True),
+        ("git@github.com:Me/App", True),
+        ("ssh://git@github.com/me/app.git", True),
+        ("git@github.com:me/other.git", False),
+        ("git@evil.example:me/app.git", False),
+        ("git@github.com:me/app.git.evil", False),
+        ("https://github.com.evil/me/app.git", False),
+    ],
+)
+def test_remote_url_forms_for_github(env, url, ok):
+    gh = Git(env.state, "https://github.com")
+    entries = [("remote.origin.url", url)]
+    if ok:
+        gh._check_config(entries, "me/app", env.ws)
+    else:
+        with pytest.raises(Refused, match="remote.origin.url"):
+            gh._check_config(entries, "me/app", env.ws)
 
 
 def test_remote_url_must_match_repo(env, checkout):
