@@ -98,10 +98,12 @@ def _assert_no_token(out: str) -> None:
         ["api", "repos/{owner}/{repo}", "--jq", "$ENV.GH_TOKEN|explode|implode|ascii_downcase"],
         ["api", "repos/{owner}/{repo}", "--jq", "$ENV.GH_TOKEN|explode"],
         ["pr", "list", "--json", "number", "-q", "env.GH_TOKEN|explode"],
+        ["pr", "list", "--json", "number", "-q env.GH_TOKEN | explode"],
+        ["api", "repos/{owner}/{repo}", "-q $ENV.GH_TOKEN | explode"],
     ],
 )
 def test_review_probes_are_refused_before_gh_runs(env, real_gh, args):
-    with pytest.raises(Refused, match="environment") as e:
+    with pytest.raises(Refused, match="environment|separate arguments") as e:
         env.gate.dispatch("gh", {"repo": "me/app", "args": args})
     _assert_no_token(str(e.value))
     assert real_gh == []

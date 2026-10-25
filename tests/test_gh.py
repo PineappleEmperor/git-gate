@@ -181,6 +181,27 @@ def test_jq_cannot_read_the_environment(args):
         plan("me/app", args)
 
 
+@pytest.mark.parametrize("cmd", [["api", "repos/{owner}/{repo}"], ["pr", "list", "--json", "number"]])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "-q$ENV.GH_TOKEN",
+        "-q=$ENV.GH_TOKEN",
+        "-q $ENV.GH_TOKEN | explode",
+        "-q env | tojson",
+        "-q\tenv",
+        "-q\nenv",
+        "-q .[] | .number",
+        "-R other/x",
+        "-S repo:other/x",
+    ],
+)
+def test_attached_short_flag_values_are_refused(cmd, flag):
+    """pflag reads `-q<value>`, `-q=<value>` and `-q <value>` in one argument as -q with that value."""
+    with pytest.raises(Refused, match="separate arguments"):
+        plan("me/app", [*cmd, flag])
+
+
 @pytest.mark.parametrize(
     "args",
     [

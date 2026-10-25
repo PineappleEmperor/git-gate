@@ -68,7 +68,9 @@ API_BOOL_FLAGS = {"--paginate", "--slurp", "-i", "--include", "--silent", "--ver
 API_DENIED = {"--input", "--hostname"}
 
 URL_LIKE = re.compile(r"(?i)^(?:[a-z][a-z0-9+.-]*://|git@)\S*$|^\S*github\.com[/:]\S*$")
-SHORT_CLUSTER = re.compile(r"^-[A-Za-z]\S+$")
+# pflag reads any longer argument after "-<letter>" as that flag with the rest as its value, spaces and
+# all, so every such argument is refused: values go in their own argument, where the checks see them.
+SHORT_CLUSTER = re.compile(r"^-[A-Za-z].", re.DOTALL)
 # `--search` builds a GitHub search query; any of these would widen it past the forced repo.
 SCOPE_QUALIFIER = re.compile(r"(?i)\b(?:repo|org|user|owner):|\bis:(?:public|private)\b")
 SEARCH_FLAGS = {"--search", "-S"}
