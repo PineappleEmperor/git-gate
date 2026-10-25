@@ -33,16 +33,18 @@ class GitHub:
         self.timeout = timeout
         self._opener = urllib.request.build_opener(_SameHostRedirects)
 
-    def _request(self, method: str, path: str, absent: tuple[int, ...] = ()):
-        """Statuses listed in `absent` mean "nothing there" and return None."""
+    def _request(self, method: str, path: str, data: dict | None = None, absent: tuple[int, ...] = ()):
+        """JSON in and out. Statuses listed in `absent` mean "nothing there" and return None."""
         req = urllib.request.Request(
             f"{self.api}/{path}",
+            data=json.dumps(data).encode() if data is not None else None,
             method=method,
             headers={
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
                 "User-Agent": "git-gate",
+                **({"Content-Type": "application/json"} if data is not None else {}),
             },
         )
         try:
@@ -91,3 +93,106 @@ class GitHub:
 
     def delete_branch(self, repo: str, branch: str) -> None:
         self._request("DELETE", f"repos/{repo}/git/refs/heads/{self._branch(branch)}")
+
+    def graphql(self, query: str, variables: dict) -> dict:
+        """The `data` of a GraphQL answer; GraphQL reports failures with status 200, so check `errors`."""
+        out = self._request("POST", "graphql", {"query": query, "variables": variables})
+        if out.get("errors"):
+            messages = "; ".join(str(e.get("message", e)) for e in out["errors"])
+            raise Refused(f"GitHub GraphQL failed: {messages}.")
+        return out.get("data") or {}
+
+    @staticmethod
+    def _segment(value: str) -> str:
+        return urllib.parse.quote(value, safe="")
+
+    def open_pull(self, repo: str, branch: str) -> str | None:
+        head = urllib.parse.quote(f"{repo.split('/')[0]}:{branch}", safe="")
+        data = self._request("GET", f"repos/{repo}/pulls?state=open&head={head}&per_page=1")
+        return data[0]["html_url"] if data else None
+
+    def comment(self, repo: str, number: int, body: str) -> str:
+        return self._request("POST", f"repos/{repo}/issues/{number}/comments", {"body": body})["html_url"]
+
+    def edit(
+        self,
+        repo: str,
+        number: int,
+        *,
+        pull: bool,
+        title: str | None = None,
+        body: str | None = None,
+        base: str | None = None,
+        state: str | None = None,
+    ) -> str:
+        """Change only the fields given; `base` applies to pull requests only."""
+        fields = {"title": title, "body": body, "base": base, "state": state}
+        data = {k: v for k, v in fields.items() if v is not None}
+        kind = "pulls" if pull else "issues"
+        return self._request("PATCH", f"repos/{repo}/{kind}/{number}", data)["html_url"]
+
+    def create_issue(self, repo: str, title: str, body: str) -> str:
+        return self._request("POST", f"repos/{repo}/issues", {"title": title, "body": body})["html_url"]
+
+    def create_pull(self, repo: str, head: str, base: str, title: str, body: str, draft: bool) -> str:
+        data = {"head": head, "base": base, "title": title, "body": body, "draft": draft}
+        return self._request("POST", f"repos/{repo}/pulls", data)["html_url"]
+
+    def mark_ready(self, repo: str, number: int) -> None:
+        """Take a draft out of draft; REST has no endpoint for it, so this goes through GraphQL."""
+        node_id = self._request("GET", f"repos/{repo}/pulls/{number}")["node_id"]
+        query = (
+            "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { id } } }"
+        )
+        self.graphql(query, {"id": node_id})
+
+    def review(self, repo: str, number: int, event: str, body: str) -> str:
+        if event not in ("COMMENT", "REQUEST_CHANGES"):
+            raise Refused("Approving is the user's: a review here can only comment or request changes.")
+        data = {"event": event, "body": body}
+        return self._request("POST", f"repos/{repo}/pulls/{number}/reviews", data)["html_url"]
+
+    def labels(self, repo: str, number: int, add: list[str], remove: list[str]) -> None:
+        base = f"repos/{repo}/issues/{number}/labels"
+        if add:
+            self._request("POST", base, {"labels": add})
+        for name in remove:
+            self._request("DELETE", f"{base}/{self._segment(name)}", absent=(404,))
+
+    def assignees(self, repo: str, number: int, add: list[str], remove: list[str]) -> None:
+        path = f"repos/{repo}/issues/{number}/assignees"
+        if add:
+            self._request("POST", path, {"assignees": add})
+        if remove:
+            self._request("DELETE", path, {"assignees": remove})
+
+    def request_reviewers(self, repo: str, number: int, reviewers: list[str]) -> None:
+        self._request("POST", f"repos/{repo}/pulls/{number}/requested_reviewers", {"reviewers": reviewers})
+
+    def run_action(self, repo: str, run_id: int, action: str) -> None:
+        endpoints = {"rerun": "rerun", "rerun_failed": "rerun-failed-jobs", "cancel": "cancel"}
+        if action not in endpoints:
+            raise Refused(f"Unknown run action {action!r}; use one of {', '.join(endpoints)}.")
+        self._request("POST", f"repos/{repo}/actions/runs/{run_id}/{endpoints[action]}")
+
+    def label(
+        self,
+        repo: str,
+        action: str,
+        name: str,
+        color: str | None = None,
+        description: str | None = None,
+        new_name: str | None = None,
+    ) -> None:
+        """Create, edit or delete a repository label; only the fields given are sent."""
+        if action == "create":
+            fields = {"name": name, "color": color, "description": description}
+            self._request("POST", f"repos/{repo}/labels", {k: v for k, v in fields.items() if v is not None})
+        elif action == "edit":
+            fields = {"new_name": new_name, "color": color, "description": description}
+            data = {k: v for k, v in fields.items() if v is not None}
+            self._request("PATCH", f"repos/{repo}/labels/{self._segment(name)}", data)
+        elif action == "delete":
+            self._request("DELETE", f"repos/{repo}/labels/{self._segment(name)}")
+        else:
+            raise Refused(f"Unknown label action {action!r}; use create, edit or delete.")
