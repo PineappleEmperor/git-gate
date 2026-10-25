@@ -8,6 +8,7 @@ import difflib
 import os
 import re
 import secrets
+import subprocess
 import sys
 import time
 import tomllib
@@ -37,6 +38,7 @@ usage: gitgaterules <command>
   add-session <folder> [--repo <repo>]     make a project folder a session, with its own repo
   remove-session <folder>                  remove a session
   group <name> add|remove <repo|@group>    change a group, making it if it is new
+  migrate [--write]                        turn a v1 file into sessions; --write writes it
 
 A session is a project folder: a conversation started in it, or below it, reaches the session's
 own repo (write), its grants, and no other repo. Every edit is checked as the gate checks the
@@ -495,6 +497,156 @@ def cmd_group(args: list[str], say) -> int:
     return _edit(say, change)[0]
 
 
+# --- migrate -----------------------------------------------------------------------------------
+
+GIT = "/usr/bin/git"
+GITHUB_URL_RE = re.compile(
+    r"(?:git@github\.com:|ssh://git@github\.com(?::22)?/|https://(?:[^@/]+@)?github\.com/|git://github\.com/)"
+    r"([^/]+/[^/]+?)(?:\.git)?/?"
+)
+
+
+def _shown_url(url: str) -> str:
+    """A remote URL fit to print: any user name and password in it removed."""
+    return re.sub(r"//[^@/]*@", "//", url)
+
+
+def origin_repo(folder: Path) -> tuple[str | None, str]:
+    """(owner/name, "") for a checkout whose origin is on github.com, else (None, why not).
+
+    Only the checkout's own config is read: no system or global config (where an insteadOf or an
+    origin of its own could name another repo), and no walking up into a parent checkout.
+    """
+    if not os.path.lexists(folder / ".git"):
+        return None, "is not a git checkout (it has no .git)"
+    env = {
+        "PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LANG": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CEILING_DIRECTORIES": str(folder.parent),
+        "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
+    }  # fmt: skip
+    try:
+        proc = subprocess.run(
+            [GIT, "-C", str(folder), "config", "--get", "remote.origin.url"],
+            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=30,
+            check=False,
+        )  # fmt: skip
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"could not be read by git ({e})"
+    if proc.returncode == 1:
+        return None, "has no origin remote"
+    if proc.returncode != 0:
+        return None, f"could not be read by git ({proc.stderr.strip()[-300:]})"
+    url = proc.stdout.strip()
+    m = GITHUB_URL_RE.fullmatch(url)
+    if not m or not valid_repo(m[1]):
+        return None, f"has origin {_shown_url(url)}, which is not a github.com repository"
+    return m[1], ""
+
+
+def migrate(data: dict) -> tuple[dict, list[str]]:
+    """A v2 version of a valid v1 file, and every judgement made on the way, in plain words."""
+    notes: list[str] = []
+    access: dict[str, str] = {}
+    names: dict[str, str] = {}
+    options: dict[str, dict] = {}
+    for name, entry in data.get("repos", {}).items():
+        level = entry if isinstance(entry, str) else entry["access"]
+        access[name.lower()], names[name.lower()] = level, name
+        kept = {k: v for k, v in entry.items() if k != "access"} if isinstance(entry, dict) else {}
+        if kept:
+            options[name] = kept
+    reads = sorted((n for n, level in access.items() if level == "read"), key=_sort_key)
+    new: dict = {k: v for k, v in data.items() if k in SETTINGS}
+    if reads:
+        new["groups"] = {"reads": [names[n] for n in reads]}
+        notes.append(
+            f"Group reads holds the {len(reads)} read-only repo(s) of [repos]; every session reads it, "
+            "as every conversation can today."
+        )
+    sessions: dict[str, dict] = {}
+    owned: set[str] = set()
+    for w in data.get("workspaces", []):
+        folder = Path(w).resolve()
+        key = str(folder)
+        if key in sessions:
+            notes.append(f"{w}: the same folder as an earlier workspace, {key}; one session.")
+            continue
+        if not folder.is_dir():
+            notes.append(f"{w}: left out: the folder does not exist, and a session's folder must.")
+            continue
+        entry: dict = {}
+        repo, why = origin_repo(folder)
+        level = access.get(repo.lower()) if repo else None
+        if repo is None:
+            notes.append(f"{key}: {why}, so the session has no repo of its own; it gets the reads only.")
+        elif level == "write":
+            entry["repo"] = repo
+            owned.add(repo.lower())
+            notes.append(f"{key}: its origin is {repo}, write in [repos]: the session's own repo.")
+        elif level == "read":
+            notes.append(
+                f"{key}: its origin is {repo}, read-only in [repos]: kept read-only (through @reads), not made "
+                f"the session's own repo. To let it write: gitgaterules grant {key} write {repo}"
+            )
+        else:
+            notes.append(
+                f"{key}: its origin is {repo}, which is not in [repos]: left out, as no conversation can reach "
+                f"it today. To make it the session's: gitgaterules grant {key} write {repo}"
+            )
+        if reads:
+            entry["read"] = ["@reads"]
+        sessions[key] = entry
+    new["sessions"] = sessions
+    if not sessions:
+        notes.append("No workspace became a session, so the gate will refuse every call until one is added.")
+    for name, level in sorted(access.items()):
+        if level == "write" and name not in owned:
+            notes.append(
+                f"{names[name]}: write in [repos] but no workspace's origin, so no session gets it; left out. "
+                f"To give it to a session: gitgaterules grant <folder> write {names[name]}"
+            )
+    if options:
+        new["repos"] = options
+        notes.append(f"[repos] keeps handover_paths and push_deploys for {', '.join(sorted(options, key=_sort_key))}.")
+    notes.append(
+        "Each session now exchanges bundles, body files and downloads inside its own folder only, and reaches "
+        "only its own repo and its grants."
+    )
+    return new, notes
+
+
+def cmd_migrate(args: list[str], say) -> int:
+    if args not in ([], ["--write"]):
+        return _usage(say)
+    path = rules_path()
+    loaded = _load(path, say)
+    if loaded is None:
+        return 1
+    text, checked = loaded
+    if checked.problems:
+        _say_problems(checked, text, say)
+        say("Fix these in the v1 file first; nothing was migrated.")
+        return 1
+    if checked.rules.version == 2:
+        say(f"{path} is already a v2 file (it has [sessions]); nothing to migrate.")
+        return 0
+    new_data, notes = migrate(tomllib.loads(text))
+    new = render(new_data)
+    if args:
+        say("Judgements:")
+        for note in notes:
+            say(f"- {note}")
+        return save(path, text.encode(), new, say)[0]
+    say(new, end="")
+    say("\nJudgements:")
+    for note in notes:
+        say(f"- {note}")
+    result = check_rules(new, config_dir())
+    _say_problems(result, new, say)
+    say(f"\nNothing written. To write it, keeping {path.name} as a backup: gitgaterules migrate --write")
+    return 1 if result.problems else 0
+
+
 COMMANDS = {
     "check": cmd_check,
     "show": cmd_show,
@@ -503,6 +655,7 @@ COMMANDS = {
     "add-session": cmd_add_session,
     "remove-session": cmd_remove_session,
     "group": cmd_group,
+    "migrate": cmd_migrate,
 }
 
 

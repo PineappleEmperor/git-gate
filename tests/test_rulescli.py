@@ -1,6 +1,7 @@
 """gitgaterules: the user's own command for checking and editing rules.toml."""
 
 import io
+import json
 import re
 import shutil
 import subprocess
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import git
 from git_gate import Refused, rulescli
 from git_gate.config import load_rules
 
@@ -153,7 +155,7 @@ def test_usage(cfg):
     assert run()[0] == 2
     assert run("frobnicate")[0] == 2
     code, out = run("--help")
-    assert code == 0 and "check" in out and "show" in out and "grant" in out
+    assert code == 0 and "check" in out and "show" in out and "grant" in out and "migrate" in out
 
 
 # --- the launcher ------------------------------------------------------------------------------
@@ -339,3 +341,105 @@ def test_a_symlinked_rules_file_is_written_through(cfg, tmp_path):
     assert run("grant", f"{tmp_path}/core", "read", "up/x")[0] == 0
     assert (cfg / "rules.toml").is_symlink() and "up/x" in real.read_text()
     assert len(list(real.parent.glob("rules.toml.bak-*"))) == 1
+
+
+# --- migrate -----------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def v1(cfg, tmp_path):
+    """A v1 file with one workspace of each kind."""
+
+    def checkout(name: str, url: str | None) -> Path:
+        path = tmp_path / "ws" / name
+        path.mkdir(parents=True)
+        git("init", "-q", cwd=path)
+        if url:
+            git("remote", "add", "origin", url, cwd=path)
+        return path
+
+    ws = {
+        "skills": checkout("skills", "git@github.com:Me/Skills.git"),
+        "core": checkout("core", "https://github.com/me/core"),
+        "unlisted": checkout("unlisted", "https://x-access-token:SECRET@github.com/me/unlisted.git"),
+        "gitlab": checkout("gitlab", "https://gitlab.com/me/skills.git"),
+        "bare": checkout("bare", None),
+        "plain": tmp_path / "ws/skills/plain",  # inside a checkout, but not one itself
+    }
+    ws["plain"].mkdir()
+    folders = [*map(str, ws.values()), str(tmp_path / "ws/missing"), str(ws["skills"]) + "/."]
+    write(
+        cfg,
+        f'protected_branches = ["main", "release/*"]\nworkspaces = {json.dumps(folders)}\n'
+        "[repos]\n"
+        '"me/skills" = { access = "write", handover_paths = ["skills/**"], push_deploys = true }\n'
+        '"me/flow" = "write"\n'
+        '"me/core" = "read"\n'
+        '"up/x" = { access = "read" }\n',
+    )
+    return ws
+
+
+def test_migrate_shows_the_result_and_every_judgement_without_writing(cfg, v1, tmp_path):
+    before = (cfg / "rules.toml").read_text()
+    code, out = run("migrate")
+    assert code == 0, out
+    assert (cfg / "rules.toml").read_text() == before and backups(cfg) == []
+    assert "gitgaterules migrate --write" in out
+    assert 'reads = ["me/core", "up/x"]' in out
+    lines = out.splitlines()
+
+    def said(folder: str, *words: str) -> None:
+        found = [line for line in lines if line.startswith(f"- {folder}") and all(w in line for w in words)]
+        assert found, (folder, words, out)
+
+    said(str(v1["skills"]), "Me/Skills", "own repo")
+    said(str(v1["core"]), "me/core", "read-only", f"gitgaterules grant {v1['core']} write me/core")
+    said(str(v1["unlisted"]), "me/unlisted", "not in [repos]", "left out")
+    said(str(v1["gitlab"]), "not a github.com")
+    said(str(v1["bare"]), "no origin")
+    said(str(v1["plain"]), "not a git checkout")
+    said(str(tmp_path / "ws/missing"), "does not exist")
+    said(str(v1["skills"]) + "/.", "same folder")
+    said("me/flow", "no workspace", "left out")
+    assert "SECRET" not in out
+
+
+def test_migrate_write_makes_a_v2_file_that_keeps_todays_access(cfg, v1):
+    code, out = run("migrate", "--write")
+    assert code == 0, out
+    assert len(backups(cfg)) == 1
+    rules = load_rules(cfg)
+    assert rules.version == 2 and rules.protected_branches == ("main", "release/*")
+    skills = rules.scoped(str(v1["skills"]))
+    assert {n: r.access for n, r in skills.repos.items()} == {"me/skills": "write", "me/core": "read", "up/x": "read"}
+    assert "skills" in skills.repo("me/skills").handover_paths and skills.repo("me/skills").push_deploys
+    core = rules.scoped(str(v1["core"]))
+    assert {n: r.access for n, r in core.repos.items()} == {"me/core": "read", "up/x": "read"}
+    assert set(rules.scoped(str(v1["plain"])).repos) == {"me/core", "up/x"}  # its own session, inside skills
+    assert len(rules.sessions) == 6
+    assert run("check")[0] == 0
+
+
+def test_migrate_reads_only_the_workspaces_own_git_config(cfg, v1, tmp_path, monkeypatch):
+    """The user's global config is not read: an insteadOf there would otherwise name another repo."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text('[remote "origin"]\n\turl = https://github.com/evil/repo\n')
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(home / ".gitconfig"))
+    code, out = run("migrate")
+    assert "evil" not in out
+    assert any(line.startswith(f"- {v1['bare']}") and "no origin" in line for line in out.splitlines())
+
+
+def test_migrate_leaves_a_v2_file_alone(cfg):
+    write(cfg, PINEAPPLE)
+    code, out = run("migrate")
+    assert code == 0 and "already" in out and backups(cfg) == []
+
+
+def test_migrate_refuses_a_broken_v1_file(cfg):
+    write(cfg, 'workspaces = ["rel"]\n')
+    code, out = run("migrate")
+    assert code == 1 and "absolute" in out
