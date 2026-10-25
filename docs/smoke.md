@@ -80,7 +80,9 @@ Expect: the PR is no longer a draft. The reply is not an error and does not ment
    `workflow_run(repo, "cancel", <run id>)` while it is queued or in progress.
 
 Expect: the run shows as cancelled (or already finished, which GitHub reports as a refusal carrying
-GitHub's own message; repeat with a fresh run). No `411`. A `workflow_run` on a run for `main` is
+GitHub's own message; repeat with a fresh run). No `411`. With a token that has no Actions write
+(the default, see [plan.md](plan.md)), expect instead a refusal beginning with the GitHub-content
+line and carrying GitHub's `403: Resource not accessible by personal access token`. A `workflow_run` on a run for `main` is
 refused with a message pointing at the web UI; try one `rerun` on a `main` run and expect that
 refusal with no change on GitHub.
 
