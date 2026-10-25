@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 from conftest import TOKEN
-from git_gate import Refused, gate
+from git_gate import Refused, call, gate
+from git_gate.call import MAX_AUDIT
 from git_gate.gate import HandedOver, InternalError
 from git_gate.github import FromGitHub
 
@@ -156,3 +157,23 @@ def test_an_unwritable_audit_log_does_not_fail_the_call(env):
     with pytest.raises(Refused, match="^no$"):
         env.gate.call("prune", raising(Refused("no")), repo="me/app")
     assert "audit.log" in (env.state / "errors.log").read_text()
+
+
+def test_audit_log_is_private_and_rolls_over(env):
+    log = env.state / "audit.log"
+    log.write_text("x" * MAX_AUDIT)
+    log.chmod(0o644)  # written by a release from before the roll-over
+    env.gate.call("prune", ok, repo="me/app")
+    assert (env.state / "audit.log.1").read_text() == "x" * MAX_AUDIT
+    assert [line["outcome"] for line in audit_lines(env)] == ["ok"]
+    assert oct(log.stat().st_mode & 0o777) == "0o600"
+    env.gate.call("prune", ok, repo="me/app")
+    assert len(audit_lines(env)) == 2  # below the limit, it appends
+
+
+def test_audit_log_keeps_one_old_file(env, monkeypatch):
+    monkeypatch.setattr(call, "MAX_AUDIT", 1)
+    for _ in range(3):
+        env.gate.call("prune", ok, repo="me/app")
+    assert sorted(p.name for p in env.state.glob("audit.log*")) == ["audit.log", "audit.log.1"]
+    assert len(audit_lines(env)) == 1

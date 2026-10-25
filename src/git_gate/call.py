@@ -19,21 +19,33 @@ from git_gate.config import state_dir
 # The only list of tool names: the server registers exactly these, and Gate.dispatch accepts only these.
 TOOLS = ("clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label")
 MAX_LOG = 1 << 20  # errors.log rolls over to errors.log.1 at this size
+MAX_AUDIT = 8 << 20  # audit.log rolls over to audit.log.1 at this size
+
+
+def append(log: Path, text: str, limit: int) -> None:
+    """Append `text` to `log` (0600), first moving a log of `limit` bytes or more to <log>.1. Raises OSError."""
+    log.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if log.stat().st_size >= limit:
+            os.replace(log, log.with_name(log.name + ".1"))
+    except FileNotFoundError:
+        pass
+    fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8", errors="replace") as f:
+        os.fchmod(fd, 0o600)  # a log written before this release may be world-readable
+        f.write(text)
+
+
+def audit(state: Path, line: str) -> None:
+    """One line to <state>/audit.log, which the gate's tool calls and gitgatepush share. Raises OSError."""
+    append(state / "audit.log", line + "\n", MAX_AUDIT)
 
 
 def log_error(text: str) -> Path | None:
     """Append to errors.log in the state directory (0600, rolled over at MAX_LOG); None if it cannot be written."""
     log = state_dir() / "errors.log"
     try:
-        log.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if log.stat().st_size >= MAX_LOG:
-                os.replace(log, log.with_name("errors.log.1"))
-        except FileNotFoundError:
-            pass
-        fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8", errors="replace") as f:
-            f.write(text)
+        append(log, text, MAX_LOG)
     except OSError:
         return None
     return log

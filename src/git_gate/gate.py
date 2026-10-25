@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from git_gate import Refused, ghpolicy, writes
-from git_gate.call import TOOLS, log_error
+from git_gate.call import TOOLS, audit, log_error
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import FromGitHub, GitHub
 from git_gate.gitops import EMPTY, MAX_STDERR, Git
@@ -149,8 +149,7 @@ class Gate:
             "reason": reason, "ms": ms, "session": _session(), "cwd": _cwd(),
         })  # fmt: skip
         try:
-            with open(self.state / "audit.log", "a") as f:
-                f.write(_scrub(line, token) + "\n")
+            audit(self.state, _scrub(line, token))
         except OSError as e:
             # The call has already happened: failing it now would misreport what was done.
             log_error(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {tool} audit.log could not be written: {e}\n")
