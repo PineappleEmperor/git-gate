@@ -627,6 +627,16 @@ def test_protected_changes_fork_point(env, m, rules, checkout):
     assert m.fork_point(REPO, lonely, tip, rules) is None
 
 
+def test_protected_changes_non_utf8_name(env, m, rules, checkout):
+    """git prints raw bytes; a name that is not UTF-8 is matched and kept, never a decode error."""
+    git("switch", "-q", "-c", "raw", cwd=checkout)
+    blob = git("hash-object", "-w", "--stdin", cwd=checkout, input="#!/bin/sh\n")
+    git("update-index", "--add", "--cacheinfo", f"100644,{blob},.githooks/\udcff", cwd=checkout)
+    git("commit", "-q", "-m", "raw \udcfe name", cwd=checkout)
+    sha = git("rev-parse", "HEAD", cwd=checkout)
+    assert _changes(env, m, rules, checkout, "raw")[1] == Protected((".githooks/\udcff",), (sha,))
+
+
 @pytest.mark.parametrize(
     ("path", "extra", "hit"),
     [

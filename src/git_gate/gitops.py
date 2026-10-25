@@ -76,6 +76,10 @@ class Git:
                 stdin=None if stdin is not None else subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
+                # Lossless: a name or message that is not UTF-8 survives as surrogates, which
+                # matching keeps and display (handover._clean) prints as "?".
+                encoding="utf-8",
+                errors="surrogateescape",
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:

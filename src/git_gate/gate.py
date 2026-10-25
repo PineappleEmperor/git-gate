@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from git_gate import Refused, ghpolicy
-from git_gate.config import Rules, check_enabled, config_dir, load_rules, load_token, state_dir
+from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import PROTECTING_RULES, GitHub
 from git_gate.gitops import EMPTY, MAX_STDERR, Git
 from git_gate.handover import Handovers
@@ -110,7 +110,10 @@ class Gate:
     def _rate_limit(self, repo: object) -> None:
         """At most RATE_LIMIT calls per RATE_WINDOW seconds per repo, counted in a file: each call may
         be its own process (the relay), so the count cannot live in memory."""
-        key = hashlib.sha256(str(repo).lower().encode()).hexdigest()[:24]
+        # Only a well-formed owner/name gets a counter of its own; anything else shares one, so a
+        # looping agent cannot create a file per made-up repo string.
+        name = repo.lower() if isinstance(repo, str) and REPO_RE.fullmatch(repo) else "\0not-a-repo"
+        key = hashlib.sha256(name.encode()).hexdigest()[:24]
         fd = os.open(self.state / "rate" / key, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "r+") as f:
             fcntl.flock(f, fcntl.LOCK_EX)

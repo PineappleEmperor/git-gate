@@ -3,7 +3,7 @@ import re
 
 import pytest
 
-from git_gate import Refused
+from git_gate import Refused, mirror
 from git_gate.config import DEFAULT_HANDOVER_PATHS, RepoRules, canonical_pattern, check_enabled, load_rules
 
 
@@ -143,3 +143,15 @@ def test_timeouts_in_range_load(tmp_path):
     (tmp_path / "rules.toml").write_text("workspaces = []\ngit_timeout_seconds = 1\ngh_timeout_seconds = 86400\n")
     rules = load_rules(tmp_path)
     assert (rules.git_timeout, rules.gh_timeout, rules.repos) == (1, 86400, {})
+
+
+def test_identifiers_fullmatch(tmp_path):
+    rules = load_rules(write_rules(tmp_path, '"me/app" = "write"'))
+    with pytest.raises(Refused, match="not an owner/name"):
+        rules.repo("me/app\n")
+    sha = "a" * 40
+    assert mirror._oid(sha) == sha
+    with pytest.raises(Refused):
+        mirror._oid(sha + "\n")
+    with pytest.raises(Refused):
+        mirror._handover_ref("refs/gate/handover/7\n")

@@ -303,6 +303,17 @@ def test_handover_base_is_never_another_branch(env, checkout):
     assert h.exclude == (fork,)
 
 
+def test_push_with_a_non_utf8_name_is_handed_over(env, checkout):
+    git("switch", "-q", "-c", "raw", cwd=checkout)
+    blob = git("hash-object", "-w", "--stdin", cwd=checkout, input="x\n")
+    git("update-index", "--add", "--cacheinfo", f"100644,{blob},.githooks/\udcff", cwd=checkout)
+    git("commit", "-q", "-m", "raw", cwd=checkout)
+    with pytest.raises(Refused, match=r"gitgatepush \d+") as e:
+        push(env, checkout, "raw")
+    h = Handovers(env.state).get(int(re.findall(r"gitgatepush (\d+)", str(e.value))[0]))
+    assert h.protected == (".githooks/\udcff",)
+
+
 def test_new_branch_handover_records_fork_point(env, checkout):
     fork = main_sha(env)
     seed = env.tmp / "seed"

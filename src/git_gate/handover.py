@@ -27,7 +27,7 @@ from git_gate.mirror import LINK_MODES, OID, Mirror
 EXPIRES = 14 * 24 * 3600
 MAX_LOG = 50
 MAX_FILES = 100
-ID_RE = re.compile(r"^[0-9]{1,9}$")
+ID_RE = re.compile(r"[0-9]{1,9}")  # fullmatch only
 USAGE = "usage: gitgatepush [<id>]"
 MAX_ID = 10**9 - 1
 STORED = ("patterns", "protected", "exclude")  # tuples in the record, lists in its JSON
@@ -154,13 +154,13 @@ class Handovers:
 
     def _highest(self) -> int:
         """The highest id with a record file, readable or not."""
-        ids = [int(p.stem) for p in self.dir.glob("*.json") if ID_RE.match(p.stem)]
+        ids = [int(p.stem) for p in self.dir.glob("*.json") if ID_RE.fullmatch(p.stem)]
         return max(ids, default=0)
 
     def _all(self) -> list[Handover]:
         found = []
         for path in self.dir.glob("*.json") if self.dir.is_dir() else ():
-            if ID_RE.match(path.stem):
+            if ID_RE.fullmatch(path.stem):
                 try:
                     h = _parse(path.read_text(), int(path.stem))
                 except OSError:
@@ -221,7 +221,7 @@ def main(argv: list[str], *, stdin=sys.stdin, stdout=sys.stdout, base_url: str =
         handovers = Handovers(state)
         if not argv:
             return _list(handovers, say)
-        if len(argv) != 1 or not ID_RE.match(argv[0]):
+        if len(argv) != 1 or not ID_RE.fullmatch(argv[0]):
             say(USAGE)
             return 2
         return _run(handovers, int(argv[0]), Mirror(Git(state, base_url), state), stdin, say)
@@ -264,8 +264,9 @@ def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
         _check(again, mirror.git, rules)
         _require_commit(mirror, h, mirror_dir, rules)
         proc = subprocess.run(
-            push_command(h, mirror_dir, url), stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False
-        )
+            push_command(h, mirror_dir, url), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            encoding="utf-8", errors="surrogateescape", check=False,
+        )  # fmt: skip
         output = (proc.stdout + proc.stderr).strip()[-MAX_STDERR:]
         if output:
             say(output, lines=True)

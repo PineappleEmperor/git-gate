@@ -263,6 +263,18 @@ def test_off_switch_and_rate_limit(env, checkout):
     assert env.gate.call("prune", ok, repo="me/app") == "ok"
 
 
+def test_rate_limit_files_are_bounded(env):
+    """Strings that are not owner/name share one counter, so a looping agent cannot fill the state dir."""
+
+    def ok(rules, token, **kw):
+        return "ok"
+
+    for i in range(20):
+        env.gate.call("prune", ok, repo=f"not a repo {i}")
+        env.gate.call("prune", ok, repo=f"me/app\n{i}")
+    assert len(list((env.state / "rate").iterdir())) == 1
+
+
 def test_token_must_be_private(env):
     (env.cfg / "token").chmod(0o644)
     with pytest.raises(Refused, match="0600"):

@@ -9,7 +9,8 @@ from pathlib import Path
 
 from git_gate import Refused
 
-REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
+# Identifier patterns are always used with fullmatch: match with "$" accepts a trailing newline.
+REPO_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}")
 ACCESS_LEVELS = ("read", "write")
 REPO_KEYS = ("access", "handover_paths", "push_deploys")
 TOP_KEYS = ("workspaces", "protected_branches", "repos", "git_timeout_seconds", "gh_timeout_seconds")
@@ -76,7 +77,7 @@ class Rules:
     forbidden: tuple[Path, ...] = field(default=())
 
     def repo(self, repo: str) -> RepoRules:
-        if not REPO_RE.match(repo) or repo.endswith(".git") or ".." in repo:
+        if not isinstance(repo, str) or not REPO_RE.fullmatch(repo) or repo.endswith(".git") or ".." in repo:
             raise Refused(f"'{repo}' is not an owner/name repository.")
         rules = self.repos.get(repo.lower())
         if rules is None:

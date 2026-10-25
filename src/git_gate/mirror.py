@@ -22,8 +22,8 @@ from git_gate.gitops import MAX_STDERR, Git
 MAX_HAVE = 1000
 INIT_TIMEOUT = 60
 INCOMING = "refs/gate/incoming/"
-HANDOVER_REF = re.compile(r"^refs/gate/handover/[0-9]+$")
-OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+HANDOVER_REF = re.compile(r"refs/gate/handover/[0-9]+")  # identifier patterns: fullmatch only
+OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 LINK_MODES = ("120000", "160000")  # symlink, gitlink
 MISSING_PREREQS = ("lacks these prerequisite commits", "Repository lacks")
 BUNDLE_HOWTO = "git bundle create <file> {branch} --not --remotes=origin"
@@ -51,7 +51,7 @@ class Mirror:
 
     def path(self, repo: str) -> Path:
         """state/mirrors/<owner>/<name>.git, created bare from the gate's empty template on first use."""
-        if not REPO_RE.match(repo):
+        if not REPO_RE.fullmatch(repo):
             raise Refused(f"'{repo}' is not an owner/name repository.")
         owner, name = repo.lower().split("/")
         path = self.root / owner / f"{name}.git"
@@ -211,7 +211,7 @@ class Mirror:
         return {line.split(" ", 1)[-1] for line in out.splitlines() if line}
 
     def _known_commits(self, repo: str, have: list[str], rules: Rules) -> list[str]:
-        wanted = list(dict.fromkeys(h for h in have if isinstance(h, str) and OID.match(h)))
+        wanted = list(dict.fromkeys(h for h in have if isinstance(h, str) and OID.fullmatch(h)))
         if not wanted:
             return []
         out = self._git(
@@ -356,13 +356,13 @@ def _not(exclude: tuple[str, ...]) -> list[str]:
 
 
 def _oid(value: str) -> str:
-    if not isinstance(value, str) or not OID.match(value) or not value.strip("0"):
+    if not isinstance(value, str) or not OID.fullmatch(value) or not value.strip("0"):
         raise Refused(f"{value!r} is not a commit SHA.")
     return value
 
 
 def _handover_ref(ref: str) -> str:
-    if not HANDOVER_REF.match(ref):
+    if not HANDOVER_REF.fullmatch(ref):
         raise Refused(f"{ref!r} is not a refs/gate/handover/<id> ref.")
     return ref
 

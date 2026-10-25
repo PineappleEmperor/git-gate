@@ -787,3 +787,24 @@ def test_main_second_run_of_a_closed_id(env, m, rules, checkout):
     assert run(env, [str(h.id)], "y\n")[0] == 0
     code, out = run(env, [str(h.id)], "y\n")
     assert code == 1 and "No open handover" in out
+
+
+def test_main_survives_non_utf8_names(env, m, rules, checkout):
+    """Names and messages that are not UTF-8 print as "?", never as a traceback."""
+    git("switch", "-q", "-c", "raw", cwd=checkout)
+    blob = git("hash-object", "-w", "--stdin", cwd=checkout, input="x\n")
+    git("update-index", "--add", "--cacheinfo", f"100644,{blob},.githooks/\udcff", cwd=checkout)
+    git("commit", "-q", "-m", "bad \udcfe subject", cwd=checkout)
+    h = stage_here(env, m, rules, checkout, "raw")
+    assert h.protected == (".githooks/\udcff",)
+    assert Handovers(env.state).get(h.id) == h  # the record keeps the name through JSON
+    code, out = run(env, [str(h.id)], "n\n")
+    assert code == 1 and "Not pushed" in out  # declined, not crashed
+    assert "  .githooks/?\n" in out and "bad " in out and " subject" in out  # git re-encodes the message
+    assert not any(0xD800 <= ord(c) <= 0xDFFF for c in out)
+
+
+def test_main_ids_fullmatch(env, hs):
+    h = make(hs)
+    code, out = run(env, [f"{h.id}\n"], "y\n")
+    assert code == 2 and "usage" in out
