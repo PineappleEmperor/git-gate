@@ -1,8 +1,10 @@
-"""The gate's five operations. Each call re-reads rules and token."""
+"""The gate's tools. Each call re-reads rules and token."""
 
 import fcntl
 import fnmatch
+import functools
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -13,13 +15,13 @@ import subprocess
 import tempfile
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
-from git_gate import Refused, ghpolicy
+from git_gate import Refused, ghpolicy, writes
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
-from git_gate.github import PROTECTING_RULES, GitHub
+from git_gate.github import PROTECTING_RULES, FromGitHub, GitHub
 from git_gate.gitops import EMPTY, MAX_STDERR, Git
 from git_gate.handover import Handovers
 from git_gate.mirror import MAX_HAVE, Mirror, Protected, comparison
@@ -29,7 +31,6 @@ from git_gate.paths import (
     copy_tree_into,
     open_dir,
     place_new_file,
-    read_workspace_file,
     require_absolute,
     write_out,
 )
@@ -44,6 +45,16 @@ MAX_NAMED = 20  # protected files named in a refusal; the handover record and sc
 
 class HandedOver(Refused):
     """A refused push kept for the user: the message names `gitgatepush <id>`."""
+
+
+def _untrusted(tool: Callable[..., str]) -> Callable[..., str]:
+    """Mark a tool's reply as GitHub content; refusals carrying GitHub's text are marked in `Gate.call`."""
+
+    @functools.wraps(tool)
+    def marked(*args, **kwargs) -> str:
+        return writes.untrusted(tool(*args, **kwargs))
+
+    return marked
 
 
 class Gate:
@@ -79,18 +90,27 @@ class Gate:
         """Run one tool, scrub the token from whatever comes back, and audit it.
 
         The off switch is checked first, then the per-repo rate limit, before anything is read.
+        Arguments the tool does not take are refused, never an internal error. A refusal that
+        carries GitHub's text is marked as untrusted, whichever tool raised it.
         """
         token = None
         outcome = "ok"
         try:
             check_enabled(self.config)
             self._rate_limit(kwargs.get("repo"))
+            try:
+                inspect.signature(fn).bind(None, None, **kwargs)
+            except TypeError as e:
+                raise Refused(f"{tool}: {e}.") from None
             rules, token = self._load()
             result = fn(rules, token, **kwargs)
             return utf8_safe(_scrub(result, token))
         except HandedOver as e:
             outcome = "handover"
             raise Refused(utf8_safe(_scrub(str(e), token))) from None
+        except FromGitHub as e:
+            outcome = "refused"
+            raise Refused(utf8_safe(writes.untrusted(_scrub(str(e), token)))) from None
         except Refused as e:
             outcome = "refused"
             raise Refused(utf8_safe(_scrub(str(e), token))) from None
@@ -354,17 +374,85 @@ class Gate:
         api.delete_branch(repo, branch)
         return f"Deleted {branch} from {repo} (PR #{last['number']} {last['state']})."
 
+    # --- typed writes (the checks live in writes.py) -------------------------------------
+
+    def _writes(self, rules: Rules, token: str) -> writes.Context:
+        return writes.Context(rules, token, self.github(token), self.git)
+
+    @_untrusted
+    def pr(
+        self,
+        rules: Rules,
+        token: str,
+        repo: str,
+        action: str,
+        number: int | None = None,
+        title: str | None = None,
+        body_file: str | None = None,
+        base: str | None = None,
+        head: str | None = None,
+        draft: bool = False,
+    ) -> str:
+        return writes.pr(self._writes(rules, token), repo, action, number, title, body_file, base, head, draft)
+
+    @_untrusted
+    def issue(
+        self,
+        rules: Rules,
+        token: str,
+        repo: str,
+        action: str,
+        number: int | None = None,
+        title: str | None = None,
+        body_file: str | None = None,
+    ) -> str:
+        return writes.issue(self._writes(rules, token), repo, action, number, title, body_file)
+
+    @_untrusted
+    def triage(
+        self,
+        rules: Rules,
+        token: str,
+        repo: str,
+        number: int,
+        add_labels: Sequence[str] = (),
+        remove_labels: Sequence[str] = (),
+        add_assignees: Sequence[str] = (),
+        remove_assignees: Sequence[str] = (),
+        add_reviewers: Sequence[str] = (),
+        remove_reviewers: Sequence[str] = (),
+    ) -> str:
+        return writes.triage(
+            self._writes(rules, token), repo, number,
+            add_labels, remove_labels, add_assignees, remove_assignees, add_reviewers, remove_reviewers,
+        )  # fmt: skip
+
+    @_untrusted
+    def workflow_run(self, rules: Rules, token: str, repo: str, action: str, run_id: int) -> str:
+        return writes.workflow_run(self._writes(rules, token), repo, action, run_id)
+
+    @_untrusted
+    def label(
+        self,
+        rules: Rules,
+        token: str,
+        repo: str,
+        action: str,
+        name: str,
+        color: str | None = None,
+        description: str | None = None,
+        new_name: str | None = None,
+    ) -> str:
+        return writes.label(self._writes(rules, token), repo, action, name, color, description, new_name)
+
+    # --- read-only gh -------------------------------------------------------------------
+
+    @_untrusted
     def gh(self, rules: Rules, token: str, repo: str, args: list[str]) -> str:
-        p = ghpolicy.plan(repo, rules.access(repo), args)
+        rules.access(repo)
+        p = ghpolicy.plan(repo, args)
         work = Path(tempfile.mkdtemp(dir=self.state / "tmp"))
         try:
-            for i, (index, src) in enumerate(sorted(p.uploads.items())):
-                data = read_workspace_file(rules, src, "body")
-                if token.encode() in data:
-                    raise Refused(f"{src} contains the gate's token; refusing to upload it.")
-                copy = work / f"upload-{i}"
-                copy.write_bytes(data)
-                p.argv[index] = str(copy)
             if p.download:
                 index, target, is_dir = p.download
                 check_new_target(rules, target, "Download target")
@@ -385,7 +473,7 @@ class Gate:
                 raise Refused(f"gh timed out after {rules.gh_timeout}s.") from None
             out = proc.stdout + (("\n" + proc.stderr) if proc.stderr.strip() else "")
             if proc.returncode != 0:
-                raise Refused(f"gh exited {proc.returncode}:\n{_tail(out)}")
+                raise FromGitHub(f"gh exited {proc.returncode}:\n{_tail(out)}")
             if p.download:
                 out += self._deliver(rules, p, dl)
             return _tail(out) or "(no output)"

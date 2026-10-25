@@ -18,6 +18,13 @@ PROTECTING_RULES = {
 }
 
 
+MAX_MESSAGE = 500
+
+
+class FromGitHub(Refused):
+    """A refusal whose message carries text GitHub sent, which the agent must treat as data."""
+
+
 def _plan_limit(message: str) -> bool:
     """True when a 403 says the plan cannot use the feature, rather than that the call was blocked."""
     return "Upgrade to GitHub Pro" in message or "make this repository public" in message.lower()
@@ -28,7 +35,7 @@ class _SameHostRedirects(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
-            raise Refused(f"GitHub redirected to another host ({newurl}); not following.")
+            raise FromGitHub(f"GitHub redirected to another host ({newurl}); not following.")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -47,7 +54,13 @@ class GitHub:
         absent: tuple[int, ...] = (),
         absent_if: Callable[[int, str], bool] | None = None,
     ):
-        """JSON in and out. Statuses in `absent`, or an error `absent_if(status, message)` accepts, give None."""
+        """JSON in and out. Statuses in `absent`, or an error `absent_if(status, message)` accepts, give None.
+
+        Every POST sends a JSON body, `{}` when there is nothing to say. A refusal names GitHub's
+        error message, cleaned and cut to MAX_MESSAGE characters.
+        """
+        if data is None and method == "POST":
+            data = {}
         req = urllib.request.Request(
             f"{self.api}/{path}",
             data=json.dumps(data).encode() if data is not None else None,
@@ -64,20 +77,40 @@ class GitHub:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 body = resp.read()
         except urllib.error.HTTPError as e:
-            if e.code in absent or (absent_if and absent_if(e.code, self._message(e))):
+            message, detail = self._message(e)
+            if e.code in absent or (absent_if and absent_if(e.code, message)):
                 return None
+            said = self._clean("; ".join(m for m in (message, *detail) if m))
+            if said:
+                raise FromGitHub(f"GitHub {method} {path} returned {e.code}: {said}") from None
             raise Refused(f"GitHub {method} {path} returned {e.code}.") from None
         except urllib.error.URLError as e:
             raise Refused(f"GitHub {method} {path} failed: {e.reason}.") from None
         return json.loads(body) if body else {}
 
     @staticmethod
-    def _message(error: urllib.error.HTTPError) -> str:
-        """The `message` of GitHub's JSON error body, or "" when there is none."""
+    def _message(error: urllib.error.HTTPError) -> tuple[str, list[str]]:
+        """GitHub's JSON error body: its `message` ("" when there is none) and the messages or codes
+        of its `errors` list, which say what a 422 "Validation Failed" was about."""
         try:
-            return str(json.loads(error.read()).get("message", ""))
+            data = json.loads(error.read())
         except OSError, ValueError, AttributeError:
-            return ""
+            return "", []
+        if not isinstance(data, dict):
+            return "", []
+        errors = data.get("errors")
+        detail = [
+            str(e.get("message") or e.get("code") or "") if isinstance(e, dict) else str(e)
+            for e in (errors if isinstance(errors, list) else [])
+        ]
+        return str(data.get("message") or ""), detail
+
+    def _clean(self, text: str) -> str:
+        """GitHub's text for a refusal: one line, no token, at most MAX_MESSAGE characters."""
+        if self.token:
+            text = text.replace(self.token, "[token]")
+        text = "".join(c if c.isprintable() else " " for c in text).strip()
+        return text if len(text) <= MAX_MESSAGE else text[: MAX_MESSAGE - 3] + "..."
 
     @staticmethod
     def _branch(branch: str) -> str:
@@ -125,8 +158,8 @@ class GitHub:
         """The `data` of a GraphQL answer; GraphQL reports failures with status 200, so check `errors`."""
         out = self._request("POST", "graphql", {"query": query, "variables": variables})
         if out.get("errors"):
-            messages = "; ".join(str(e.get("message", e)) for e in out["errors"])
-            raise Refused(f"GitHub GraphQL failed: {messages}.")
+            messages = "; ".join(str(e.get("message", e)) if isinstance(e, dict) else str(e) for e in out["errors"])
+            raise FromGitHub(f"GitHub GraphQL failed: {self._clean(messages)}")
         return out.get("data") or {}
 
     @staticmethod
@@ -203,6 +236,10 @@ class GitHub:
             self._request("POST", path, {"reviewers": add})
         if remove:
             self._request("DELETE", path, {"reviewers": remove})
+
+    def run(self, repo: str, run_id: int) -> dict:
+        """A workflow run, which says among other things which branch it ran on (`head_branch`)."""
+        return self._request("GET", f"repos/{repo}/actions/runs/{run_id}")
 
     def run_action(self, repo: str, run_id: int, action: str) -> None:
         endpoints = {"rerun": "rerun", "rerun_failed": "rerun-failed-jobs", "cancel": "cancel"}

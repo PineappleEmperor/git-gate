@@ -15,14 +15,33 @@ READ = {
     ("repo", "view"),
     ("api",),
 }  # fmt: skip
-WRITE = {
-    ("pr", "create"), ("pr", "edit"), ("pr", "comment"), ("pr", "review"), ("pr", "close"),
-    ("pr", "reopen"), ("pr", "ready"),
-    ("issue", "create"), ("issue", "edit"), ("issue", "comment"), ("issue", "close"),
-    ("issue", "reopen"),
-    ("run", "rerun"), ("run", "cancel"),
-    ("label", "create"), ("label", "edit"),
-}  # fmt: skip
+# gh is read-only: each former write has a typed tool with checked parameters instead.
+TYPED_WRITES = {
+    ("pr", "create"): "use the gate's pr tool, action create",
+    ("pr", "edit"): (
+        "use the gate's pr tool, action edit, for the title, body and base, and its triage tool for labels, "
+        "assignees and reviewers"
+    ),
+    ("pr", "comment"): "use the gate's pr tool, action comment",
+    ("pr", "review"): (
+        "use the gate's pr tool, action review_comment or request_changes; approving is the user's, "
+        "since the token acts as the user"
+    ),
+    ("pr", "close"): "use the gate's pr tool, action close",
+    ("pr", "reopen"): "use the gate's pr tool, action reopen",
+    ("pr", "ready"): "use the gate's pr tool, action ready",
+    ("issue", "create"): "use the gate's issue tool, action create",
+    ("issue", "edit"): (
+        "use the gate's issue tool, action edit, for the title and body, and its triage tool for labels and assignees"
+    ),
+    ("issue", "comment"): "use the gate's issue tool, action comment",
+    ("issue", "close"): "use the gate's issue tool, action close",
+    ("issue", "reopen"): "use the gate's issue tool, action reopen",
+    ("run", "rerun"): "use the gate's workflow_run tool, action rerun (or rerun_failed for --failed)",
+    ("run", "cancel"): "use the gate's workflow_run tool, action cancel",
+    ("label", "create"): "use the gate's label tool, action create",
+    ("label", "edit"): "use the gate's label tool, action edit",
+}
 REFUSED_HINTS = {
     ("repo", "clone"): "use the gate's clone tool",
     ("pr", "checkout"): "use the gate's fetch tool, then check out locally",
@@ -33,6 +52,7 @@ REFUSED_HINTS = {
     ("pr", "merge"): "merging lands code on the base branch, which stays the user's to do",
     ("search", "issues"): "GitHub ORs repo: qualifiers, so it cannot be held to one repo; use issue list --search",
     ("search", "prs"): "GitHub ORs repo: qualifiers, so it cannot be held to one repo; use pr list --search",
+    **TYPED_WRITES,
 }
 
 DENIED_FLAGS = {"-R", "--repo", "--hostname", "--web", "-w", "--editor", "-e", "--recover", "--admin", "--owner"}
@@ -58,11 +78,10 @@ SEARCH_FLAGS = {"--search", "-S"}
 class GhPlan:
     argv: list[str]
     env: dict[str, str] = field(default_factory=dict)
-    uploads: dict[int, str] = field(default_factory=dict)  # argv index -> agent path to copy
     download: tuple[int, str, bool] | None = None  # (argv index, agent path, is_dir)
 
 
-def plan(repo: str, access: str, args: list[str]) -> GhPlan:
+def plan(repo: str, args: list[str]) -> GhPlan:
     if not args:
         raise Refused("gh needs a subcommand.")
     for a in args:
@@ -71,10 +90,8 @@ def plan(repo: str, access: str, args: list[str]) -> GhPlan:
     cmd = (args[0],) if args[0] == "api" else tuple(args[:2])
     if cmd in REFUSED_HINTS:
         raise Refused(f"gh {' '.join(cmd)} is not available through the gate: {REFUSED_HINTS[cmd]}.")
-    if cmd not in READ | WRITE:
+    if cmd not in READ:
         raise Refused(f"gh {' '.join(cmd)} is not on the gate's subcommand allowlist.")
-    if cmd in WRITE and access != "write":
-        raise Refused(f"gh {' '.join(cmd)} needs write access; {repo} is read-only.")
     rest = list(args[len(cmd) :])
     if cmd == ("api",):
         return _plan_api(repo, rest)
@@ -113,14 +130,13 @@ def _plan_command(repo: str, cmd: tuple[str, ...], rest: list[str]) -> GhPlan:
                 "gh --clobber is not allowed through the gate: downloads go into a new directory "
                 "(or a new file) the gate creates, and never replace anything."
             )
+        if name in BODY_FILE_FLAGS:
+            raise Refused(f"gh {name} is not allowed: gh is read-only, and bodies go through the gate's typed tools.")
         if name in SEARCH_FLAGS:
             value = t.split("=", 1)[1] if "=" in t else (rest[i + 1] if i + 1 < len(rest) else "")
             if SCOPE_QUALIFIER.search(value):
                 raise Refused("--search may not name repo:, org:, user:, owner: or is:public/private.")
-        wants_path = name in BODY_FILE_FLAGS or (
-            cmd[1] == "download" and name in DOWNLOAD_DIR_FLAGS | DOWNLOAD_FILE_FLAGS
-        )
-        if wants_path:
+        if cmd[1] == "download" and name in DOWNLOAD_DIR_FLAGS | DOWNLOAD_FILE_FLAGS:
             if "=" in t and t.startswith("--"):
                 value = t.split("=", 1)[1]
                 out.append(name)
@@ -131,14 +147,9 @@ def _plan_command(repo: str, cmd: tuple[str, ...], rest: list[str]) -> GhPlan:
                 out.append(t)
                 i += 1
             out.append(value)
-            index = len(out) - 1
-            if name in BODY_FILE_FLAGS:
-                if value != "-":
-                    result.uploads[index] = value
-            else:
-                if result.download:
-                    raise Refused("Give one download target.")
-                result.download = (index, value, name in DOWNLOAD_DIR_FLAGS)
+            if result.download:
+                raise Refused("Give one download target.")
+            result.download = (len(out) - 1, value, name in DOWNLOAD_DIR_FLAGS)
         else:
             out.append(t)
         i += 1
@@ -151,7 +162,6 @@ def _plan_command(repo: str, cmd: tuple[str, ...], rest: list[str]) -> GhPlan:
     prefix = ["repo", "view", repo] if cmd == ("repo", "view") else [*cmd, "-R", repo]
     offset = len(prefix)
     result.argv = prefix + out
-    result.uploads = {k + offset: v for k, v in result.uploads.items()}
     if result.download:
         idx, path, is_dir = result.download
         result.download = (idx + offset, path, is_dir)

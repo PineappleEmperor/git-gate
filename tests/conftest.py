@@ -1,4 +1,8 @@
+import io
+import json
+import stat
 import subprocess
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -143,3 +147,63 @@ def push(env, checkout: Path, branch: str, **kwargs) -> str:
     out.unlink(missing_ok=True)
     make_bundle(checkout, out, branch)
     return call(env, "push", repo=kwargs.pop("repo", "me/app"), branch=branch, bundle=str(out), **kwargs)
+
+
+API = "https://api.github.com/"
+URL = "https://github.com/me/app/pull/7"
+
+
+class FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeOpener:
+    """Stands in for the urllib opener: records each request, answers from canned replies."""
+
+    def __init__(self, replies=None):
+        self.replies = replies or {}
+        self.calls = []
+
+    def open(self, req, timeout=None):
+        path = req.full_url.removeprefix(API)
+        body = json.loads(req.data) if req.data else None
+        self.calls.append((req.get_method(), path, body))
+        reply = self.replies.get((req.get_method(), path), {"html_url": URL})
+        if isinstance(reply, int):
+            raise urllib.error.HTTPError(req.full_url, reply, "status", {}, None)
+        if isinstance(reply, tuple):  # (status, message, headers): an error with a GitHub-style body
+            status, message, headers = reply
+            fp = io.BytesIO(json.dumps({"message": message}).encode())
+            raise urllib.error.HTTPError(req.full_url, status, "status", headers, fp)
+        return FakeResponse(json.dumps(reply).encode())
+
+
+@pytest.fixture
+def fake_gh(env):
+    """A stand-in gh that records its call; `999` among its arguments makes it fail."""
+    record = env.tmp / "gh-call.json"
+    script = env.tmp / "gh"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys, pathlib\n"
+        f"rec = pathlib.Path({str(record)!r})\n"
+        "args = sys.argv[1:]\n"
+        "files = {a: pathlib.Path(a).read_text() for a in args if a.startswith('/') and pathlib.Path(a).is_file()}\n"
+        "rec.write_text(json.dumps({'args': args, 'cwd': os.getcwd(), 'env': dict(os.environ), 'files': files}))\n"
+        "if '999' in args:\n"
+        "    print('GraphQL: Could not resolve to a PullRequest with the number of 999.', file=sys.stderr)\n"
+        "    sys.exit(1)\n"
+        "if '-D' in args:\n"
+        "    d = pathlib.Path(args[args.index('-D') + 1]); (d / 'art').mkdir(); (d / 'art/log.txt').write_text('L')\n"
+        "    (d / '.claude').mkdir(); (d / '.claude/settings.json').write_text('{}')\n"
+        "if '-O' in args:\n"
+        "    pathlib.Path(args[args.index('-O') + 1]).write_text('asset')\n"
+        "print('ok', os.environ.get('GH_TOKEN'))\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    env.gate.gh_bin = str(script)
+    return lambda: json.loads(record.read_text())

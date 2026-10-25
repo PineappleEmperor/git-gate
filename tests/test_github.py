@@ -4,40 +4,9 @@ import urllib.error
 
 import pytest
 
+from conftest import URL, FakeOpener
 from git_gate import Refused
-from git_gate.github import GitHub
-
-API = "https://api.github.com/"
-URL = "https://github.com/me/app/pull/7"
-
-
-class FakeResponse(io.BytesIO):
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-class FakeOpener:
-    """Stands in for the urllib opener: records each request, answers from canned replies."""
-
-    def __init__(self, replies=None):
-        self.replies = replies or {}
-        self.calls = []
-
-    def open(self, req, timeout=None):
-        path = req.full_url.removeprefix(API)
-        body = json.loads(req.data) if req.data else None
-        self.calls.append((req.get_method(), path, body))
-        reply = self.replies.get((req.get_method(), path), {"html_url": URL})
-        if isinstance(reply, int):
-            raise urllib.error.HTTPError(req.full_url, reply, "status", {}, None)
-        if isinstance(reply, tuple):  # (status, message, headers): an error with a GitHub-style body
-            status, message, headers = reply
-            fp = io.BytesIO(json.dumps({"message": message}).encode())
-            raise urllib.error.HTTPError(req.full_url, status, "status", headers, fp)
-        return FakeResponse(json.dumps(reply).encode())
+from git_gate.github import FromGitHub, GitHub
 
 
 def make(replies=None):
@@ -179,15 +148,15 @@ CASES = [
     ),
     (
         lambda g: g.run_action("me/app", 5, "rerun"),
-        [("POST", "repos/me/app/actions/runs/5/rerun", None)],
+        [("POST", "repos/me/app/actions/runs/5/rerun", {})],
     ),
     (
         lambda g: g.run_action("me/app", 5, "rerun_failed"),
-        [("POST", "repos/me/app/actions/runs/5/rerun-failed-jobs", None)],
+        [("POST", "repos/me/app/actions/runs/5/rerun-failed-jobs", {})],
     ),
     (
         lambda g: g.run_action("me/app", 5, "cancel"),
-        [("POST", "repos/me/app/actions/runs/5/cancel", None)],
+        [("POST", "repos/me/app/actions/runs/5/cancel", {})],
     ),
     (
         lambda g: g.label("me/app", "create", "bug", color="f00", description="d"),
@@ -280,3 +249,50 @@ def test_open_pull():
     assert gh._opener.calls == [("GET", path, None)]
     gh = make({("GET", path): []})
     assert gh.open_pull("me/app", "feat") is None
+
+
+def test_every_post_sends_a_json_body():
+    gh = make()
+    gh.run_action("me/app", 5, "rerun")
+    ((method, _, body),) = gh._opener.calls
+    assert method == "POST" and body == {}
+
+
+def test_run_is_read():
+    gh = make({("GET", "repos/me/app/actions/runs/5"): {"id": 5, "head_branch": "feat"}})
+    assert gh.run("me/app", 5)["head_branch"] == "feat"
+    assert gh._opener.calls == [("GET", "repos/me/app/actions/runs/5", None)]
+
+
+def test_refusal_carries_githubs_message():
+    gh = make({("POST", "repos/me/app/issues/7/comments"): (422, "Validation Failed", {})})
+    with pytest.raises(FromGitHub, match="422: Validation Failed"):
+        gh.comment("me/app", 7, "x")
+
+
+def test_githubs_message_is_scrubbed_and_cut():
+    gh = make({("POST", "repos/me/app/issues/7/comments"): (422, "tok leaked\n\x1b[2J" + "y" * 900, {})})
+    with pytest.raises(FromGitHub) as e:
+        gh.comment("me/app", 7, "x")
+    text = str(e.value)
+    assert "tok leaked" not in text and "[token] leaked" in text
+    assert "\n" not in text and "\x1b" not in text
+    assert text.count("y") <= 500
+
+
+def test_validation_errors_are_named():
+    class Opener(FakeOpener):
+        def open(self, req, timeout=None):
+            body = {"message": "Validation Failed", "errors": [{"message": "A pull request already exists"}]}
+            raise urllib.error.HTTPError(req.full_url, 422, "status", {}, io.BytesIO(json.dumps(body).encode()))
+
+    gh = GitHub("tok")
+    gh._opener = Opener()
+    with pytest.raises(FromGitHub, match="Validation Failed.*A pull request already exists"):
+        gh.create_pull("me/app", "feat", "main", "t", "b", False)
+
+
+def test_graphql_errors_are_from_github():
+    gh = make({("POST", "graphql"): {"errors": [{"message": "nope"}]}})
+    with pytest.raises(FromGitHub, match="nope"):
+        gh.graphql("query { a }", {})
