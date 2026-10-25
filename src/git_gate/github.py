@@ -131,7 +131,11 @@ class GitHub:
 
     @staticmethod
     def _segment(value: str) -> str:
-        return urllib.parse.quote(value, safe="")
+        """One path segment from user input. Dots are encoded and dot-only values refused, so a
+        value can never turn into `.` or `..` and walk the request up out of its endpoint."""
+        if not value or set(value) == {"."}:
+            raise Refused(f"Refusing path segment {value!r}.")
+        return urllib.parse.quote(value, safe="").replace(".", "%2E")
 
     def open_pull(self, repo: str, branch: str) -> str | None:
         head = urllib.parse.quote(f"{repo.split('/')[0]}:{branch}", safe="")
@@ -193,8 +197,12 @@ class GitHub:
         if remove:
             self._request("DELETE", path, {"assignees": remove})
 
-    def request_reviewers(self, repo: str, number: int, reviewers: list[str]) -> None:
-        self._request("POST", f"repos/{repo}/pulls/{number}/requested_reviewers", {"reviewers": reviewers})
+    def request_reviewers(self, repo: str, number: int, add: list[str], remove: list[str]) -> None:
+        path = f"repos/{repo}/pulls/{number}/requested_reviewers"
+        if add:
+            self._request("POST", path, {"reviewers": add})
+        if remove:
+            self._request("DELETE", path, {"reviewers": remove})
 
     def run_action(self, repo: str, run_id: int, action: str) -> None:
         endpoints = {"rerun": "rerun", "rerun_failed": "rerun-failed-jobs", "cancel": "cancel"}
@@ -211,7 +219,7 @@ class GitHub:
         description: str | None = None,
         new_name: str | None = None,
     ) -> None:
-        """Create, edit or delete a repository label; only the fields given are sent."""
+        """Create or edit a repository label definition; only the fields given are sent."""
         if action == "create":
             fields = {"name": name, "color": color, "description": description}
             self._request("POST", f"repos/{repo}/labels", {k: v for k, v in fields.items() if v is not None})
@@ -219,7 +227,5 @@ class GitHub:
             fields = {"new_name": new_name, "color": color, "description": description}
             data = {k: v for k, v in fields.items() if v is not None}
             self._request("PATCH", f"repos/{repo}/labels/{self._segment(name)}", data)
-        elif action == "delete":
-            self._request("DELETE", f"repos/{repo}/labels/{self._segment(name)}")
         else:
-            raise Refused(f"Unknown label action {action!r}; use create, edit or delete.")
+            raise Refused(f"Unknown label action {action!r}; use create or edit.")

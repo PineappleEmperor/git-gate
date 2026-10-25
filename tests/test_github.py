@@ -156,8 +156,26 @@ CASES = [
         [("POST", "repos/me/app/issues/7/assignees", {"assignees": ["v"]})],
     ),
     (
-        lambda g: g.request_reviewers("me/app", 7, ["r"]),
+        lambda g: g.request_reviewers("me/app", 7, ["r"], []),
         [("POST", "repos/me/app/pulls/7/requested_reviewers", {"reviewers": ["r"]})],
+    ),
+    (
+        lambda g: g.request_reviewers("me/app", 7, [], ["r"]),
+        [("DELETE", "repos/me/app/pulls/7/requested_reviewers", {"reviewers": ["r"]})],
+    ),
+    (
+        lambda g: g.request_reviewers("me/app", 7, ["a"], ["b"]),
+        [
+            ("POST", "repos/me/app/pulls/7/requested_reviewers", {"reviewers": ["a"]}),
+            ("DELETE", "repos/me/app/pulls/7/requested_reviewers", {"reviewers": ["b"]}),
+        ],
+    ),
+    (lambda g: g.request_reviewers("me/app", 7, [], []), []),
+    (lambda g: g.labels("me/app", 7, [], []), []),
+    (lambda g: g.assignees("me/app", 7, [], []), []),
+    (
+        lambda g: g.labels("me/app", 7, [], ["v1.0"]),
+        [("DELETE", "repos/me/app/issues/7/labels/v1%2E0", None)],
     ),
     (
         lambda g: g.run_action("me/app", 5, "rerun"),
@@ -178,10 +196,6 @@ CASES = [
     (
         lambda g: g.label("me/app", "edit", "bug", new_name="defect"),
         [("PATCH", "repos/me/app/labels/bug", {"new_name": "defect"})],
-    ),
-    (
-        lambda g: g.label("me/app", "delete", "a/b c"),
-        [("DELETE", "repos/me/app/labels/a%2Fb%20c", None)],
     ),
 ]
 
@@ -217,10 +231,21 @@ def test_run_action_rejects_unknown():
     assert gh._opener.calls == []
 
 
-def test_label_rejects_unknown_action():
+@pytest.mark.parametrize("action", ["delete", "rename", ""])
+def test_label_rejects_other_actions(action):
     gh = make()
     with pytest.raises(Refused):
-        gh.label("me/app", "rename", "bug")
+        gh.label("me/app", action, "bug")
+    assert gh._opener.calls == []
+
+
+@pytest.mark.parametrize("name", ["..", ".", "", "..."])
+def test_label_refuses_dot_segments(name):
+    gh = make()
+    with pytest.raises(Refused, match="segment"):
+        gh.label("me/app", "edit", name, new_name="x")
+    with pytest.raises(Refused):
+        gh.labels("me/app", 7, [], [name])
     assert gh._opener.calls == []
 
 
