@@ -145,3 +145,14 @@ def test_audit_says_how_long_the_call_took(env):
     took, refused = (line["ms"] for line in audit_lines(env)[-2:])
     assert type(took) is int and 50 <= took < 5000
     assert type(refused) is int and 0 <= refused < took
+
+
+# --- writing audit.log -----------------------------------------------------------------------
+
+
+def test_an_unwritable_audit_log_does_not_fail_the_call(env):
+    (env.state / "audit.log").mkdir()
+    assert env.gate.call("prune", ok, repo="me/app") == "ok"
+    with pytest.raises(Refused, match="^no$"):
+        env.gate.call("prune", raising(Refused("no")), repo="me/app")
+    assert "audit.log" in (env.state / "errors.log").read_text()

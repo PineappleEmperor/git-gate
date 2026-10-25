@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from git_gate import Refused, ghpolicy, writes
-from git_gate.call import TOOLS
+from git_gate.call import TOOLS, log_error
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import FromGitHub, GitHub
 from git_gate.gitops import EMPTY, MAX_STDERR, Git
@@ -148,8 +148,12 @@ class Gate:
             "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "args": kwargs, "outcome": outcome,
             "reason": reason, "ms": ms, "session": _session(), "cwd": _cwd(),
         })  # fmt: skip
-        with open(self.state / "audit.log", "a") as f:
-            f.write(_scrub(line, token) + "\n")
+        try:
+            with open(self.state / "audit.log", "a") as f:
+                f.write(_scrub(line, token) + "\n")
+        except OSError as e:
+            # The call has already happened: failing it now would misreport what was done.
+            log_error(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {tool} audit.log could not be written: {e}\n")
 
     def _rate_limit(self, repo: object) -> None:
         """At most RATE_LIMIT calls per RATE_WINDOW seconds per repo, counted in a file: each call may
