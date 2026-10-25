@@ -43,6 +43,10 @@ FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
 MAX_NAMED = 20  # protected files named in a refusal; the handover record and screen hold them all
 
 
+class InternalError(Exception):
+    """A tool failed in a way nobody planned for; the message is scrubbed and safe to show an agent."""
+
+
 class HandedOver(Refused):
     """A refused push kept for the user: the message names `gitgatepush <id>`."""
 
@@ -122,9 +126,10 @@ class Gate:
         except Refused as e:
             outcome = "refused"
             raise Refused(utf8_safe(_scrub(str(e), token))) from None
-        except Exception:
+        except Exception as e:
             outcome = "error"
-            raise
+            # Nothing unplanned reaches the agent raw: the text is scrubbed and holds no lone surrogate.
+            raise InternalError(utf8_safe(_scrub(f"{type(e).__name__}: {e}", token))) from e
         finally:
             self._audit(tool, kwargs, outcome, token)
 

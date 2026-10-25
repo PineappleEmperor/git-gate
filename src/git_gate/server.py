@@ -13,7 +13,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from git_gate import Refused
 from git_gate.config import state_dir
-from git_gate.gate import Gate, utf8_safe
+from git_gate.gate import Gate, InternalError, utf8_safe
 
 RELAY_TIMEOUT = 4 * 3600  # a backstop only; each call enforces the timeouts in rules.toml
 
@@ -117,7 +117,12 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         try:
             return await anyio.to_thread.run_sync(call)
         except Refused as e:
-            raise ToolError(str(e)) from None
+            raise ToolError(utf8_safe(str(e))) from None
+        except Exception as e:
+            # Gate.call has already scrubbed the token from its own failures. The text must still be
+            # valid UTF-8: a lone surrogate would crash the transport's JSON encoder.
+            detail = str(e) if isinstance(e, InternalError) else f"{type(e).__name__}: {e}"
+            raise ToolError(utf8_safe(f"git-gate hit an internal error: {detail}")) from None
 
     @server.tool()
     async def clone(repo: str, path: str) -> str:
