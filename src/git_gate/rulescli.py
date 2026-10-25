@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,6 +53,29 @@ HEADER_RE = re.compile(r"\s*\[(?!\[)(.*)\]\s*(?:#.*)?")
 KEY_RE = re.compile(
     r"""\s*((?:[A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*"|'[^']*')(?:\s*\.\s*(?:[A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*"|'[^']*'))*)\s*="""
 )
+
+
+MAX_LINE = 2000  # characters of one printed line
+MAX_VALUE = 300  # characters of a URL or git's stderr in a message
+
+
+def clean(text: str, limit: int = MAX_LINE) -> str:
+    """Text as it may reach the user's terminal, which every line gitgaterules prints goes through:
+    whatever is not printable (control characters, escape sequences, bidi and zero-width marks) as
+    an escape, the rule scripts/audit_report.py uses, and each line at most `limit` characters.
+
+    Remote URLs, git's stderr, folder names and the rules file can all hold text an agent wrote.
+    """
+    lines = []
+    for line in text.split("\n"):
+        line = "".join(c if c.isprintable() else _escape(c) for c in line)
+        lines.append(line if len(line) <= limit else line[:limit] + "…")
+    return "\n".join(lines)
+
+
+def _escape(c: str) -> str:
+    n = ord(c)
+    return f"\\x{n:02x}" if n < 0x100 else f"\\u{n:04x}" if n < 0x10000 else f"\\U{n:08x}"
 
 
 def rules_path() -> Path:
@@ -536,9 +560,19 @@ GITHUB_URL_RE = re.compile(
 )
 
 
-def _shown_url(url: str) -> str:
-    """A remote URL fit to print: any user name and password in it removed."""
-    return re.sub(r"//[^@/]*@", "//", url)
+def shown_url(url: str) -> str:
+    """A remote URL fit to print: no user name or password (all before the netloc's last "@"), no
+    query and no fragment, escaped and cut by `clean`. scp-like URLs (user@host:path) too."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        parts = None
+    if parts and parts.scheme and parts.netloc:
+        url = urllib.parse.urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, "", ""))
+    else:
+        host, colon, path = url.partition(":")
+        url = host.rpartition("@")[2] + colon + re.split(r"[?#]", path, maxsplit=1)[0]
+    return clean(url, MAX_VALUE)
 
 
 def origin_repo(folder: Path) -> tuple[str | None, str]:
@@ -558,19 +592,20 @@ def origin_repo(folder: Path) -> tuple[str | None, str]:
     try:
         proc = subprocess.run(
             [GIT, "-C", str(folder), "config", "--get", "remote.origin.url"],
-            env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=30,
-            check=False,
+            env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=30, check=False,
         )  # fmt: skip
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, f"could not be read by git ({e})"
     if proc.returncode == 1:
         return None, "has no origin remote"
     if proc.returncode != 0:
-        return None, f"could not be read by git ({proc.stderr.strip()[-300:]})"
-    url = proc.stdout.strip()
+        # Decoded here, not in text mode, which would turn a stray \r into a line break unseen.
+        stderr = proc.stderr.decode(errors="replace").strip().replace("\n", " ")
+        return None, f"could not be read by git ({clean(stderr, MAX_VALUE)})"
+    url = proc.stdout.decode(errors="replace").strip()
     m = GITHUB_URL_RE.fullmatch(url)
     if not m or not valid_repo(m[1]):
-        return None, f"has origin {_shown_url(url)}, which is not a github.com repository"
+        return None, f"has origin {shown_url(url)}, which is not a github.com repository"
     return m[1], ""
 
 
@@ -790,7 +825,7 @@ COMMANDS = {
 
 def main(argv: list[str], *, stdout=sys.stdout, stdin=sys.stdin) -> int:
     def say(text: str = "", end: str = "\n") -> None:
-        stdout.write(text + end)
+        stdout.write(clean(text) + end)
         stdout.flush()
 
     if not argv:

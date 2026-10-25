@@ -577,3 +577,66 @@ def test_a_folder_named_unlike_its_repo_is_warned_about(cfg, tmp_path):
     assert "is named elsewhere" in out
     code, out = run("migrate", "--write", stdin=Terminal("y\n"))
     assert code == 0 and owned(cfg)["elsewhere"] == "me/skills"  # a warning, not a flag
+
+
+# --- what gitgaterules prints is escaped ---------------------------------------------------------
+# Remote URLs, git's stderr, folder names and the file itself can hold text an agent wrote.
+
+
+def unprintable(text: str) -> list[str]:
+    return [c for c in text if not c.isprintable() and c != "\n"]
+
+
+def one_workspace(cfg, tmp_path, url: str, name: str = "w") -> Path:
+    folder = tmp_path / "ws" / name
+    checkout_of(folder, url)
+    write(cfg, f'workspaces = [{json.dumps(str(folder))}]\n[repos]\n"me/x" = "write"\n')
+    return folder
+
+
+def test_an_escape_sequence_in_a_remote_url_is_escaped(cfg, tmp_path):
+    one_workspace(cfg, tmp_path, "https://gitlab.com/me/\x1b]0;owned\x07x‮.git")
+    code, out = run("migrate")
+    assert unprintable(out) == []
+    assert "\\x1b]0;owned\\x07x\\u202e.git" in out
+
+
+def test_a_shown_url_keeps_no_credentials_query_or_fragment(cfg, tmp_path):
+    one_workspace(cfg, tmp_path, "https://user:tok%40en@gitlab.com/me/x.git?private_token=abc#frag")
+    code, out = run("migrate")
+    assert "https://gitlab.com/me/x.git" in out
+    for secret in ("user", "tok", "private_token", "abc", "frag"):
+        assert secret not in out.replace("tmp/", "")
+    assert rulescli.shown_url("git@evil@github.com:me/x?q#f") == "github.com:me/x"
+    assert rulescli.shown_url("ssh://a:b@c@host:22/p/q.git?x") == "ssh://host:22/p/q.git"
+
+
+def test_git_stderr_is_escaped_and_cut(cfg, tmp_path, monkeypatch):
+    fake = tmp_path / "git"
+    fake.write_text(
+        "#!/bin/sh\nprintf 'fatal: \\033[2Jcleared\\r%s' \"$(printf 'x%.0s' $(seq 1 2000))\" >&2\nexit 128\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr(rulescli, "GIT", str(fake))
+    one_workspace(cfg, tmp_path, "https://github.com/me/x")
+    code, out = run("migrate")
+    assert unprintable(out) == []
+    line = next(line for line in out.splitlines() if "could not be read by git" in line)
+    assert len(line) < 600 and "\\x1b[2Jcleared\\x0d" in line
+
+
+def test_a_folder_name_with_control_characters_is_escaped(cfg, tmp_path):
+    folder = tmp_path / "ws" / "a\x1b[31mb"
+    folder.mkdir(parents=True)
+    write(cfg, f"workspaces = [{json.dumps(str(folder))}]\n")
+    code, out = run("migrate")
+    assert unprintable(out) == [] and "a\\x1b[31mb" in out
+
+
+def test_the_diff_and_the_file_hold_no_raw_invisible_characters(cfg, tmp_path):
+    write(cfg, 'protected_branches = ["ma‮in"]\n' + PINEAPPLE)
+    code, out = run("grant", f"{tmp_path}/core", "read", "up/x")
+    assert code == 0 and unprintable(out) == []
+    text = (cfg / "rules.toml").read_text()
+    assert unprintable(text) == [] and "\\u202e" in text
+    assert load_rules(cfg).protected_branches == ("ma‮in",)

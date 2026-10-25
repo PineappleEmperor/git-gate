@@ -76,13 +76,14 @@ def valid_repo(name: object) -> bool:
 
 
 def toml_string(text: str) -> str:
-    """`text` as a TOML basic string: quotes and backslashes escaped, control characters as \\uXXXX."""
+    """`text` as a TOML basic string: quotes and backslashes escaped, and whatever is not printable
+    (control characters, bidi and zero-width marks) as \\uXXXX, so the file shows all it holds."""
     out = []
     for c in text:
         if c in '"\\':
             out.append("\\" + c)
-        elif ord(c) < 0x20 or ord(c) == 0x7F:
-            out.append(f"\\u{ord(c):04x}")
+        elif not c.isprintable():
+            out.append(f"\\u{ord(c):04x}" if ord(c) < 0x10000 else f"\\U{ord(c):08x}")
         else:
             out.append(c)
     return '"' + "".join(out) + '"'
