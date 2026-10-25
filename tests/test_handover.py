@@ -9,6 +9,7 @@ import pytest
 
 from conftest import TOKEN, commit, git, push
 from git_gate import Refused
+from git_gate.call import MAX_AUDIT
 from git_gate.config import DEFAULT_HANDOVER_PATHS, Rules
 from git_gate.handover import EXPIRES, Handover, Handovers, main, push_command
 from git_gate.mirror import Mirror, comparison
@@ -836,3 +837,16 @@ def test_main_audits_the_push(env, m, rules, checkout):
         failing.id,
         failing.sha,
     )
+
+
+def test_main_rolls_the_audit_log_over(env, m, rules, checkout):
+    """gitgatepush shares the gate's audit.log, and its limit."""
+    log = env.state / "audit.log"
+    log.write_text("x" * MAX_AUDIT)
+    h = stage(env, m, rules, checkout)
+    log.write_text("x" * MAX_AUDIT)  # staging went through the gate, which wrote its own line
+    assert run(env, [str(h.id)], "y\n")[0] == 0
+    [old] = env.state.glob("audit.log.*")
+    assert old.read_text() == "x" * MAX_AUDIT
+    assert [line["outcome"] for line in audit_lines(env)] == ["pushed"]
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600

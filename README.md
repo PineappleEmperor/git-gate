@@ -70,3 +70,38 @@ relay release need one restart, to replace their old server.
 ```bash
 claude mcp add --scope user git-gate -- /opt/git-gate/current/bin/git-gate
 ```
+
+## Audit log
+
+Every tool call, and every `gitgatepush` push, appends one JSON line to
+`~/.local/state/git-gate/audit.log` (mode 0600). The token never appears in it. A tool call never
+fails over its audit line: if the line cannot be written, `errors.log` beside it says so. A tool
+call's line:
+
+- `time`: local time the call ended.
+- `tool`: the tool.
+- `args`: its arguments. Each string is cut at 1,000 characters, each list at 20 entries plus a
+  count of the rest. Past 8 KiB in all, lists shrink further, down to the count alone; other
+  arguments are kept.
+- `outcome`: `ok`, `refused`, `handover` or `error`.
+- `reason`: for anything but `ok`, the first line of what the agent was told (at most 300
+  characters); for `error`, the exception. Otherwise null.
+- `ms`: how long the call took, in milliseconds.
+- `session`: the conversation, as its relay's `<pid>-<start time>`.
+- `cwd`: the conversation's project folder, or null.
+
+A `gitgatepush` line has `time`, `tool` (`gitgatepush`), `id`, `repo`, `branch`, `sha` and `outcome`
+(`pushed` or `failed`). Lines from older releases lack the newer fields.
+
+At 8 MiB, `audit.log` is renamed to `audit.log.<YYYYmmddTHHMMSS>`, with `.<n>` added if that name is
+taken. The gate never deletes these files: remove old ones yourself.
+
+To summarise the log, run this from your own terminal:
+
+```bash
+python3 /opt/git-gate/current/scripts/audit_report.py [--since YYYY-MM-DD] [path/to/audit.log]
+```
+
+It reads the rotated files oldest first, then `audit.log`. It prints calls per project folder and
+per repo and tool, each with outcome counts. It also prints the most common refusal reasons and
+handover outcomes per repo.

@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from git_gate import Refused
+from git_gate.call import audit
 from git_gate.config import REPO_RE, Rules, state_dir
 from git_gate.gitops import MAX_STDERR, Git
 from git_gate.mirror import LINK_MODES, OID, Mirror
@@ -292,9 +293,7 @@ def _audit(state: Path, h: Handover, outcome: str, say) -> None:
         "branch": h.branch, "sha": h.sha, "outcome": outcome,
     })  # fmt: skip
     try:
-        fd = os.open(state / "audit.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "a") as f:
-            f.write(line + "\n")
+        audit(state, line)
     except OSError as e:
         say(f"Warning: could not write {state / 'audit.log'}: {e.strerror}.")
 

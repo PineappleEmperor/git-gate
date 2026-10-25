@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from git_gate import Refused, ghpolicy, writes
-from git_gate.call import TOOLS
+from git_gate.call import TOOLS, audit, log_error
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import FromGitHub, GitHub
 from git_gate.gitops import EMPTY, MAX_STDERR, Git
@@ -44,6 +44,12 @@ FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
 # What GitHub says when a token without the Workflows permission pushes a change to .github/workflows.
 WORKFLOW_SCOPE = "create or update workflow"
 MAX_NAMED = 20  # protected files named in a refusal; the handover record and screen hold them all
+PROC = Path("/proc")
+MAX_REASON = 300  # characters of a refusal's first line kept in audit.log
+MAX_ARG = 1000  # characters of one string argument kept in audit.log
+MAX_ARGS = 8 << 10  # characters of all the arguments, as JSON, kept in audit.log
+# (entries kept, characters kept of each string in them) for list arguments, tried in turn until all fit
+LIST_STEPS = ((20, MAX_ARG), (20, 100), (5, 100), (0, 0))
 
 
 class InternalError(Exception):
@@ -107,8 +113,10 @@ class Gate:
         Arguments the tool does not take are refused, never an internal error. A refusal that
         carries GitHub's text is marked as untrusted, whichever tool raised it.
         """
+        started = time.monotonic()
         token = None
         outcome = "ok"
+        message = None  # what the agent is told when the outcome is not ok, scrubbed
         try:
             check_enabled(self.config)
             self._rate_limit(kwargs.get("repo"))
@@ -120,27 +128,36 @@ class Gate:
             result = fn(rules, token, **kwargs)
             return utf8_safe(_scrub(result, token))
         except HandedOver as e:
-            outcome = "handover"
-            raise Refused(utf8_safe(_scrub(str(e), token))) from None
+            outcome, message = "handover", utf8_safe(_scrub(str(e), token))
+            raise Refused(message) from None
         except FromGitHub as e:
-            outcome = "refused"
-            raise Refused(utf8_safe(writes.untrusted(_scrub(str(e), token)))) from None
+            outcome, message = "refused", utf8_safe(_scrub(str(e), token))
+            raise Refused(writes.untrusted(message)) from None
         except Refused as e:
-            outcome = "refused"
-            raise Refused(utf8_safe(_scrub(str(e), token))) from None
+            outcome, message = "refused", utf8_safe(_scrub(str(e), token))
+            raise Refused(message) from None
         except Exception as e:
             outcome = "error"
             # Nothing unplanned reaches the agent raw: the text is scrubbed and holds no lone surrogate.
-            raise InternalError(utf8_safe(_scrub(f"{type(e).__name__}: {e}", token))) from e
+            message = utf8_safe(_scrub(f"{type(e).__name__}: {e}", token))
+            raise InternalError(message) from e
         finally:
-            self._audit(tool, kwargs, outcome, token)
+            self._audit(tool, kwargs, outcome, token, message, int((time.monotonic() - started) * 1000))
 
-    def _audit(self, tool: str, kwargs: dict, outcome: str, token: str | None) -> None:
-        line = json.dumps(
-            {"time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "args": kwargs, "outcome": outcome}
-        )
-        with open(self.state / "audit.log", "a") as f:
-            f.write(_scrub(line, token) + "\n")
+    def _audit(self, tool: str, kwargs: dict, outcome: str, token: str | None, message: str | None, ms: int) -> None:
+        """One line per call. `reason` is the first line of what the agent was told, without the
+        untrusted-content marker a refusal carrying GitHub's text starts with."""
+        reason = message.strip().partition("\n")[0][:MAX_REASON] if message is not None else None
+        try:
+            line = json.dumps({
+                "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "args": _logged_args(kwargs, token),
+                "outcome": outcome, "reason": reason, "ms": ms, "session": _session(), "cwd": _cwd(),
+            })  # fmt: skip
+            audit(self.state, _scrub(line, token))
+        except Exception as e:
+            # The call has already happened: failing it now would misreport what was done.
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            log_error(_scrub(f"{stamp} {tool} audit.log could not be written: {type(e).__name__}: {e}\n", token))
 
     def _rate_limit(self, repo: object) -> None:
         """At most RATE_LIMIT calls per RATE_WINDOW seconds per repo, counted in a file: each call may
@@ -567,6 +584,67 @@ def _refusal_for(found: Protected) -> str:
     if found.commits:
         reason += f" Commit(s) {', '.join(c[:12] for c in found.commits)} change them."
     return reason
+
+
+def _logged_args(kwargs: dict, token: str | None) -> dict:
+    """The arguments as audit.log keeps them, at most MAX_ARGS characters as JSON.
+
+    They are the agent's, so this is what bounds how fast it can fill the log, and padding one
+    argument must not hide the others: every argument that is not a list is kept, cut at MAX_ARG.
+    Lists give way step by step (LIST_STEPS), keeping their heads, where gh's command is, and a
+    count of the rest. Only arguments no tool declares can make even that too long.
+    """
+    for items, chars in LIST_STEPS:
+        args = {
+            _cut(k, MAX_ARG, token): _cut(v, MAX_ARG, token) if isinstance(v, str) else _head(v, items, chars, token)
+            for k, v in kwargs.items()
+        }
+        if len(json.dumps(args)) <= MAX_ARGS:
+            return args
+    kept, size = {}, 0
+    for k, v in args.items():
+        size += len(json.dumps({k: v}))
+        if size > MAX_ARGS:
+            break
+        kept[k] = v
+    return kept | {"…": f"[+{len(args) - len(kept)} more arguments, {len(json.dumps(kwargs))} chars in all]"}
+
+
+def _head(value: object, items: int, chars: int, token: str | None) -> object:
+    """A list or object argument as its first `items` entries, strings cut at `chars`, and a count of the rest."""
+    if isinstance(value, str):
+        return _cut(value, chars, token)
+    if isinstance(value, list | tuple):
+        rest = [f"…[+{len(value) - items} more]"] if len(value) > items else []
+        return [_head(v, items, chars, token) for v in value[:items]] + rest
+    if isinstance(value, dict):
+        rest = {"…": f"[+{len(value) - items} more]"} if len(value) > items else {}
+        return {_cut(k, chars, token): _head(v, items, chars, token) for k, v in list(value.items())[:items]} | rest
+    return value
+
+
+def _cut(text: str, limit: int, token: str | None) -> str:
+    text = _scrub(text, token)  # before the cut, which could leave half a token unmatched
+    return text if len(text) <= limit else f"{text[:limit]}…[+{len(text) - limit} chars]"
+
+
+def _session(proc: Path = PROC) -> str:
+    """The calling conversation: its relay's pid and start time (/proc stat field 22), so a reused pid
+    is a new session. The relay is this process's parent; without /proc, its pid alone."""
+    ppid = os.getppid()
+    try:
+        # The process name, in parentheses, may hold spaces and ")": the fields start after the last ")".
+        return f"{ppid}-{int((proc / str(ppid) / 'stat').read_text().rpartition(')')[2].split()[19])}"
+    except OSError, ValueError, IndexError:
+        return str(ppid)
+
+
+def _cwd() -> str | None:
+    """The conversation's project folder: the relay runs there and its child inherits it; None if gone."""
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
 
 
 def utf8_safe(text: str) -> str:
