@@ -313,6 +313,9 @@ def workflow_run(ctx: Context, repo: str, action: str, run_id: int) -> str:
         reason = "GitHub names no branch for it."
     else:
         reason = protection(ctx.rules, api, repo, branch, api.default_branch(repo), must_exist=True)
+        # A tag push reports the tag as head_branch, and an agent can push a branch of that name.
+        if reason is None and api.tag_exists(repo, branch):
+            reason = f"{repo} also has a tag {branch}, so this may be that tag's run (a release)."
     web = f"https://github.com/{repo}/actions/runs/{n}"
     if reason:
         # The reason quotes what GitHub said about the run, so it is marked as GitHub content.

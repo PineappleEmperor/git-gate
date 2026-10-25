@@ -237,6 +237,13 @@ class GitHub:
         if remove:
             self._request("DELETE", path, {"reviewers": remove})
 
+    def tag_exists(self, repo: str, name: str) -> bool:
+        """Whether `repo` has the tag `name`. Each `/`-separated part is quoted as a segment of its
+        own, so a tag like release/v1 keeps its path and no part can become `.` or `..`. Only a 404
+        means "no tag"; any other failure raises."""
+        path = "/".join(self._segment(part) for part in name.split("/"))
+        return self._request("GET", f"repos/{repo}/git/ref/tags/{path}", absent=(404,)) is not None
+
     def run(self, repo: str, run_id: int) -> dict:
         """A workflow run, which says among other things which branch it ran on (`head_branch`)."""
         return self._request("GET", f"repos/{repo}/actions/runs/{run_id}")

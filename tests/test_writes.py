@@ -8,7 +8,7 @@ import pytest
 
 from conftest import TOKEN, URL, FakeOpener, call
 from git_gate import Refused
-from git_gate.github import GitHub
+from git_gate.github import FromGitHub, GitHub
 from git_gate.writes import UNTRUSTED
 
 BODY = "<body>"  # stands for the body file each test writes
@@ -18,6 +18,7 @@ RUN_READS = [
     api_call.default_branch("me/app"),
     api_call.branch("me/app", "feat"),
     api_call.rule_types("me/app", "feat"),
+    api_call.tag_exists("me/app", "feat"),
 ]
 
 
@@ -33,6 +34,7 @@ def api(env):
     fake.run.return_value = dict(RUN)
     fake.branch.return_value = {"sha": "a" * 40, "protected": False}
     fake.rule_types.return_value = set()
+    fake.tag_exists.return_value = False
 
     def factory(token):
         assert token == TOKEN
@@ -55,7 +57,7 @@ def _fill(kwargs, body):
 
 def writes(api):
     """The calls that change something on GitHub."""
-    return [c for c in api.method_calls if c[0] not in ("default_branch", "run", "branch", "rule_types")]
+    return [c for c in api.method_calls if c[0] not in ("default_branch", "run", "branch", "rule_types", "tag_exists")]
 
 
 CASES = [
@@ -528,6 +530,22 @@ def test_workflow_run_from_a_fork_refused(env, api, head):
     _refused_run(env, api)
 
 
+def test_workflow_run_whose_branch_name_is_also_a_tag_refused(env, api):
+    """A tag push reports the tag as head_branch; an agent could push a branch of the same name."""
+    api.run.return_value = RUN | {"head_branch": "v1.2.0"}
+    api.tag_exists.return_value = True
+    assert "tag" in _refused_run(env, api)
+    api.tag_exists.assert_called_once_with("me/app", "v1.2.0")
+
+
+@pytest.mark.parametrize("error", [FromGitHub("GitHub GET ... returned 500: oops"), Refused("returned 500.")])
+def test_workflow_run_refused_when_the_tag_lookup_fails(env, api, error):
+    api.tag_exists.side_effect = error
+    with pytest.raises(Refused, match="500"):
+        call(env, "workflow_run", repo="me/app", action="rerun", run_id=5)
+    assert writes(api) == []
+
+
 @pytest.mark.parametrize("event", ["push", "pull_request"])
 def test_workflow_run_on_a_feature_branch_allowed(env, api, event):
     api.run.return_value = RUN | {"event": event, "head_repository": {"full_name": "Me/App"}}
@@ -561,6 +579,7 @@ def test_every_post_sends_a_json_body(env):
             ("GET", "repos/me/app"): {"default_branch": "main"},
             ("GET", "repos/me/app/branches/feat"): {"commit": {"sha": "a" * 40}, "protected": False},
             ("GET", "repos/me/app/rules/branches/feat"): [],
+            ("GET", "repos/me/app/git/ref/tags/feat"): 404,
         },
     )
     call(env, "workflow_run", repo="me/app", action="rerun", run_id=5)

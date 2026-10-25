@@ -296,3 +296,34 @@ def test_graphql_errors_are_from_github():
     gh = make({("POST", "graphql"): {"errors": [{"message": "nope"}]}})
     with pytest.raises(FromGitHub, match="nope"):
         gh.graphql("query { a }", {})
+
+
+@pytest.mark.parametrize(
+    ("name", "path"),
+    [
+        ("v1.2.0", "repos/me/app/git/ref/tags/v1%2E2%2E0"),
+        ("release/v1", "repos/me/app/git/ref/tags/release/v1"),
+        ("a b#c?d", "repos/me/app/git/ref/tags/a%20b%23c%3Fd"),
+    ],
+)
+def test_tag_exists(name, path):
+    gh = make({("GET", path): {"ref": f"refs/tags/{name}"}})
+    assert gh.tag_exists("me/app", name) is True
+    assert gh._opener.calls == [("GET", path, None)]
+    gh = make({("GET", path): 404})
+    assert gh.tag_exists("me/app", name) is False
+
+
+@pytest.mark.parametrize("status", [500, 403, 401])
+def test_tag_lookup_failure_raises(status):
+    gh = make({("GET", "repos/me/app/git/ref/tags/v1"): status})
+    with pytest.raises(Refused, match=str(status)):
+        gh.tag_exists("me/app", "v1")
+
+
+@pytest.mark.parametrize("name", ["", "..", "a/../b", "a//b", "a/."])
+def test_tag_lookup_refuses_dot_segments(name):
+    gh = make()
+    with pytest.raises(Refused, match="segment"):
+        gh.tag_exists("me/app", name)
+    assert gh._opener.calls == []
