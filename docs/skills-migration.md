@@ -37,6 +37,8 @@ the gate steps below are added beside the plain `git`/`gh` steps, never in place
   cannot stand in for it: release-flow's opener mints no token.)
 - **A read the gate refuses as off the allowlist** is the user's to grant, as a `read` entry in
   `rules.toml`; agents do not route around it with `curl` or a web fetch.
+- **A refusal saying the session has no access to a repo** is the user's to grant with
+  `gitgaterules`, never routed around.
 
 ## Bundles and body files
 
