@@ -1,6 +1,11 @@
 import sys
 
-if len(sys.argv) == 3 and sys.argv[1] == "call":
+USAGE = "usage: python -m git_gate call <tool>   (arguments as one JSON object on stdin)"
+
+if sys.argv[1:2] == ["call"]:
+    if len(sys.argv) != 3:
+        print(USAGE, file=sys.stderr)
+        sys.exit(2)
     from git_gate.call import main
 
     main(sys.argv[2])

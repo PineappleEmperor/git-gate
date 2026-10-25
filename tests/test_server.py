@@ -1,4 +1,6 @@
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import anyio
@@ -67,6 +69,21 @@ def test_unexpected_relay_exception_is_utf8_safe(tmp_path):
         anyio.run(build(relay=broken).call_tool, "prune", {"repo": "me/app", "branch": "x"})
     str(e.value).encode("utf-8")
     assert "ValueError" in str(e.value)
+
+
+def test_call_with_bad_arity_exits_without_serving():
+    for argv in (["call"], ["call", "fetch", "extra"]):
+        proc = subprocess.run(
+            [sys.executable, "-m", "git_gate", *argv],
+            input="",
+            capture_output=True,
+            text=True,
+            env={"PYTHONPATH": str(SRC), "PATH": "/usr/bin:/bin"},
+            timeout=5,
+        )
+        assert proc.returncode == 2, argv
+        assert "usage" in proc.stderr.lower() and "call <tool>" in proc.stderr
+        assert proc.stdout == ""
 
 
 def test_refusal_becomes_tool_error(env):
