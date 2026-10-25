@@ -231,12 +231,66 @@ def test_audit_scrubs_the_token_before_cutting(env):
     assert json.loads(line)["args"]["branch"].startswith("x" * 990 + "[token]")
 
 
-def test_audit_caps_all_the_arguments(env):
-    have = ["a" * 40] * 1000
+def test_audit_keeps_the_head_of_each_list(env):
+    have = [f"{i:040x}" for i in range(1000)]
     env.gate.call("fetch", ok, repo="me/app", bundle="/w/f.bundle", have=have)
     args = audit_lines(env)[-1]["args"]
-    size = len(json.dumps({"repo": "me/app", "bundle": "/w/f.bundle", "have": have}))
-    assert args == {"repo": "me/app", "truncated": True, "chars": size}
+    assert args == {"repo": "me/app", "bundle": "/w/f.bundle", "have": [*have[:20], "…[+980 more]"]}
+
+
+def test_padding_cannot_hide_a_push(env):
+    """Arguments that are not lists are always kept; a padded list gives way first."""
+    with pytest.raises(Refused):
+        env.gate.call(
+            "push", env.gate.push, repo="me/app", branch="feat", bundle="/w/x.bundle",
+            pad=["x" * 1000] * 10_000, more="y" * 10**6,
+        )  # fmt: skip
+    line = audit_lines(env)[-1]
+    assert line["tool"] == "push"
+    args = line["args"]
+    assert (args["repo"], args["branch"], args["bundle"]) == ("me/app", "feat", "/w/x.bundle")
+    assert args["more"] == "y" * 1000 + f"…[+{10**6 - 1000} chars]"
+    assert args["pad"][-1] == "…[+9980 more]"
+
+
+def test_padding_cannot_hide_a_gh_command(env):
+    argv = ["api", "repos/me/app/pulls", *(["-f", "x" * 1000] * 2000)]
+    with pytest.raises(Refused):
+        env.gate.call("gh", env.gate.gh, repo="me/app", args=argv)
+    args = audit_lines(env)[-1]["args"]
+    assert args["repo"] == "me/app"
+    assert args["args"][:3] == ["api", "repos/me/app/pulls", "-f"]
+    assert args["args"][-1] == f"…[+{len(argv) - 20} more]"
+
+
+def test_many_padded_lists_keep_their_heads(env):
+    lists = {f"{k}_labels": ["z" * 1000] * 1000 for k in ("add", "remove")}
+    lists |= {f"{k}_{w}": ["z" * 1000] * 1000 for k in ("add", "remove") for w in ("assignees", "reviewers")}
+    env.gate.call("triage", ok, repo="me/app", number=7, **lists)
+    args = audit_lines(env)[-1]["args"]
+    assert (args["repo"], args["number"]) == ("me/app", 7)
+    for name in lists:
+        assert args[name][0].startswith("zzz") and args[name][-1].startswith("…[+")
+    assert len(json.dumps(args)) <= gate.MAX_ARGS
+
+
+def test_lists_are_emptied_before_any_other_argument_goes(env):
+    lists = {f"list{i}": ["z" * 1000] * 10 for i in range(100)}
+    env.gate.call("prune", ok, repo="me/app", branch="feat", **lists)
+    args = audit_lines(env)[-1]["args"]
+    assert (args["repo"], args["branch"]) == ("me/app", "feat")
+    assert all(args[name] == ["…[+10 more]"] for name in lists)
+
+
+def test_only_what_fits_is_kept_of_too_many_arguments(env):
+    """The server passes only the arguments a tool declares; this is for anything else."""
+    extra = {f"x{i}": "x" * 1000 for i in range(20)}
+    env.gate.call("prune", ok, repo="me/app", branch="feat", **extra)
+    args = audit_lines(env)[-1]["args"]
+    assert (args["repo"], args["branch"]) == ("me/app", "feat")
+    assert len(json.dumps(args)) <= gate.MAX_ARGS + 100
+    size = len(json.dumps({"repo": "me/app", "branch": "feat"} | extra))
+    assert args["…"] == f"[+{22 - len(args) + 1} more arguments, {size} chars in all]"
 
 
 def test_huge_arguments_make_a_short_line(env):

@@ -47,7 +47,9 @@ MAX_NAMED = 20  # protected files named in a refusal; the handover record and sc
 PROC = Path("/proc")
 MAX_REASON = 300  # characters of a refusal's first line kept in audit.log
 MAX_ARG = 1000  # characters of one string argument kept in audit.log
-MAX_ARGS = 8 << 10  # characters of all the arguments, as JSON, kept in audit.log; past it, only their size
+MAX_ARGS = 8 << 10  # characters of all the arguments, as JSON, kept in audit.log
+# (entries kept, characters kept of each string in them) for list arguments, tried in turn until all fit
+LIST_STEPS = ((20, MAX_ARG), (20, 100), (5, 100), (0, 0))
 
 
 class InternalError(Exception):
@@ -585,24 +587,45 @@ def _refusal_for(found: Protected) -> str:
 
 
 def _logged_args(kwargs: dict, token: str | None) -> dict:
-    """The arguments as audit.log keeps them: each string scrubbed, then cut at MAX_ARG, and all of
-    them at MAX_ARGS. They are the agent's, so this is what bounds how fast it can fill the log."""
+    """The arguments as audit.log keeps them, at most MAX_ARGS characters as JSON.
 
-    def cut(value):
-        if isinstance(value, str):
-            value = _scrub(value, token)  # before the cut, which could leave half a token unmatched
-            return value if len(value) <= MAX_ARG else f"{value[:MAX_ARG]}…[+{len(value) - MAX_ARG} chars]"
-        if isinstance(value, list | tuple):
-            return [cut(v) for v in value]
-        if isinstance(value, dict):
-            return {cut(k): cut(v) for k, v in value.items()}
-        return value
+    They are the agent's, so this is what bounds how fast it can fill the log, and padding one
+    argument must not hide the others: every argument that is not a list is kept, cut at MAX_ARG.
+    Lists give way step by step (LIST_STEPS), keeping their heads, where gh's command is, and a
+    count of the rest. Only arguments no tool declares can make even that too long.
+    """
+    for items, chars in LIST_STEPS:
+        args = {
+            _cut(k, MAX_ARG, token): _cut(v, MAX_ARG, token) if isinstance(v, str) else _head(v, items, chars, token)
+            for k, v in kwargs.items()
+        }
+        if len(json.dumps(args)) <= MAX_ARGS:
+            return args
+    kept, size = {}, 0
+    for k, v in args.items():
+        size += len(json.dumps({k: v}))
+        if size > MAX_ARGS:
+            break
+        kept[k] = v
+    return kept | {"…": f"[+{len(args) - len(kept)} more arguments, {len(json.dumps(kwargs))} chars in all]"}
 
-    args = cut(kwargs)
-    if len(json.dumps(args)) <= MAX_ARGS:
-        return args
-    repo = args.get("repo")
-    return ({"repo": repo} if isinstance(repo, str) else {}) | {"truncated": True, "chars": len(json.dumps(kwargs))}
+
+def _head(value: object, items: int, chars: int, token: str | None) -> object:
+    """A list or object argument as its first `items` entries, strings cut at `chars`, and a count of the rest."""
+    if isinstance(value, str):
+        return _cut(value, chars, token)
+    if isinstance(value, list | tuple):
+        rest = [f"…[+{len(value) - items} more]"] if len(value) > items else []
+        return [_head(v, items, chars, token) for v in value[:items]] + rest
+    if isinstance(value, dict):
+        rest = {"…": f"[+{len(value) - items} more]"} if len(value) > items else {}
+        return {_cut(k, chars, token): _head(v, items, chars, token) for k, v in list(value.items())[:items]} | rest
+    return value
+
+
+def _cut(text: str, limit: int, token: str | None) -> str:
+    text = _scrub(text, token)  # before the cut, which could leave half a token unmatched
+    return text if len(text) <= limit else f"{text[:limit]}…[+{len(text) - limit} chars]"
 
 
 def _session(proc: Path = PROC) -> str:
