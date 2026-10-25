@@ -76,6 +76,12 @@ class Git:
     def url(self, repo: str) -> str:
         return f"{self.base_url}/{repo}.git"
 
+    def user_push_url(self, repo: str) -> str:
+        """Where a handover pushes from the user's terminal: SSH for GitHub, the base URL otherwise."""
+        if self.base_url == "https://github.com":
+            return f"git@github.com:{repo}.git"
+        return self.url(repo)
+
     def env(self, token: str | None = None, git_dir: Path | None = None) -> dict[str, str]:
         env = {
             "PATH": "/usr/bin:/bin",

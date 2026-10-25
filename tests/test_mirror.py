@@ -1,0 +1,458 @@
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from conftest import TOKEN, commit, git
+from git_gate import Refused
+from git_gate.config import DEFAULT_HANDOVER_PATHS, load_rules
+from git_gate.gitops import Git
+from git_gate.mirror import Mirror
+
+REPO = "me/app"
+
+
+@pytest.fixture
+def m(env):
+    return Mirror(env.gate.git, env.state)
+
+
+@pytest.fixture
+def rules(env):
+    return load_rules(env.cfg)
+
+
+def mgit(m: Mirror, *args: str) -> str:
+    return git(f"--git-dir={m.path(REPO)}", *args)
+
+
+def bundle(checkout: Path, out: Path, *refs: str) -> Path:
+    git("bundle", "create", "-q", str(out), *refs, "--not", "--remotes=origin", cwd=checkout)
+    return out
+
+
+def seed_push(env, path: str, content: str = "x") -> str:
+    seed = env.tmp / "seed"
+    sha = commit(seed, path, content)
+    git("push", "-q", env.url, "main", cwd=seed)
+    return sha
+
+
+# --- path, sync ----------------------------------------------------------------------------
+
+
+def test_mirror_is_bare_under_state(env, m):
+    p = m.path(REPO)
+    assert p == env.state / "mirrors/me/app.git"
+    assert git(f"--git-dir={p}", "rev-parse", "--is-bare-repository") == "true"
+    assert not (p / "hooks").exists()
+    assert m.path("Me/App") == p
+
+
+def test_sync_mirrors_heads_and_prunes(env, m, rules):
+    seed = env.tmp / "seed"
+    main = git("rev-parse", "HEAD", cwd=seed)
+    git("push", "-q", env.url, "main:refs/heads/gone", "main:refs/heads/topic/x", cwd=seed)
+    with m.lock(REPO):
+        assert m.sync(REPO, TOKEN, rules) == {"main": main, "gone": main, "topic/x": main}
+    git("update-ref", "-d", "refs/heads/gone", cwd=env.bare)
+    new = seed_push(env, "b.txt")
+    assert m.sync(REPO, TOKEN, rules) == {"main": new, "topic/x": main}
+    assert mgit(m, "for-each-ref", "--format=%(refname)") == "refs/heads/main\nrefs/heads/topic/x"
+    assert mgit(m, "tag") == ""
+
+
+def test_sync_empty_remote(env, m, rules):
+    git("init", "-q", "--bare", str(env.remote / "me/empty.git"))
+    assert m.sync("me/empty", TOKEN, rules) == {}
+
+
+# --- import --------------------------------------------------------------------------------
+
+
+def test_import_bundle_returns_branch_sha(env, m, rules, checkout):
+    git("switch", "-q", "-c", "feat", cwd=checkout)
+    commit(checkout, "a.txt")
+    tip = commit(checkout, "b.txt")
+    b = bundle(checkout, env.tmp / "push.bundle", "feat")
+    m.sync(REPO, TOKEN, rules)
+    assert m.import_bundle(REPO, b, "feat", rules) == tip
+    mgit(m, "cat-file", "-e", f"{tip}^{{commit}}")
+    mgit(m, "fsck", "--no-progress", "--no-dangling")
+    assert mgit(m, "for-each-ref", "--format=%(refname)", "refs/heads/") == "refs/heads/main"
+
+
+def test_import_twice_and_nested_names(env, m, rules, checkout):
+    git("switch", "-q", "-c", "feat", cwd=checkout)
+    commit(checkout, "a.txt")
+    m.sync(REPO, TOKEN, rules)
+    m.import_bundle(REPO, bundle(checkout, env.tmp / "1.bundle", "feat"), "feat", rules)
+    git("switch", "-q", "--detach", cwd=checkout)
+    git("branch", "-q", "-D", "feat", cwd=checkout)
+    git("switch", "-q", "-c", "feat/x", cwd=checkout)
+    tip = commit(checkout, "b.txt")
+    assert m.import_bundle(REPO, bundle(checkout, env.tmp / "2.bundle", "feat/x"), "feat/x", rules) == tip
+    git("commit", "-q", "--amend", "-m", "rewritten", cwd=checkout)
+    rewritten = git("rev-parse", "HEAD", cwd=checkout)
+    assert m.import_bundle(REPO, bundle(checkout, env.tmp / "3.bundle", "feat/x"), "feat/x", rules) == rewritten
+    assert mgit(m, "for-each-ref", "--format=%(refname)", "refs/gate/") == "refs/gate/incoming/feat/x"
+
+
+@pytest.mark.parametrize("extra", [["other"], ["v1"], ["HEAD"], "only-tag", "wrong-branch"])
+def test_import_refuses_extra_refs(env, m, rules, checkout, extra):
+    git("switch", "-q", "-c", "feat", cwd=checkout)
+    commit(checkout, "a.txt")
+    git("branch", "other", cwd=checkout)
+    git("tag", "v1", cwd=checkout)
+    if extra == "only-tag":
+        refs, branch = ["v1"], "feat"
+    elif extra == "wrong-branch":
+        refs, branch = ["other"], "feat"
+    else:
+        refs, branch = ["feat", *extra], "feat"
+    b = bundle(checkout, env.tmp / "push.bundle", *refs)
+    m.sync(REPO, TOKEN, rules)
+    with pytest.raises(Refused, match="exactly one ref"):
+        m.import_bundle(REPO, b, branch, rules)
+    assert mgit(m, "for-each-ref", "refs/gate/") == ""
+
+
+def test_import_refuses_corrupt_bundle(env, m, rules, checkout):
+    git("switch", "-q", "-c", "feat", cwd=checkout)
+    commit(checkout, "a.txt", "some content " * 50)
+    m.sync(REPO, TOKEN, rules)
+    m.import_bundle(REPO, bundle(checkout, env.tmp / "good.bundle", "feat"), "feat", rules)
+    assert mgit(m, "for-each-ref", "refs/gate/incoming/") != ""
+    commit(checkout, "b.txt", "other content " * 50)
+    b = bundle(checkout, env.tmp / "bad.bundle", "feat")
+    data = bytearray(b.read_bytes())
+    start = data.index(b"PACK") + 12
+    for i in range(start + 8, min(start + 40, len(data) - 20)):
+        data[i] ^= 0xFF
+    b.write_bytes(bytes(data))
+    with pytest.raises(Refused):
+        m.import_bundle(REPO, b, "feat", rules)
+    assert mgit(m, "for-each-ref", "refs/gate/incoming/") == ""
+
+
+def test_import_refuses_non_bundle(env, m, rules):
+    b = env.tmp / "junk.bundle"
+    b.write_text("not a bundle\n")
+    with pytest.raises(Refused, match="not a git bundle"):
+        m.import_bundle(REPO, b, "feat", rules)
+
+
+def test_import_missing_prerequisites(env, m, rules, checkout):
+    """A stale origin/* ref names a commit GitHub never had, so the bundle's prerequisite is missing."""
+    git("switch", "-q", "-c", "local", cwd=checkout)
+    unpushed = commit(checkout, "local.txt")
+    git("update-ref", "refs/remotes/origin/gone", unpushed, cwd=checkout)
+    git("switch", "-q", "-c", "feat", cwd=checkout)
+    commit(checkout, "feat.txt")
+    b = bundle(checkout, env.tmp / "push.bundle", "feat")
+    m.sync(REPO, TOKEN, rules)
+    with pytest.raises(Refused) as e:
+        m.import_bundle(REPO, b, "feat", rules)
+    msg = str(e.value)
+    assert "run the gate's fetch" in msg
+    assert "--not" in msg
+    assert unpushed[:12] in msg
+    assert mgit(m, "for-each-ref", "refs/gate/") == ""
+
+
+def test_import_refuses_bad_branch_name(env, m, rules):
+    with pytest.raises(Refused, match="branch name"):
+        m.import_bundle(REPO, env.tmp / "x.bundle", "-x", rules)
+
+
+# --- export --------------------------------------------------------------------------------
+
+
+def _fetch_into_new(env, b: Path, name: str) -> dict[str, str]:
+    repo = env.tmp / name
+    git("init", "-q", str(repo), cwd=env.tmp)
+    git("fetch", "-q", str(b), "+refs/heads/*:refs/remotes/origin/*", cwd=repo)
+    out = git("for-each-ref", "--format=%(refname:lstrip=3) %(objectname)", "refs/remotes/origin/", cwd=repo)
+    return dict(line.split(" ") for line in out.splitlines())
+
+
+def test_export_full_and_incremental(env, m, rules):
+    seed = env.tmp / "seed"
+    main = git("rev-parse", "HEAD", cwd=seed)
+    git("switch", "-q", "-c", "dev", cwd=seed)
+    dev = commit(seed, "dev.txt", "dev " * 200)
+    git("push", "-q", env.url, "dev", cwd=seed)
+    m.sync(REPO, TOKEN, rules)
+
+    full = env.tmp / "full.bundle"
+    assert m.export_bundle(REPO, full, [], rules) is True
+    assert _fetch_into_new(env, full, "fresh") == {"main": main, "dev": dev}
+
+    part = env.tmp / "part.bundle"
+    assert m.export_bundle(REPO, part, [main], rules) is True
+    assert part.stat().st_size < full.stat().st_size
+    assert git("bundle", "list-heads", str(part)).split() == [dev, "refs/heads/dev"]
+
+    none = env.tmp / "none.bundle"
+    assert m.export_bundle(REPO, none, [main, dev], rules) is False
+    assert not none.exists()
+
+
+def test_export_empty_mirror(env, m, rules):
+    git("init", "-q", "--bare", str(env.remote / "me/empty.git"))
+    m.sync("me/empty", TOKEN, rules)
+    out = env.tmp / "out.bundle"
+    assert m.export_bundle("me/empty", out, [], rules) is False
+    assert not out.exists()
+
+
+def test_export_ignores_unknown_have(env, m, rules):
+    main = seed_push(env, "b.txt")
+    m.sync(REPO, TOKEN, rules)
+    tree = mgit(m, "rev-parse", "main^{tree}")
+    have = ["0" * 40, "nothex", "--all", main.upper(), main[:12], tree, "", "f" * 64]
+    out = env.tmp / "out.bundle"
+    assert m.export_bundle(REPO, out, have, rules) is True
+    assert _fetch_into_new(env, out, "fresh") == {"main": main}
+    with pytest.raises(Refused, match="1000"):
+        m.export_bundle(REPO, env.tmp / "cap.bundle", ["0" * 40] * 1001, rules)
+    assert m.export_bundle(REPO, env.tmp / "ok.bundle", ["0" * 40] * 999 + [main], rules) is False
+
+
+# --- ancestry ------------------------------------------------------------------------------
+
+
+def test_ancestry_helpers(env, m, rules, checkout):
+    base = git("rev-parse", "HEAD", cwd=checkout)
+    git("switch", "-q", "-c", "feat", cwd=checkout)
+    commit(checkout, "a.txt")
+    tip = commit(checkout, "b.txt")
+    m.sync(REPO, TOKEN, rules)
+    m.import_bundle(REPO, bundle(checkout, env.tmp / "p.bundle", "feat"), "feat", rules)
+    upstream = seed_push(env, "up.txt")
+    m.sync(REPO, TOKEN, rules)
+    assert m.is_ancestor(REPO, base, tip, rules) is True
+    assert m.is_ancestor(REPO, upstream, tip, rules) is False
+    assert m.merge_base(REPO, upstream, tip, rules) == base
+    assert len(m.new_commits(REPO, tip, upstream, rules)) == 2
+    everything = m.new_commits(REPO, tip, None, rules)
+    assert len(everything) == 3 and base in everything
+    assert m.new_commits(REPO, base, upstream, rules) == []
+    git("switch", "-q", "--orphan", "lonely", cwd=checkout)
+    orphan = commit(checkout, "o.txt")
+    m.import_bundle(REPO, bundle(checkout, env.tmp / "o.bundle", "lonely"), "lonely", rules)
+    assert m.merge_base(REPO, orphan, tip, rules) is None
+    with pytest.raises(Refused):
+        m.is_ancestor(REPO, "--all", tip, rules)
+
+
+# --- touched -------------------------------------------------------------------------------
+
+
+def _touched(env, m, rules, checkout, branch, patterns=DEFAULT_HANDOVER_PATHS):
+    """Bundle `branch` from the checkout, import it, and run the checks as push will."""
+    heads = m.sync(REPO, TOKEN, rules)
+    sha = m.import_bundle(REPO, bundle(checkout, env.tmp / f"{branch}.bundle", branch), branch, rules)
+    base = heads.get(branch) or heads.get("main")
+    return sha, m.touched(REPO, m.new_commits(REPO, sha, base, rules), base, sha, patterns, rules)
+
+
+def test_touched_names_workflow_commits(env, m, rules, checkout):
+    git("switch", "-q", "-c", "ci", cwd=checkout)
+    commit(checkout, "a.txt")
+    one = commit(checkout, ".github/workflows/ci.yml", "on: push")
+    two = commit(checkout, ".github/workflows/ci.yml", "on: [push]")
+    _, hits = _touched(env, m, rules, checkout, "ci")
+    assert sorted(hits) == sorted([one, two])
+
+
+def test_touched_deleting_workflow_by_rename(env, m, rules, checkout):
+    seed_push(env, ".github/workflows/ci.yml", "on: push")
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "mv", "origin/main", cwd=checkout)
+    git("mv", ".github/workflows/ci.yml", "ci.yml", cwd=checkout)
+    git("commit", "-q", "-m", "move", cwd=checkout)
+    sha, hits = _touched(env, m, rules, checkout, "mv")
+    assert hits == [sha]
+
+
+def test_touched_clean_merge_of_main_with_workflow_change_passes(env, m, rules, checkout):
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "topic.txt")
+    seed_push(env, ".github/workflows/ci.yml", "on: push")
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("merge", "-q", "--no-edit", "origin/main", cwd=checkout)
+    assert _touched(env, m, rules, checkout, "topic")[1] == []
+
+
+def test_touched_evil_merge_editing_workflow(env, m, rules, checkout):
+    seed_push(env, ".github/workflows/ci.yml", "on: push")
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "topic", "main", cwd=checkout)
+    commit(checkout, "topic.txt")
+    git("merge", "-q", "--no-commit", "origin/main", cwd=checkout)
+    (checkout / ".github/workflows/ci.yml").write_text("on: everything")
+    git("add", ".", cwd=checkout)
+    git("commit", "-q", "--no-edit", cwd=checkout)
+    sha, hits = _touched(env, m, rules, checkout, "topic")
+    assert hits == [sha]
+
+
+def test_touched_merge_rolling_workflow_back(env, m, rules, checkout):
+    """Dense-combined diffs hide a merge that keeps one parent's older workflow; the tree check must not."""
+    old = seed_push(env, ".github/workflows/ci.yml", "v1")
+    seed_push(env, ".github/workflows/ci.yml", "v2")
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "side", old, cwd=checkout)
+    commit(checkout, "side.txt")
+    git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
+    commit(checkout, "topic.txt")
+    git("merge", "-q", "--no-commit", "side", cwd=checkout)
+    git("checkout", "side", "--", ".github/workflows/ci.yml", cwd=checkout)
+    git("commit", "-q", "--no-edit", cwd=checkout)
+    assert (checkout / ".github/workflows/ci.yml").read_text() == "v1"
+    sha, hits = _touched(env, m, rules, checkout, "topic")
+    assert hits == [sha]
+
+
+def test_touched_stale_fork_passes(env, m, rules, checkout):
+    """Main gaining a workflow change after the fork is not this branch's change."""
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "topic.txt")
+    seed_push(env, ".github/workflows/ci.yml", "on: push")
+    assert _touched(env, m, rules, checkout, "topic")[1] == []
+
+
+def test_touched_against_existing_remote_branch(env, m, rules, checkout):
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "topic.txt")
+    git("push", "-q", env.url, "topic", cwd=checkout)
+    git("fetch", "-q", "origin", cwd=checkout)
+    wf = commit(checkout, ".github/workflows/ci.yml")
+    commit(checkout, "more.txt")
+    assert _touched(env, m, rules, checkout, "topic")[1] == [wf]
+
+
+def test_touched_root_commit_without_base(env, m, rules, checkout):
+    git("switch", "-q", "--orphan", "fresh", cwd=checkout)
+    root = commit(checkout, ".githooks/pre-commit")
+    m.sync(REPO, TOKEN, rules)
+    sha = m.import_bundle(REPO, bundle(checkout, env.tmp / "f.bundle", "fresh"), "fresh", rules)
+    assert sha == root
+    assert m.touched(REPO, m.new_commits(REPO, sha, None, rules), None, sha, DEFAULT_HANDOVER_PATHS, rules) == [root]
+
+
+def test_touched_ignores_replace_refs(env, m, rules, checkout):
+    """refs/replace could make a workflow commit look harmless; the gate's git disables replacements."""
+    git("switch", "-q", "-c", "sneaky", cwd=checkout)
+    bad = commit(checkout, ".github/workflows/ci.yml", "on: push")
+    git("switch", "-q", "main", cwd=checkout)
+    git("switch", "-q", "-c", "decoy", cwd=checkout)
+    good = commit(checkout, "ok.txt")
+    git("push", "-q", env.url, "sneaky", "decoy", cwd=checkout)
+    heads = m.sync(REPO, TOKEN, rules)
+    mgit(m, "replace", bad, good)
+    assert mgit(m, "for-each-ref", "refs/replace/") != ""
+    main = heads["main"]
+    assert m.new_commits(REPO, bad, main, rules) == [bad]
+    assert m.touched(REPO, [bad], main, bad, DEFAULT_HANDOVER_PATHS, rules) == [bad]
+
+
+@pytest.mark.parametrize(
+    ("path", "extra", "hit"),
+    [
+        (".githooks/pre-commit", (), True),
+        (".pre-commit-config.yaml", (), True),
+        (".github/workflows/sub/x.yml", (), True),
+        ("skills/x.md", (), False),
+        ("skills/x.md", ("skills/**",), True),
+        ("docs/.pre-commit-config.yaml", (), False),
+        (".github/dependabot.yml", (), False),
+        (".GITHUB/workflows/ci.yml", (), False),
+    ],
+)
+def test_touched_patterns(env, m, rules, checkout, path, extra, hit):
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    sha = commit(checkout, path)
+    _, hits = _touched(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + extra)
+    assert hits == ([sha] if hit else [])
+
+
+def test_touched_pattern_directory_as_file(env, m, rules, checkout):
+    """A file at the pattern's directory (`.github/workflows` itself) is a handover path too."""
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    sha = commit(checkout, ".github/workflows", "not a directory")
+    assert _touched(env, m, rules, checkout, "topic")[1] == [sha]
+    git("switch", "-q", "-c", "sk", "main", cwd=checkout)
+    sha = commit(checkout, "skills", "file")
+    assert _touched(env, m, rules, checkout, "sk", ("skills/*.md",))[1] == [sha]
+
+
+# --- push, handover refs -------------------------------------------------------------------
+
+
+def test_push_from_mirror(env, m, rules, checkout):
+    git("switch", "-q", "-c", "feat", cwd=checkout)
+    tip = commit(checkout, "a.txt")
+    git("tag", "v1", cwd=checkout)
+    m.sync(REPO, TOKEN, rules)
+    sha = m.import_bundle(REPO, bundle(checkout, env.tmp / "p.bundle", "feat"), "feat", rules)
+    proc = m.push(REPO, sha, "feat", TOKEN, rules)
+    assert isinstance(proc, subprocess.CompletedProcess)
+    assert proc.returncode == 0, proc.stderr
+    assert git("rev-parse", "refs/heads/feat", cwd=env.bare) == tip
+    assert git("tag", cwd=env.bare) == ""
+    git("switch", "-q", "main", cwd=checkout)
+    other = commit(checkout, "b.txt")
+    git("push", "-q", env.url, "main:refs/heads/elsewhere", cwd=checkout)
+    m.sync(REPO, TOKEN, rules)
+    rejected = m.push(REPO, other, "feat", TOKEN, rules)
+    assert rejected.returncode != 0
+    assert git("rev-parse", "refs/heads/feat", cwd=env.bare) == tip
+
+
+def test_push_refuses_bad_inputs(env, m, rules):
+    sha = seed_push(env, "b.txt")
+    m.sync(REPO, TOKEN, rules)
+    with pytest.raises(Refused):
+        m.push(REPO, sha, "-x", TOKEN, rules)
+    with pytest.raises(Refused):
+        m.push(REPO, "main", "feat", TOKEN, rules)
+
+
+def test_keep_and_drop_handover_refs(env, m, rules):
+    sha = seed_push(env, "b.txt")
+    m.sync(REPO, TOKEN, rules)
+    m.keep(REPO, "refs/gate/handover/7", sha, rules)
+    assert mgit(m, "rev-parse", "refs/gate/handover/7") == sha
+    m.drop(REPO, "refs/gate/handover/7", rules)
+    assert mgit(m, "for-each-ref", "refs/gate/") == ""
+    m.drop(REPO, "refs/gate/handover/7", rules)
+    for bad in ("refs/heads/main", "refs/gate/handover/x", "refs/gate/handover/7/../8", "refs/gate/incoming/7"):
+        with pytest.raises(Refused):
+            m.keep(REPO, bad, sha, rules)
+        with pytest.raises(Refused):
+            m.drop(REPO, bad, rules)
+    with pytest.raises(Refused):
+        m.keep(REPO, "refs/gate/handover/8", "1" * 40, rules)
+    m.keep(REPO, "refs/gate/handover/8", sha, rules)
+    with pytest.raises(Refused, match="not a commit SHA"):
+        m.keep(REPO, "refs/gate/handover/8", "0" * 40, rules)  # the null SHA would delete the ref
+    assert mgit(m, "rev-parse", "refs/gate/handover/8") == sha
+
+
+# --- Git.user_push_url ---------------------------------------------------------------------
+
+
+def test_user_push_url(env, tmp_path):
+    assert Git(tmp_path / "s1", "https://github.com").user_push_url(REPO) == "git@github.com:me/app.git"
+    assert env.gate.git.user_push_url(REPO) == env.url
+    assert Git(tmp_path / "s2", "https://ghe.example.com/").user_push_url(REPO) == "https://ghe.example.com/me/app.git"
+
+
+def test_import_under_github_protocol_allowlist(env, rules, checkout, tmp_path):
+    """With base_url https, the gate's config allows only https; reading a bundle file still works."""
+    m = Mirror(Git(tmp_path / "s", "https://github.com"), tmp_path / "s")
+    git("switch", "-q", "--orphan", "fresh", cwd=checkout)
+    root = commit(checkout, "a.txt")
+    assert m.import_bundle(REPO, bundle(checkout, env.tmp / "f.bundle", "fresh"), "fresh", rules) == root
