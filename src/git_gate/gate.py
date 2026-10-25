@@ -109,6 +109,7 @@ class Gate:
         Arguments the tool does not take are refused, never an internal error. A refusal that
         carries GitHub's text is marked as untrusted, whichever tool raised it.
         """
+        started = time.monotonic()
         token = None
         outcome = "ok"
         message = None  # what the agent is told when the outcome is not ok, scrubbed
@@ -137,15 +138,15 @@ class Gate:
             message = utf8_safe(_scrub(f"{type(e).__name__}: {e}", token))
             raise InternalError(message) from e
         finally:
-            self._audit(tool, kwargs, outcome, token, message)
+            self._audit(tool, kwargs, outcome, token, message, int((time.monotonic() - started) * 1000))
 
-    def _audit(self, tool: str, kwargs: dict, outcome: str, token: str | None, message: str | None) -> None:
+    def _audit(self, tool: str, kwargs: dict, outcome: str, token: str | None, message: str | None, ms: int) -> None:
         """One line per call. `reason` is the first line of what the agent was told, without the
         untrusted-content marker a refusal carrying GitHub's text starts with."""
         reason = message.strip().partition("\n")[0][:MAX_REASON] if message is not None else None
         line = json.dumps({
             "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "args": kwargs, "outcome": outcome,
-            "reason": reason, "session": _session(), "cwd": _cwd(),
+            "reason": reason, "ms": ms, "session": _session(), "cwd": _cwd(),
         })  # fmt: skip
         with open(self.state / "audit.log", "a") as f:
             f.write(_scrub(line, token) + "\n")

@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -128,3 +129,19 @@ def test_audit_reason_for_a_real_refusal(env):
     with pytest.raises(Refused, match="allowlist") as e:
         env.gate.call("fetch", env.gate.fetch, repo="nobody/x", bundle=str(env.ws / "f.bundle"))
     assert audit_lines(env)[-1]["reason"] == str(e.value).splitlines()[0]
+
+
+# --- ms --------------------------------------------------------------------------------------
+
+
+def test_audit_says_how_long_the_call_took(env):
+    def slow(rules, token, **kw):
+        time.sleep(0.05)
+        return "ok"
+
+    env.gate.call("prune", slow, repo="me/app")
+    with pytest.raises(Refused):
+        env.gate.call("prune", raising(Refused("no")), repo="me/app")
+    took, refused = (line["ms"] for line in audit_lines(env)[-2:])
+    assert type(took) is int and 50 <= took < 5000
+    assert type(refused) is int and 0 <= refused < took
