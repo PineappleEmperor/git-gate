@@ -87,21 +87,28 @@ switch_to() {
     sudo ln -sfn "releases/$1" "$ROOT/current.new"
     sudo mv -T "$ROOT/current.new" "$ROOT/current"
     echo "current -> releases/$1."
-    link_gitgatepush
+    link_launchers
 }
 
-# Point $BIN_DIR/gitgatepush at the live release's launcher, so it works in any shell and always
-# runs the root-owned copy. Warn when another gitgatepush earlier on PATH would win.
-link_gitgatepush() {
-    link=$BIN_DIR/gitgatepush
-    sudo ln -sfn "$ROOT/current/bin/gitgatepush" "$link"
-    echo "$link -> $ROOT/current/bin/gitgatepush"
-    found=$(command -v gitgatepush || true)
-    if [ -z "$found" ]; then
-        echo "install.sh: warning: gitgatepush is not on your PATH; add $BIN_DIR to it." >&2
-    elif [ "$found" != "$link" ]; then
-        echo "install.sh: warning: running gitgatepush will start $found, not $link. Remove or rename it." >&2
-    fi
+# Point $BIN_DIR/gitgatepush and $BIN_DIR/gitgaterules at the live release's launchers, so they
+# work in any shell and always run the root-owned copy. Warn when another one earlier on PATH would
+# win. A release without a launcher (gitgaterules is newer) leaves that link as it is.
+link_launchers() {
+    for name in gitgatepush gitgaterules; do
+        link=$BIN_DIR/$name
+        if [ ! -e "$ROOT/current/bin/$name" ]; then
+            echo "This release has no $name; $link is left as it is."
+            continue
+        fi
+        sudo ln -sfn "$ROOT/current/bin/$name" "$link"
+        echo "$link -> $ROOT/current/bin/$name"
+        found=$(command -v "$name" || true)
+        if [ -z "$found" ]; then
+            echo "install.sh: warning: $name is not on your PATH; add $BIN_DIR to it." >&2
+        elif [ "$found" != "$link" ]; then
+            echo "install.sh: warning: running $name will start $found, not $link. Remove or rename it." >&2
+        fi
+    done
 }
 
 cmd_list() {

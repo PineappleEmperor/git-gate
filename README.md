@@ -51,10 +51,10 @@ sh ~/git-gate-install.sh install <sha>
 
 Later: `/opt/git-gate/current/install.sh install <sha>`, `rollback <sha>`, `list`.
 
-Each install and rollback also links `/usr/local/bin/gitgatepush` to
-`/opt/git-gate/current/bin/gitgatepush` (override the directory with `GIT_GATE_BIN_DIR`), then
-checks that `gitgatepush` in your shell resolves to that link and warns, naming the other path,
-if it does not. The launcher refuses to run from anywhere but `/opt/git-gate/releases/`.
+Each install and rollback also links `/usr/local/bin/gitgatepush` and `/usr/local/bin/gitgaterules`
+to the same names in `/opt/git-gate/current/bin/` (override the directory with `GIT_GATE_BIN_DIR`),
+then checks that each name in your shell resolves to its link and warns, naming the other path, if
+it does not. The launchers refuse to run from anywhere but `/opt/git-gate/releases/`.
 
 A new install applies to the next call in every open conversation: the registered server is a
 relay that hands each call to the current release. Conversations opened before the first
