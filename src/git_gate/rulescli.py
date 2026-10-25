@@ -14,12 +14,14 @@ import time
 import tomllib
 from pathlib import Path
 
+from git_gate import Refused
 from git_gate.config import (
     OPTION_KEYS,
     SESSION_KEYS,
     SETTINGS,
     Checked,
     Rules,
+    canonical_pattern,
     check_rules,
     config_dir,
     label,
@@ -196,7 +198,38 @@ def _sort_key(entry: object) -> tuple:
     return (str(entry).casefold(), str(entry))
 
 
-def _value(value: object, where: str) -> str:
+def _repo_entry(entry: str) -> str:
+    return entry if entry.startswith("@") else entry.lower()
+
+
+def _pattern(entry: str) -> str:
+    try:
+        return canonical_pattern(entry)
+    except Refused:
+        return entry  # kept as written, for the check to refuse
+
+
+def _sameness(table: str, key: str):
+    """How the gate compares this list's entries: dedup must never merge two it tells apart.
+    Repo names ignore case; handover paths are compared in canonical form; anything else
+    (protected_branches is matched case-sensitively) only when identical."""
+    if table == "groups" or (table == "sessions" and key in ("read", "write")):
+        return _repo_entry
+    if table == "repos" and key == "handover_paths":
+        return _pattern
+    return str
+
+
+def _items(value: list, same, where: str) -> list[str]:
+    if not all(isinstance(v, str) for v in value):
+        return [_value(v, same, where) for v in value]
+    seen: dict[str, str] = {}
+    for v in sorted(value, key=_sort_key):
+        seen.setdefault(same(v), v)
+    return [toml_string(v) for v in seen.values()]
+
+
+def _value(value: object, same, where: str) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
@@ -204,33 +237,28 @@ def _value(value: object, where: str) -> str:
     if isinstance(value, str):
         return toml_string(value)
     if isinstance(value, list):
-        if not all(isinstance(v, str) for v in value):
-            return "[" + ", ".join(_value(v, where) for v in value) + "]"
-        seen: dict[str, str] = {}
-        for v in sorted(value, key=_sort_key):
-            seen.setdefault(v if v.startswith("@") else v.lower(), v)
-        return "[" + ", ".join(toml_string(v) for v in seen.values()) + "]"
+        return "[" + ", ".join(_items(value, same, where)) + "]"
     raise EditError(f"gitgaterules cannot rewrite {where} = {value!r}; fix it by hand, then run gitgaterules check.")
 
 
-def _line(key: str, value: object, where: str) -> str:
-    text = f"{toml_key(key)} = {_value(value, where)}"
+def _line(table: str, key: str, value: object, where: str) -> str:
+    same = _sameness(table, key)
+    text = f"{toml_key(key)} = {_value(value, same, where)}"
     if len(text) <= INLINE or not isinstance(value, list) or not value:
         return text
-    inner = _value(value, where)[1:-1].split(", ")
-    return f"{toml_key(key)} = [\n" + "".join(f"    {v},\n" for v in inner) + "]"
+    return f"{toml_key(key)} = [\n" + "".join(f"    {v},\n" for v in _items(value, same, where)) + "]"
 
 
-def _entries_of(table: dict, order: tuple[str, ...], where: str) -> list[str]:
+def _entries_of(table: str, entries: dict, order: tuple[str, ...], where: str) -> list[str]:
     rank = {k: i for i, k in enumerate(order)}
     lines = []
-    for key in sorted(table, key=lambda k: (rank.get(k, len(rank)), k)):
-        value = table[key]
+    for key in sorted(entries, key=lambda k: (rank.get(k, len(rank)), k)):
+        value = entries[key]
         if isinstance(value, dict):
             raise EditError(f"gitgaterules cannot rewrite the table {where}.{key}; fix it by hand.")
         if isinstance(value, list) and not value and key in ("read", "write"):
             continue
-        lines.append(_line(key, value, f"{where}.{key}"))
+        lines.append(_line(table, key, value, f"{where}.{key}"))
     return lines
 
 
@@ -239,7 +267,7 @@ def render(data: dict) -> str:
     out = [HEADER]
     scalars = [k for k in data if not isinstance(data[k], dict)]
     if scalars:
-        out.append("\n".join(_entries_of({k: data[k] for k in scalars}, SETTINGS, "top level")) + "\n")
+        out.append("\n".join(_entries_of("", {k: data[k] for k in scalars}, SETTINGS, "top level")) + "\n")
     rank = {k: i for i, k in enumerate(TABLE_ORDER)}
     for name in sorted((k for k in data if isinstance(data[k], dict)), key=lambda k: (rank.get(k, len(rank)), k)):
         table = data[name]
@@ -250,10 +278,10 @@ def render(data: dict) -> str:
                 entry = table[key]
                 if not isinstance(entry, dict):
                     raise EditError(f"gitgaterules cannot rewrite {label(name, key)} = {entry!r}; fix it by hand.")
-                body = _entries_of(entry, KEY_ORDER[name], label(name, key))
+                body = _entries_of(name, entry, KEY_ORDER[name], label(name, key))
                 out.append("\n".join([label(name, key), *body]) + "\n")
         elif table:
-            out.append("\n".join([label(name), *_entries_of(table, (), label(name))]) + "\n")
+            out.append("\n".join([label(name), *_entries_of(name, table, (), label(name))]) + "\n")
     return "\n".join(out)
 
 

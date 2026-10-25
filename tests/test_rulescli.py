@@ -443,3 +443,31 @@ def test_migrate_refuses_a_broken_v1_file(cfg):
     write(cfg, 'workspaces = ["rel"]\n')
     code, out = run("migrate")
     assert code == 1 and "absolute" in out
+
+
+def test_a_rewrite_drops_only_entries_the_gate_treats_as_the_same(cfg, tmp_path):
+    """Each list is deduplicated with the gate's own comparison for that key, never a looser one."""
+    write(
+        cfg,
+        'protected_branches = ["release/*", "Release/*", "main", "main"]\n'
+        "[groups]\n"
+        'g = ["Me/X", "me/x", "@h"]\n'
+        'h = ["up/y"]\n'
+        '[sessions."{tmp}/core"]\n'
+        'read = ["@g", "UP/Z", "up/z"]\n'
+        '[repos."me/x"]\n'
+        'handover_paths = ["Skills/**", "skills", "Docs/*.MD", "docs/*.md", "Other"]\n',
+    )
+    before = load_rules(cfg)
+    assert run("grant", f"{tmp_path}/core", "write", "me/w")[0] == 0
+    text = (cfg / "rules.toml").read_text()
+    assert 'protected_branches = ["main", "Release/*", "release/*"]' in text
+    assert 'g = ["@h", "Me/X"]' in text
+    assert 'read = ["@g", "UP/Z"]' in text
+    after = load_rules(cfg)
+    assert after.protected_branches == ("main", "Release/*", "release/*")
+    old, new = before.scoped(f"{tmp_path}/core"), after.scoped(f"{tmp_path}/core")
+    assert set(new.repo("me/x").handover_paths) == set(old.repo("me/x").handover_paths)
+    assert {n: r.access for n, r in new.repos.items()} == {
+        **{n: r.access for n, r in old.repos.items()}, "me/w": "write",
+    }  # fmt: skip
