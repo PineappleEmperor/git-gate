@@ -161,6 +161,38 @@ def test_api_refusals(args):
         plan("me/app", args)
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["api", "repos/{owner}/{repo}", "--jq", "$ENV.GH_TOKEN|explode|implode|ascii_downcase"],
+        ["api", "repos/{owner}/{repo}", "--jq=$ENV|tostring"],
+        ["api", "repos/{owner}/{repo}", "-q", "env.GH_TOKEN|explode"],
+        ["api", "repos/{owner}/{repo}", "-q", '"\\(env)"'],
+        ["api", "repos/{owner}/{repo}", "--jq", "[.x, $ENV] | .[1]"],
+        ["pr", "list", "--json", "number", "-q", "env.GH_TOKEN|explode"],
+        ["pr", "list", "--json", "number", "--jq=$ENV"],
+        ["issue", "view", "1", "--json", "title", "--jq", "env | keys"],
+        ["run", "list", "--json", "status", "-q", ".[]|$ENV.HOME"],
+    ],
+)
+def test_jq_cannot_read_the_environment(args):
+    """gh compiles --jq with gojq's environment loader: `env` and `$ENV` would read gh's environment."""
+    with pytest.raises(Refused, match="environment"):
+        plan("me/app", args)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["api", "repos/{owner}/{repo}/pulls", "--jq", ".[].environment"],
+        ["api", "repos/{owner}/{repo}/deployments", "-q", "map(.environment_url)"],
+        ["pr", "list", "--json", "number", "-q", ".[].number"],
+    ],
+)
+def test_jq_without_env_still_passes(args):
+    plan("me/app", args)
+
+
 # --- runner, with a fake gh ----------------------------------------------------------------
 
 

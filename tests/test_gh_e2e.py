@@ -95,6 +95,21 @@ def _assert_no_token(out: str) -> None:
 @pytest.mark.parametrize(
     "args",
     [
+        ["api", "repos/{owner}/{repo}", "--jq", "$ENV.GH_TOKEN|explode|implode|ascii_downcase"],
+        ["api", "repos/{owner}/{repo}", "--jq", "$ENV.GH_TOKEN|explode"],
+        ["pr", "list", "--json", "number", "-q", "env.GH_TOKEN|explode"],
+    ],
+)
+def test_review_probes_are_refused_before_gh_runs(env, real_gh, args):
+    with pytest.raises(Refused, match="environment") as e:
+        env.gate.dispatch("gh", {"repo": "me/app", "args": args})
+    _assert_no_token(str(e.value))
+    assert real_gh == []
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
         ["api", "repos/{owner}/{repo}", "--jq", "$ENV|tojson"],
         ["api", "repos/{owner}/{repo}", "--jq", '[$ENV[]]|join(" ")|explode|tojson'],
         ["api", "repos/{owner}/{repo}", "--jq", "$ENV.GH_TOKEN|explode|implode|ascii_downcase"],

@@ -72,6 +72,9 @@ SHORT_CLUSTER = re.compile(r"^-[A-Za-z]\S+$")
 # `--search` builds a GitHub search query; any of these would widen it past the forced repo.
 SCOPE_QUALIFIER = re.compile(r"(?i)\b(?:repo|org|user|owner):|\bis:(?:public|private)\b")
 SEARCH_FLAGS = {"--search", "-S"}
+# gh compiles --jq with gojq's environment loader: `env` and `$ENV` read gh's own environment.
+JQ_FLAGS = {"-q", "--jq"}
+JQ_ENV = re.compile(r"(?i)\benv\b")
 
 
 @dataclass
@@ -100,6 +103,11 @@ def plan(repo: str, args: list[str]) -> GhPlan:
 
 def _flag_name(token: str) -> str:
     return token.split("=", 1)[0] if token.startswith("--") else token
+
+
+def _check_jq(name: str, value: str) -> None:
+    if name in JQ_FLAGS and JQ_ENV.search(value):
+        raise Refused(f"gh {name} filters may not use env or $ENV: they read the gate's environment.")
 
 
 def _common_checks(tokens: list[str]) -> None:
@@ -132,9 +140,10 @@ def _plan_command(repo: str, cmd: tuple[str, ...], rest: list[str]) -> GhPlan:
             )
         if name in BODY_FILE_FLAGS:
             raise Refused(f"gh {name} is not allowed: gh is read-only, and bodies go through the gate's typed tools.")
-        if name in SEARCH_FLAGS:
+        if name in SEARCH_FLAGS | JQ_FLAGS:
             value = t.split("=", 1)[1] if "=" in t else (rest[i + 1] if i + 1 < len(rest) else "")
-            if SCOPE_QUALIFIER.search(value):
+            _check_jq(name, value)
+            if name in SEARCH_FLAGS and SCOPE_QUALIFIER.search(value):
                 raise Refused("--search may not name repo:, org:, user:, owner: or is:public/private.")
         if cmd[1] == "download" and name in DOWNLOAD_DIR_FLAGS | DOWNLOAD_FILE_FLAGS:
             if "=" in t and t.startswith("--"):
@@ -193,6 +202,7 @@ def _plan_api(repo: str, rest: list[str]) -> GhPlan:
                 value = rest[i + 1]
                 i += 1
             i += 1
+            _check_jq(name, value)
             if name in ("-X", "--method"):
                 if value.upper() != "GET":
                     raise Refused("gh api is GET-only through the gate.")
