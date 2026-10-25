@@ -10,8 +10,8 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from git_gate import Refused, server
+from git_gate.call import TOOLS, run
 from git_gate.call import main as call_main
-from git_gate.call import run
 from git_gate.server import Relay, build
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -212,8 +212,15 @@ def test_call_main_writes_a_private_log(tmp_path, monkeypatch):
     assert oct((state / "errors.log").stat().st_mode & 0o777) == "0o600"
 
 
+def test_call_tools_are_the_ten_tools():
+    assert set(TOOLS) == {"clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label"}
+    assert len(TOOLS) == 10
+
+
 def test_call_run(env):
     assert "reset --hard" in run("clone", {"repo": "me/app", "path": str(env.ws / "c")}, env.gate)["ok"]
+    assert "allowlist" in run("triage", {"repo": "nobody/x", "number": 1, "add_labels": ["bug"]}, env.gate)["refused"]
+    assert "allowlist" in run("label", {"repo": "nobody/x", "action": "create", "name": "x"}, env.gate)["refused"]
     assert "allowlist" in run("fetch", {"repo": "nobody/x", "bundle": str(env.ws / "f.bundle")}, env.gate)["refused"]
     assert "no tool" in run("rm", {}, env.gate)["refused"]
 

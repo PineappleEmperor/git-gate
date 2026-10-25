@@ -1,3 +1,5 @@
+import inspect
+import json
 import re
 import subprocess
 import sys
@@ -9,17 +11,41 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, TextContent
 
 from conftest import git, make_bundle
-from git_gate import Refused
+from git_gate import Refused, call
 from git_gate.gate import Gate
-from git_gate.server import Relay, build
+from git_gate.server import INSTRUCTIONS, Relay, build
 
 SRC = Path(__file__).resolve().parents[1] / "src"
+
+
+TEN = {"clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label"}
 
 
 def test_tools_registered(env):
     server = build(env.gate)
     names = {t.name for t in anyio.run(server.list_tools)}
-    assert names == {"clone", "fetch", "push", "prune", "gh"}
+    assert names == TEN
+
+
+def test_server_tools_equal_call_tools(env):
+    """D13: call.TOOLS is the only list of tool names, and the server registers exactly it."""
+    registered = [t.name for t in anyio.run(build(env.gate).list_tools)]
+    assert len(registered) == len(set(registered))
+    assert set(registered) == set(call.TOOLS) == TEN
+
+
+def test_tool_parameters_match_the_gate_methods(env):
+    """A tool schema that drifts from its Gate method would fail only at call time, in the child."""
+    for tool in anyio.run(build(env.gate).list_tools):
+        params = list(inspect.signature(getattr(Gate, tool.name)).parameters.values())[3:]  # self, rules, token
+        schema = tool.input_schema
+        assert set(schema["properties"]) == {p.name for p in params}, tool.name
+        assert set(schema.get("required", [])) == {p.name for p in params if p.default is p.empty}, tool.name
+
+
+def test_every_tool_has_a_docstring(env):
+    for tool in anyio.run(build(env.gate).list_tools):
+        assert len(tool.description or "") > 40, tool.name
 
 
 def test_dispatch_is_the_only_path():
@@ -39,6 +65,38 @@ def test_dispatch_keeps_gate_call_refusals(env):
     with pytest.raises(Refused, match="JSON object"):
         env.gate.dispatch("prune", ["me/app"])
     assert "reset --hard" in env.gate.dispatch("clone", {"repo": "me/app", "path": str(env.ws / "c")})
+
+
+def test_instructions_carry_the_agent_steps():
+    for needed in (
+        "git bundle create <dir>/.tmp/<name>.bundle <branch> --not --remotes=origin",
+        "git fetch --prune <bundle> '+refs/heads/*:refs/remotes/origin/*'",
+        "git for-each-ref --format='%(objectname)' refs/remotes/origin",
+        "bundle and body files must be *.bundle / *.md|*.txt outside dot directories (except .tmp)",
+        "gitgatepush <id>",
+        "the user merges",
+        "never use SSH",
+    ):
+        assert needed in INSTRUCTIONS, needed
+
+
+def test_tool_docs_carry_the_exact_commands(env):
+    docs = {t.name: " ".join(t.description.split()) for t in anyio.run(build(env.gate).list_tools)}
+    assert "git bundle create <dir>/.tmp/<name>.bundle <branch> --not --remotes=origin" in docs["push"]
+    assert "gitgatepush <id>" in docs["push"]
+    assert "git fetch --prune <bundle> '+refs/heads/*:refs/remotes/origin/*'" in docs["fetch"]
+    assert "git for-each-ref --format='%(objectname)' refs/remotes/origin" in docs["fetch"]
+    assert "git -C <path> reset --hard" in docs["clone"]
+    for name in ("pr", "issue"):
+        assert "*.md" in docs[name] and "outside dot directories" in docs[name]
+
+
+def test_typed_tool_call_reaches_the_gate(env):
+    server = build(env.gate)
+    with pytest.raises(ToolError, match="allowlist"):
+        anyio.run(server.call_tool, "triage", {"repo": "nobody/x", "number": 1, "add_labels": ["bug"]})
+    with pytest.raises(ToolError, match="allowlist"):
+        anyio.run(server.call_tool, "workflow_run", {"repo": "nobody/x", "action": "rerun", "run_id": 1})
 
 
 def test_build_refuses_gate_and_relay_together(env, tmp_path):
@@ -84,6 +142,70 @@ def test_call_with_bad_arity_exits_without_serving():
         assert proc.returncode == 2, argv
         assert "usage" in proc.stderr.lower() and "call <tool>" in proc.stderr
         assert proc.stdout == ""
+
+
+def test_stdio_round_trip_writes_json(env):
+    """One tools/call through the real stdio loop with in-memory streams."""
+    requests = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "prune", "arguments": {"repo": "nobody/x", "branch": "b"}},
+        },
+    ]
+    server = build(env.gate)
+    answered = anyio.Event()
+    written: list[str] = []
+
+    class Feed:
+        """stdin: the requests, then silence until the answer is out (EOF would stop the server first)."""
+
+        def __init__(self):
+            self.lines = [json.dumps(r) + "\n" for r in requests]
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.lines:
+                return self.lines.pop(0)
+            await answered.wait()
+            raise StopAsyncIteration
+
+    class Sink:
+        async def write(self, text):
+            written.append(text)
+            if json.loads(text).get("id") == 2:
+                answered.set()
+
+        async def flush(self):
+            pass
+
+    async def serve():
+        from mcp.server.stdio import stdio_server
+
+        with anyio.fail_after(10):
+            async with stdio_server(stdin=Feed(), stdout=Sink()) as (read, write):
+                low = server._lowlevel_server
+                await low.run(read, write, low.create_initialization_options())
+
+    anyio.run(serve)
+    replies = [json.loads(line) for line in written]
+    answer = next(r for r in replies if r.get("id") == 2)
+    assert answer["result"]["isError"] is True
+    assert "allowlist" in answer["result"]["content"][0]["text"]
 
 
 def test_refusal_becomes_tool_error(env):

@@ -17,7 +17,7 @@ from git_gate import Refused
 from git_gate.config import state_dir
 
 # The only list of tool names: the server registers exactly these, and Gate.dispatch accepts only these.
-TOOLS = ("clone", "fetch", "push", "prune", "gh")
+TOOLS = ("clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label")
 MAX_LOG = 1 << 20  # errors.log rolls over to errors.log.1 at this size
 
 
