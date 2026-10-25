@@ -316,12 +316,19 @@ def _matches(path: str, patterns) -> bool:
 
 
 def _link_reaches(path: str, patterns) -> bool:
-    """A symlink matching a pattern, or at or above its literal directory, leads into a handover path."""
+    """A symlink that matches any leading-component prefix of a pattern can lead into a handover path.
+
+    For `skills/*/skill.md` that is `skills`, `skills/*` or the whole pattern; a pattern starting
+    with `**` is reached by every symlink.
+    """
     if _matches(path, patterns):
         return True
-    path = path.casefold()
-    for literal in (_literal(_normalise(pattern)) for pattern in patterns):
-        if literal and (literal == path or literal.startswith(path + "/")):
+    p = PurePosixPath(path.casefold())
+    for pattern in map(_normalise, patterns):
+        parts = pattern.split("/")
+        if parts[0] == "**":
+            return True
+        if any(p.full_match("/".join(parts[:i])) for i in range(1, len(parts) + 1)):
             return True
     return False
 

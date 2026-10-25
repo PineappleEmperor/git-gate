@@ -618,3 +618,24 @@ def test_touched_ordinary_symlinks_pass(env, m, rules, checkout):
     commit(checkout, "README.md", "changed")
     link(checkout, "github", "docs")
     assert _touched(env, m, rules, checkout, "topic")[1] == []
+
+
+@pytest.mark.parametrize(
+    ("path", "extra", "hit"),
+    [
+        ("skills/foo", ("skills/*/skill.md",), True),
+        ("Skills/Foo", ("skills/*/skill.md",), True),
+        ("docs/x", ("**/secret.md",), True),
+        ("x", ("a/**/b.md",), False),
+        ("a/deep/er", ("a/**/b.md",), True),
+        ("docs/x", (), False),
+        ("skills/foo/bar", ("skills/*.md",), False),
+    ],
+)
+def test_touched_symlink_under_wildcard_prefix(env, m, rules, checkout, path, extra, hit):
+    """A symlink matching any leading prefix of a pattern can lead into it; a leading ** is reached by all."""
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "real/skill.md")
+    sha = link(checkout, path, "/".join([".."] * path.count("/") + ["real"]))
+    hits = _touched(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + extra)[1]
+    assert hits == ([sha] if hit else [])
