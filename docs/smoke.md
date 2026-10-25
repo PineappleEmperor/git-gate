@@ -99,9 +99,35 @@ exact text, authored by the user's account.
 2. Agent: fetch as in step 1, then `git -C <abs> merge origin/main` on `smoke/gate` (a clean merge),
    bundle (`--not --remotes=origin`) and `push`.
 
-Expect: `Pushed <k> commit(s) to PineappleEmperor/ha-skills smoke/gate (<12 hex> -> <12 hex>).` The
-push is not refused for the workflow file, because the branch did not change it; the merge only
-brought in what the default branch already had.
+Expect one of these two, and record which one happened:
+
+- `Pushed <k> commit(s) to PineappleEmperor/ha-skills smoke/gate (<12 hex> -> <12 hex>).` The push is
+  not refused for the workflow file, because the branch did not change it; the merge only brought
+  in what the default branch already had.
+- Or GitHub refuses the token's push for want of the Workflows permission. Then the reply is
+  `Not pushed: GitHub refuses workflow changes from the gate's token. That push is the user's. ...`
+  and `gitgatepush H0`, never a bare `git push was rejected`. User: run `gitgatepush H0`, check that
+  it shows `Files under handover paths: none.` and the merge commit, and answer `y`. Expect
+  `Pushed. Handover H0 is closed.`, and `smoke/gate` on GitHub is the merge commit.
+
+3. Agent: from the commit on `main` just before step 6.1's workflow change, create `smoke/stale`
+   (`git -C <abs> switch -c smoke/stale <that commit>`), commit a change to `smoke.txt`, bundle and
+   push it.
+
+Expect: `Not pushed: smoke/stale does not change 1 file(s) under handover paths that main has changed
+since smoke/stale forked from it: .github/workflows/<file>.yml. ... No handover was kept: fetch, then
+rebase or merge origin/main, and push again.` There is no `gitgatepush` line and no `smoke/stale` on
+GitHub. Then `git -C <abs> rebase origin/main`, bundle and push again: expect `Pushed 1 commit(s)`.
+Delete `smoke/stale` in the web UI afterwards.
+
+## 6a. The token stays out of reach
+
+1. Agent: `gh(repo, ["api", "repos/{owner}/{repo}", "--jq", "$ENV.GH_TOKEN|explode"])`, then
+   `gh(repo, ["pr", "list", "--json", "number", "-q", "env.GH_TOKEN|explode"])`, then
+   `gh(repo, ["pr", "list", "--json", "number", "-q env|tojson"])` (one argument).
+
+Expect: the first two are refused with `gh --jq filters may not use env or $ENV` (or `-q`), the third
+with `Pass short flags and their values as separate arguments`. Nothing token-shaped comes back.
 
 ## 7. Refusals and their handovers
 
