@@ -1,5 +1,6 @@
 import io
 import json
+import shlex
 import stat
 from concurrent.futures import ThreadPoolExecutor
 
@@ -424,3 +425,128 @@ def test_main_refuses_a_record_that_vanished_after_it_was_shown(env, m, rules, c
     code, out = run_with(env, [str(h.id)], Meddler(lambda: Handovers(env.state).close(h.id)))
     assert code != 0 and "No open handover" in out
     assert remote_has(env, "feat") is None
+
+
+# --- fix round 1: showing it safely ---------------------------------------------------------
+
+
+def test_main_prints_a_command_that_shlex_splits_back_to_the_argv(env, m, rules, checkout):
+    branch = "a;touch$x'q\"`id`|&b"
+    h = stage(env, m, rules, checkout, branch)
+    _, out = run(env, [str(h.id)], "n\n")
+    line = next(x for x in out.splitlines() if x.startswith("Run: "))
+    url = env.gate.git.user_push_url(REPO)
+    assert shlex.split(line.removeprefix("Run: ")) == push_command(h, m.path(REPO), url)
+
+
+def test_main_refuses_unprintable_branch_names(env, hs):
+    bad = make(hs, branch="feat‮b")
+    code, out = run(env, [str(bad.id)], "y\n")
+    assert code != 0 and "unprintable" in out
+    assert "‮" not in out
+
+
+def test_main_says_how_many_commits_are_not_shown(env, m, rules, checkout):
+    git("switch", "-q", "-c", "big", cwd=checkout)
+    for i in range(55):
+        git("commit", "-q", "--allow-empty", "-m", f"step {i}", cwd=checkout)
+    git(
+        "bundle",
+        "create",
+        "-q",
+        str(env.state / "staging" / "big.bundle"),
+        "big",
+        "--not",
+        "--remotes=origin",
+        cwd=checkout,
+    )
+    base = git("rev-parse", "origin/main", cwd=checkout)
+    with m.lock(REPO):
+        m.sync(REPO, TOKEN, rules)
+        tip = m.import_bundle(REPO, env.state / "staging" / "big.bundle", "big", rules)
+        h = Handovers(env.state).create(REPO, "big", tip, base, None, "protected")
+        m.keep(REPO, h.ref, tip, rules)
+    _, out = run(env, [str(h.id)], "n\n")
+    assert "step 54" in out and "step 5" in out
+    assert "step 4\n" not in out
+    assert "5 more commits not shown" in out
+    git("switch", "-q", "main", cwd=checkout)
+    small = stage(env, m, rules, checkout, "small", base=base)
+    _, out = run(env, [str(small.id)], "n\n")
+    assert "add small" in out and "more commits" not in out
+
+
+def test_main_lists_every_file_the_push_changes(env, m, rules, checkout):
+    """The file list covers all new commits together, so an early commit cannot hide behind the log's cap."""
+    git("switch", "-q", "-c", "wide", cwd=checkout)
+    commit(checkout, ".github/workflows/hidden.yml", "on: push", message="innocent")
+    for i in range(60):
+        git("commit", "-q", "--allow-empty", "-m", f"filler {i}", cwd=checkout)
+    for i in range(105):
+        (checkout / f"bulk/f{i:03}.txt").parent.mkdir(exist_ok=True)
+        (checkout / f"bulk/f{i:03}.txt").write_text("x")
+    git("add", "bulk", cwd=checkout)
+    git("commit", "-q", "-m", "bulk", cwd=checkout)
+    git(
+        "bundle",
+        "create",
+        "-q",
+        str(env.state / "staging" / "w.bundle"),
+        "wide",
+        "--not",
+        "--remotes=origin",
+        cwd=checkout,
+    )
+    base = git("rev-parse", "origin/main", cwd=checkout)
+    with m.lock(REPO):
+        m.sync(REPO, TOKEN, rules)
+        tip = m.import_bundle(REPO, env.state / "staging" / "w.bundle", "wide", rules)
+        h = Handovers(env.state).create(REPO, "wide", tip, base, None, "touches .github/workflows")
+        m.keep(REPO, h.ref, tip, rules)
+    _, out = run(env, [str(h.id)], "n\n")
+    assert "12 more commits not shown" in out
+    assert "innocent" not in out  # the log is capped ...
+    assert ".github/workflows/hidden.yml" in out  # ... the file list is not hiding it
+    assert "and 6 more files" in out
+    assert "106 files changed" in out
+
+
+def test_main_without_base_lists_files_against_the_empty_tree(env, m, rules, checkout):
+    h = stage(env, m, rules, checkout, "fresh")
+    _, out = run(env, [str(h.id)], "n\n")
+    assert "README.md" in out and "fresh.txt" in out and "2 files changed" in out
+
+
+@pytest.mark.parametrize("bad", ["‮", "‪", "⁦", "​", "­", "\r", "\x1b", "\x9b", "\x07", "﻿", ""])
+def test_main_flattens_unprintable_characters(env, hs, bad):
+    h = make(hs, reason=f"a{bad}b\nc")
+    code, out = run(env, [])
+    assert code == 0 and out.count("\n") == 1  # the reason is one line
+    assert f"a{bad}b" not in out and "a?b?c" in out
+    code, out = run(env, [str(h.id)], "n\n")
+    assert bad not in out
+
+
+def test_main_keeps_git_output_lines_but_cleans_them(env, m, rules, checkout):
+    git("switch", "-q", "-c", "evil", cwd=checkout)
+    commit(checkout, "e.txt", message="one ‮​\r\x9b subject")
+    commit(checkout, "f.txt", message="second")
+    git(
+        "bundle",
+        "create",
+        "-q",
+        str(env.state / "staging" / "evil.bundle"),
+        "evil",
+        "--not",
+        "--remotes=origin",
+        cwd=checkout,
+    )
+    with m.lock(REPO):
+        m.sync(REPO, TOKEN, rules)
+        tip = m.import_bundle(REPO, env.state / "staging" / "evil.bundle", "evil", rules)
+        h = Handovers(env.state).create(REPO, "evil", tip, None, None, "pro\u202etected")
+        m.keep(REPO, h.ref, tip, rules)
+    _, out = run(env, [str(h.id)], "n\n")
+    assert "pro?tected" in out
+    assert "one ??" in out and "? subject" in out and "second" in out  # git itself splits the subject at \r
+    assert not any(c in out for c in "‮​\r\x9b")

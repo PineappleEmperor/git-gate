@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -25,8 +26,8 @@ from git_gate.mirror import OID, Mirror
 
 EXPIRES = 14 * 24 * 3600
 MAX_LOG = 50
+MAX_FILES = 100
 ID_RE = re.compile(r"^[0-9]{1,9}$")
-UNSAFE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 USAGE = "usage: gitgatepush [<id>]"
 MAX_ID = 10**9 - 1
 # The mirror calls made here read only git_timeout from the rules, so the user's rules.toml (which
@@ -184,8 +185,8 @@ def push_command(h: Handover, mirror_dir: Path, url: str) -> list[str]:
 
 
 def main(argv: list[str], *, stdin=sys.stdin, stdout=sys.stdout, base_url: str = "https://github.com") -> int:
-    def say(text: str = "", end: str = "\n") -> None:
-        stdout.write(_clean(text) + end)
+    def say(text: str = "", end: str = "\n", *, lines: bool = False) -> None:
+        stdout.write(_clean(text, lines=lines) + end)
         stdout.flush()
 
     try:
@@ -198,7 +199,7 @@ def main(argv: list[str], *, stdin=sys.stdin, stdout=sys.stdout, base_url: str =
             return 2
         return _run(handovers, int(argv[0]), Mirror(Git(state, base_url), state), stdin, say)
     except Refused as e:
-        say(str(e))
+        say(str(e), lines=True)
         return 1
 
 
@@ -226,9 +227,9 @@ def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
     if h.lease:
         say(f"This replaces {h.branch} (now {h.lease[:12]}), which is a force push guarded by that SHA.")
     say()
-    say(history)
+    say(history, lines=True)
     say()
-    say("Run: " + " ".join(push_command(h, mirror_dir, url)))
+    say("Run: " + shlex.join(push_command(h, mirror_dir, url)))
     say("Push it? [y/N] ", end="")
     if stdin.readline().strip().lower() not in ("y", "yes"):
         say(f"Not pushed. Handover {h.id} stays open.")
@@ -245,7 +246,7 @@ def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
         )
         output = (proc.stdout + proc.stderr).strip()[-MAX_STDERR:]
         if output:
-            say(output)
+            say(output, lines=True)
         if proc.returncode != 0:
             say(f"git push failed (exit {proc.returncode}). Handover {h.id} is still open.")
             return proc.returncode or 1
@@ -263,6 +264,8 @@ def _check(h: Handover, git: Git, rules: Rules) -> None:
     """The record is the gate's own, but it is checked before it becomes a command line."""
     if not REPO_RE.match(h.repo):
         raise Refused(f"Handover {h.id} names a bad repository.")
+    if not h.branch.isprintable():
+        raise Refused(f"Handover {h.id} names a branch with unprintable characters.")
     git.check_branch(h.branch, rules)
     for value in (h.sha, h.base, h.lease):
         if value is not None and not OID.match(value):
@@ -280,25 +283,39 @@ def _require_commit(mirror: Mirror, h: Handover, mirror_dir: Path, rules: Rules)
 
 
 def _show(mirror: Mirror, h: Handover, mirror_dir: Path, rules: Rules) -> str:
-    """The commits and file changes the push would add, from the mirror."""
-    if h.base:
-        steps = [["log", "--oneline", "--no-decorate", f"{h.base}..{h.sha}"], ["diff", "--stat", h.base, h.sha]]
-    else:
-        # A new branch: everything no mirrored branch already has.
-        log = ["log", "--oneline", "--no-decorate", "--stat", f"--max-count={MAX_LOG}", h.sha, "--not", "--branches"]
-        steps = [log]
-    parts = []
-    for step in steps:
+    """What the push adds: the newest commits, how many are not listed, and every changed file."""
+
+    def out(args: list[str], stdin: str | None = None) -> str:
         proc = mirror.git.run(
-            [step[0], "--no-color", "--no-ext-diff", *step[1:]], timeout=rules.git_timeout, git_dir=mirror_dir,
-            check=False,
+            [args[0], "--no-color", "--no-ext-diff", *args[1:]] if args[0] in ("log", "diff") else args,
+            timeout=rules.git_timeout, git_dir=mirror_dir, check=False, stdin=stdin,
         )  # fmt: skip
         if proc.returncode != 0:
             raise Refused(f"Could not show handover {h.id}:\n{proc.stderr.strip()[-MAX_STDERR:]}")
-        parts.append(proc.stdout.rstrip())
-    return "\n\n".join(p for p in parts if p) or "(no new commits)"
+        return proc.stdout
+
+    # No base means a new branch: everything no mirrored branch already has, against the empty tree.
+    new = [f"{h.base}..{h.sha}"] if h.base else [h.sha, "--not", "--branches"]
+    start = h.base or out(["hash-object", "-t", "tree", "--stdin"], stdin="").strip()
+
+    commits = out(["log", "--oneline", "--no-decorate", f"--max-count={MAX_LOG}", *new]).rstrip()
+    total = int(out(["rev-list", "--count", *new]).strip())
+    if total > MAX_LOG:
+        commits += f"\n... and {total - MAX_LOG} more commits not shown"
+
+    diff = ["--no-renames", start, h.sha, "--"]
+    files = len([f for f in out(["diff", "--name-only", "-z", *diff]).split("\0") if f])
+    stat = out(["diff", "--stat=500,400", f"--stat-count={MAX_FILES}", *diff]).rstrip().splitlines()
+    if files > MAX_FILES:
+        more = f" \u2026 and {files - MAX_FILES} more files not listed"
+        stat = [more if line.strip() == "..." else line for line in stat]
+    return "\n\n".join(p for p in (commits, "\n".join(stat)) if p) or "(no new commits)"
 
 
-def _clean(text: str) -> str:
-    """Commit messages and file names come from the agent: no escape sequences reach the terminal."""
-    return UNSAFE.sub("?", text)
+def _clean(text: str, *, lines: bool = False) -> str:
+    """Commit messages and file names come from the agent: nothing unprintable reaches the terminal.
+
+    That covers control characters, escape sequences, bidi overrides and zero-width characters
+    alike. Multi-line git output keeps its newlines; every other field is flattened to one line.
+    """
+    return "".join(c if c.isprintable() or (lines and c == "\n") else "?" for c in text)
