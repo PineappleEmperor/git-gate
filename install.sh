@@ -19,6 +19,7 @@ set -eu
 
 ROOT=${GIT_GATE_ROOT:-/opt/git-gate}
 RELEASES=$ROOT/releases
+BIN_DIR=${GIT_GATE_BIN_DIR:-/usr/local/bin}
 REPO=$HOME/git-gate
 PYTHON=$HOME/.pyenv/versions/3.14.4/bin/python3.14
 ROOT_ENV="env -i PATH=/usr/bin:/bin LANG=C.UTF-8 PIP_CONFIG_FILE=/dev/null PIP_NO_CACHE_DIR=1"
@@ -85,7 +86,22 @@ switch_to() {
     [ -d "$RELEASES/$1" ] || die "no release $1 in $RELEASES."
     sudo ln -sfn "releases/$1" "$ROOT/current.new"
     sudo mv -T "$ROOT/current.new" "$ROOT/current"
-    echo "current -> releases/$1. Restart Claude Code sessions to pick it up."
+    echo "current -> releases/$1."
+    link_gitgatepush
+}
+
+# Point $BIN_DIR/gitgatepush at the live release's launcher, so it works in any shell and always
+# runs the root-owned copy. Warn when another gitgatepush earlier on PATH would win.
+link_gitgatepush() {
+    link=$BIN_DIR/gitgatepush
+    sudo ln -sfn "$ROOT/current/bin/gitgatepush" "$link"
+    echo "$link -> $ROOT/current/bin/gitgatepush"
+    found=$(command -v gitgatepush || true)
+    if [ -z "$found" ]; then
+        echo "install.sh: warning: gitgatepush is not on your PATH; add $BIN_DIR to it." >&2
+    elif [ "$found" != "$link" ]; then
+        echo "install.sh: warning: running gitgatepush will start $found, not $link. Remove or rename it." >&2
+    fi
 }
 
 cmd_list() {

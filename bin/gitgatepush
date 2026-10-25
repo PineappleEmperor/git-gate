@@ -4,5 +4,13 @@
 # Resolves its own path first, so a running command keeps its release when `current` moves.
 set -eu
 self=$(readlink -f "$0")
+root=$(readlink -f "${GIT_GATE_ROOT:-/opt/git-gate}")
+case $self in
+    "$root"/releases/*/bin/gitgatepush) ;;
+    *)
+        echo "gitgatepush: $self is not an installed release under $root/releases/; refusing to run." >&2
+        echo "Run it through the link install.sh makes, or reinstall with install.sh." >&2
+        exit 1 ;;
+esac
 release=${self%/bin/gitgatepush}
 exec "$release/.venv/bin/python" -I -m git_gate handover "$@"
