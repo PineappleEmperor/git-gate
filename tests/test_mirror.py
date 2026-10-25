@@ -202,7 +202,8 @@ def test_import_missing_prerequisites(env, m, rules, checkout):
     with pytest.raises(Refused) as e:
         m.import_bundle(REPO, b, "feat", rules)
     msg = str(e.value)
-    assert "run the gate's fetch" in msg
+    assert "run the gate's fetch" in msg and "git fetch --prune" in msg
+    assert "branch -dr" not in msg
     assert "--not" in msg
     assert unpushed[:12] in msg
     assert mgit(m, "for-each-ref", "refs/gate/") == ""

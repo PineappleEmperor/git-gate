@@ -137,9 +137,9 @@ class Mirror:
                 missing = re.findall(r"\b[0-9a-f]{40,64}\b", verify.stderr)
                 raise Refused(
                     f"The bundle builds on commits GitHub does not have ({', '.join(c[:12] for c in missing[:5])}), "
-                    "usually because an origin/* branch in your clone is stale. To fix it, run the gate's fetch, "
-                    "delete each origin/* branch GitHub no longer lists (git branch -dr origin/<name>), then "
-                    "recreate the bundle with:\n\n" + BUNDLE_HOWTO.format(branch=branch)
+                    "usually because an origin/* branch in your clone is stale. To fix it, run the gate's fetch "
+                    "and the git fetch --prune command it gives you, which makes origin/* exactly GitHub's "
+                    "branches, then recreate the bundle with:\n\n" + BUNDLE_HOWTO.format(branch=branch)
                 )
             raise Refused(f"The bundle does not verify:\n{_tail(verify.stderr)}")
 
