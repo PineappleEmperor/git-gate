@@ -12,7 +12,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from git_gate import Refused
-from git_gate.config import state_dir
+from git_gate.call import log_error
 from git_gate.gate import Gate, InternalError, utf8_safe
 
 RELAY_TIMEOUT = 4 * 3600  # a backstop only; each call enforces the timeouts in rules.toml
@@ -50,10 +50,13 @@ class Relay:
                 input=json.dumps(kwargs),
                 capture_output=True,
                 text=True,
+                errors="replace",  # a crashed child's stderr can hold bytes that are not UTF-8
                 timeout=RELAY_TIMEOUT,
             )
-        except OSError, subprocess.TimeoutExpired:
-            raise Refused(f"git-gate release {target.name[:12]} gave no answer.") from None
+        except subprocess.TimeoutExpired:
+            raise Refused(f"git-gate release {target.name[:12]} timed out after {RELAY_TIMEOUT:g}s.") from None
+        except OSError as e:
+            raise Refused(f"git-gate could not start release {target.name[:12]}: {e.strerror or e}.") from None
         result = self._answer(proc.stdout)
         if result is None:
             log = self._log_child_failure(tool, proc)
@@ -80,15 +83,8 @@ class Relay:
     @staticmethod
     def _log_child_failure(tool: str, proc: subprocess.CompletedProcess) -> Path | None:
         """Keep what a child printed on stderr and its exit code; never the token, which this process lacks."""
-        log = state_dir() / "errors.log"
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        try:
-            log.parent.mkdir(parents=True, exist_ok=True)
-            with open(log, "a") as f:
-                f.write(f"{stamp} {tool} relay child exited {proc.returncode} without a valid answer\n{proc.stderr}\n")
-        except OSError:
-            return None
-        return log
+        return log_error(f"{stamp} {tool} relay child exited {proc.returncode} without a valid answer\n{proc.stderr}\n")
 
 
 INSTRUCTIONS = """\

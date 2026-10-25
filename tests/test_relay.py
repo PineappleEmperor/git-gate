@@ -9,7 +9,7 @@ import anyio
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from git_gate import Refused
+from git_gate import Refused, server
 from git_gate.call import main as call_main
 from git_gate.call import run
 from git_gate.server import Relay, build
@@ -151,6 +151,65 @@ def test_server_uses_the_relay(tmp_path):
 
 def test_dev_checkout_is_not_relayed():
     assert Relay.for_installed() is None
+
+
+def test_relay_timeout_and_oserror_messages_differ(tmp_path, monkeypatch):
+    rel = _release(tmp_path, "slowrelease", {"ok": "never"})
+    _point(tmp_path, "slowrelease")
+    (rel / "bin/git-gate").write_text("#!/bin/sh\nsleep 5\n")
+    monkeypatch.setattr(server, "RELAY_TIMEOUT", 0.2)
+    with pytest.raises(Refused) as slow:
+        Relay(tmp_path)("gh", {})
+    (rel / "bin/git-gate").unlink()
+    with pytest.raises(Refused) as missing:
+        Relay(tmp_path)("gh", {})
+    assert "timed out" in str(slow.value) and "slowrelease" in str(slow.value)
+    assert "could not start" in str(missing.value) and "slowrelease" in str(missing.value)
+    assert str(slow.value) != str(missing.value)
+
+
+def test_relay_decodes_a_childs_non_utf8_output_with_replacement(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_GATE_STATE_DIR", str(tmp_path / "state"))
+    rel = _release(tmp_path, "r", {})
+    (rel / "bin/git-gate").write_text("#!/bin/sh\nprintf 'bad \\377 byte' >&2\nexit 1\n")
+    _point(tmp_path, "r")
+    with pytest.raises(Refused, match="gave no answer"):
+        Relay(tmp_path)("gh", {})
+    assert "bad \ufffd byte" in (tmp_path / "state/errors.log").read_text()
+
+
+def test_relay_decodes_a_non_utf8_answer_with_replacement(tmp_path):
+    rel = _release(tmp_path, "r", {})
+    (rel / "bin/git-gate").write_text('#!/bin/sh\nprintf \'{"ok": "name \\377 here"}\'\n')
+    _point(tmp_path, "r")
+    assert Relay(tmp_path)("gh", {}) == "name \ufffd here"
+
+
+def test_errors_log_is_private_and_rolls_over(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    monkeypatch.setenv("GIT_GATE_STATE_DIR", str(state))
+    rel = _release(tmp_path, "r", {})
+    (rel / "bin/git-gate").write_text("#!/bin/sh\necho first >&2\nexit 3\n")
+    _point(tmp_path, "r")
+    with pytest.raises(Refused):
+        Relay(tmp_path)("gh", {})
+    log = state / "errors.log"
+    assert oct(log.stat().st_mode & 0o777) == "0o600"
+    log.write_text("x" * (1 << 20))
+    with pytest.raises(Refused):
+        Relay(tmp_path)("gh", {})
+    assert (state / "errors.log.1").read_text() == "x" * (1 << 20)
+    assert "first" in log.read_text() and log.stat().st_size < 1 << 20
+    assert oct(log.stat().st_mode & 0o777) == "0o600"
+
+
+def test_call_main_writes_a_private_log(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    monkeypatch.setenv("GIT_GATE_STATE_DIR", str(state))
+    monkeypatch.setattr("git_gate.gate.Gate", lambda: 1 / 0)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    call_main("fetch")
+    assert oct((state / "errors.log").stat().st_mode & 0o777) == "0o600"
 
 
 def test_call_run(env):
