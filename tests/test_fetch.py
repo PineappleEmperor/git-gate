@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 from pathlib import Path
 
@@ -42,13 +43,51 @@ def test_fetch_writes_bundle(env, checkout):
     out_path.unlink()
     have = git("for-each-ref", "--format=%(objectname)", "refs/remotes/origin/", cwd=checkout).split()
     out = call(env, "fetch", repo="me/app", bundle=str(out_path), have=have)
-    assert "Up to date" in out
-    assert not out_path.exists()
+    assert "Wrote 2 branch(es)" in out and out_path.is_file()
+    run_reply(out, checkout)
+    assert git("rev-parse", "origin/main", cwd=checkout) == new
 
     newer = upstream(env, "newer.txt")
     out = call(env, "fetch", repo="me/app", bundle=str(out_path), have=have)
     git("fetch", "-q", str(out_path), REFSPEC, cwd=checkout)
     assert git("rev-parse", "origin/main", cwd=checkout) == newer
+
+
+def run_reply(reply: str, checkout: Path) -> None:
+    """Run the fetch command the gate's reply hands the agent, as the agent would."""
+    line = next(x for x in reply.splitlines() if x.startswith("git fetch "))
+    assert line.startswith("git fetch --prune ") and line.endswith(f"'{REFSPEC}'")
+    git(*shlex.split(line)[1:], cwd=checkout)
+
+
+def origin_refs(checkout: Path) -> dict[str, str]:
+    out = git("for-each-ref", "--format=%(refname:lstrip=3) %(objectname)", "refs/remotes/origin/", cwd=checkout)
+    return dict(line.split(" ") for line in out.splitlines() if not line.startswith("HEAD "))
+
+
+def test_fetch_delivers_a_new_branch_at_a_known_sha(env, checkout):
+    """GitHub gains release-1 at main's commit; the agent already holds that commit."""
+    main = git("rev-parse", "origin/main", cwd=checkout)
+    git("push", "-q", env.url, "main:refs/heads/release-1", cwd=env.tmp / "seed")
+    out_path = env.ws / "f.bundle"
+    out = call(env, "fetch", repo="me/app", bundle=str(out_path), have=[main])
+    assert "Wrote 2 branch(es)" in out
+    run_reply(out, checkout)
+    assert origin_refs(checkout) == {"main": main, "release-1": main}
+
+
+def test_fetch_prune_removes_branches_gone_from_github(env, checkout):
+    seed = env.tmp / "seed"
+    git("push", "-q", env.url, "main:refs/heads/gone", cwd=seed)
+    out_path = env.ws / "f.bundle"
+    run_reply(call(env, "fetch", repo="me/app", bundle=str(out_path)), checkout)
+    assert "gone" in origin_refs(checkout)
+    git("push", "-q", env.url, ":refs/heads/gone", cwd=seed)
+    have = list(origin_refs(checkout).values())
+    out = call(env, "fetch", repo="me/app", bundle=str(out_path), have=have)
+    assert "have=[]" in out
+    run_reply(out, checkout)
+    assert origin_refs(checkout) == heads(env)
 
 
 def test_fetch_replaces_an_existing_bundle_file(env, checkout):

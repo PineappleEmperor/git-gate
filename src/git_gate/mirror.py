@@ -183,17 +183,19 @@ class Mirror:
     def export_bundle(self, repo: str, out: Path, have: list[str], rules: Rules) -> bool:
         """Write every branch to `out`, leaving out the history below each known `have` commit.
 
-        The haves' parents are excluded, not the haves, so a branch whose tip the agent already has
-        still carries its ref. If that would still drop a branch (a tip below a have's parents), the
-        bundle is written in full instead. Malformed or unknown `have` entries are skipped. False, and
-        no file, only when the mirror has no branches or every branch tip is itself in `have`.
+        The bundle always lists exactly the mirror's refs/heads/*, so a `git fetch --prune` from it
+        makes origin/* equal GitHub's branches: a have list names commits, not branches, so it can
+        never show that the agent's refs already match. The haves' parents are excluded, not the
+        haves, so a branch whose tip the agent already has still carries its ref; if that would
+        still drop a branch (a tip below a have's parents), the bundle is written in full instead.
+        Malformed or unknown `have` entries are skipped. False, and no file, only without branches.
         """
         if len(have) > MAX_HAVE:
             raise Refused(f"have lists {len(have)} SHAs; the gate takes at most {MAX_HAVE}.")
         if not out.is_absolute():
             raise Refused("The output path must be absolute.")
         heads = self._heads(repo, rules)
-        if not heads or set(heads.values()) <= set(have):
+        if not heads:
             return False
         parents = [f"{h}^@" for h in self._known_commits(repo, have, rules)]
         if parents:

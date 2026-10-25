@@ -222,7 +222,11 @@ class Gate:
         )
 
     def fetch(self, rules: Rules, token: str, repo: str, bundle: str, have: list[str] = ()) -> str:
-        """Write every GitHub branch of `repo` to a bundle at `bundle`, leaving out what `have` covers."""
+        """Write every GitHub branch of `repo` to a bundle at `bundle`, leaving out what `have` covers.
+
+        Every bundle lists all of GitHub's branches, so the agent's `git fetch --prune` keeps
+        origin/* exactly equal to GitHub, which push bundles made with --not --remotes=origin rely on.
+        """
         rules.access(repo)
         if not isinstance(have, list | tuple) or not all(isinstance(h, str) for h in have):
             raise Refused("have must be a list of commit SHA strings.")
@@ -233,21 +237,16 @@ class Gate:
             with self.mirror.lock(repo):
                 heads = self.mirror.sync(repo, token, rules)
                 wrote = self.mirror.export_bundle(repo, tmp, list(have), rules)
-            if not heads:
-                return f"{repo} has no branches on GitHub yet; nothing to fetch, and no bundle was written."
-            listing = "GitHub's branches (what origin/* should be):\n" + "\n".join(
-                f"{name} {sha}" for name, sha in sorted(heads.items())
-            )
-            gone = (
-                "\n\nAn origin/* branch not listed here is gone from GitHub; delete it with "
-                "git branch -dr origin/<name>."
-            )
             if not wrote:
-                return f"Up to date: origin/* already matches GitHub. No bundle was written.\n\n{listing}{gone}"
+                return f"{repo} has no branches on GitHub yet; nothing to fetch, and no bundle was written."
             write_out(rules, bundle, tmp, "Bundle output")
+        listing = "\n".join(f"{name} {sha}" for name, sha in sorted(heads.items()))
         return (
             f"Wrote {len(heads)} branch(es) of {repo} to {bundle}. Inside the sandbox run:\n\n"
-            f"git fetch {shlex.quote(bundle)} '{FETCH_REFSPEC}'\n\n{listing}{gone}"
+            f"git fetch --prune {shlex.quote(bundle)} '{FETCH_REFSPEC}'\n\n"
+            "That makes origin/* exactly GitHub's branches. If git reports missing prerequisite commits, "
+            "call fetch again with have=[].\n\n"
+            f"GitHub's branches:\n{listing}"
         )
 
     def push(self, rules: Rules, token: str, repo: str, branch: str, bundle: str) -> str:

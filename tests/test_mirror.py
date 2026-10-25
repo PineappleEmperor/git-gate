@@ -290,9 +290,35 @@ def test_export_full_and_incremental(env, m, rules, checkout):
     assert m.export_bundle(REPO, tip, [m2], rules) is True
     assert _heads_of(tip) == {"main": m2, "dev": dev}
 
-    none = env.tmp / "none.bundle"
-    assert m.export_bundle(REPO, none, [m2, dev], rules) is False
-    assert not none.exists()
+    every = env.tmp / "every.bundle"
+    assert m.export_bundle(REPO, every, [m2, dev], rules) is True
+    assert _heads_of(every) == {"main": m2, "dev": dev}
+
+
+def test_export_always_lists_every_branch(env, m, rules, checkout):
+    """A have list carries no branch names: a new branch at a known commit must still arrive."""
+    main = git("rev-parse", "HEAD", cwd=checkout)
+    git("push", "-q", env.url, f"{main}:refs/heads/release-1", cwd=env.tmp / "seed")
+    m.sync(REPO, TOKEN, rules)
+    out = env.tmp / "known.bundle"
+    assert m.export_bundle(REPO, out, [main], rules) is True
+    assert _heads_of(out) == {"main": main, "release-1": main}
+    assert _fetch_into(checkout, out) == {"main": main, "release-1": main}
+    again = env.tmp / "again.bundle"
+    assert m.export_bundle(REPO, again, [main, main], rules) is True
+    assert set(_heads_of(again)) == {"main", "release-1"}
+
+
+def test_export_false_only_without_branches(env, m, rules):
+    git("init", "-q", "--bare", str(env.remote / "me/empty.git"))
+    m.sync("me/empty", TOKEN, rules)
+    for have in ([], ["a" * 40]):
+        out = env.tmp / "out.bundle"
+        assert m.export_bundle("me/empty", out, have, rules) is False
+        assert not out.exists()
+    main = seed_push(env, "b.txt")
+    m.sync(REPO, TOKEN, rules)
+    assert m.export_bundle(REPO, env.tmp / "one.bundle", [main], rules) is True
 
 
 def test_export_keeps_branches_whose_tips_the_agent_has(env, m, rules, checkout):
@@ -349,7 +375,7 @@ def test_export_ignores_unknown_have(env, m, rules):
     assert _fetch_into_new(env, out, "fresh") == {"main": main}
     with pytest.raises(Refused, match="1000"):
         m.export_bundle(REPO, env.tmp / "cap.bundle", ["0" * 40] * 1001, rules)
-    assert m.export_bundle(REPO, env.tmp / "ok.bundle", ["0" * 40] * 999 + [main], rules) is False
+    assert m.export_bundle(REPO, env.tmp / "ok.bundle", ["0" * 40] * 999 + [main], rules) is True
 
 
 # --- ancestry ------------------------------------------------------------------------------

@@ -131,8 +131,10 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
     async def fetch(repo: str, bundle: str, have: list[str] | None = None) -> str:
         """Write every GitHub branch of `repo` to a bundle file at `bundle` (absolute, in a workspace).
 
-        Then, in the sandbox: git fetch <bundle> '+refs/heads/*:refs/remotes/origin/*'. Pass your
-        current origin/* SHAs as `have` to leave out history you already hold.
+        Then, in the sandbox: git fetch --prune <bundle> '+refs/heads/*:refs/remotes/origin/*',
+        which makes origin/* exactly GitHub's branches. To leave out history you already hold, pass
+        as `have` the output of git for-each-ref --format='%(objectname)' refs/remotes/origin; if
+        git then reports missing prerequisites, fetch again with have=[].
         """
         return await run("fetch", repo=repo, bundle=bundle, have=have or [])
 
