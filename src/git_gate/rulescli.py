@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from git_gate import Refused
@@ -40,7 +41,8 @@ usage: gitgaterules <command>
   add-session <folder> [--repo <repo>]     make a project folder a session, with its own repo
   remove-session <folder>                  remove a session
   group <name> add|remove <repo|@group>    change a group, making it if it is new
-  migrate [--write]                        turn a v1 file into sessions; --write writes it
+  migrate [--write [--yes-pairings <folder>=<repo> ...]]
+                                           turn a v1 file into sessions; --write asks, then writes
 
 A session is a project folder: a conversation started in it, or below it, reaches the session's
 own repo (write), its grants, and no other repo. Every edit is checked as the gate checks the
@@ -543,7 +545,8 @@ def origin_repo(folder: Path) -> tuple[str | None, str]:
     """(owner/name, "") for a checkout whose origin is on github.com, else (None, why not).
 
     Only the checkout's own config is read: no system or global config (where an insteadOf or an
-    origin of its own could name another repo), and no walking up into a parent checkout.
+    origin of its own could name another repo), and no walking up into a parent checkout. That
+    config is the agent's to change, so the answer is a suggestion, never a pairing by itself.
     """
     if not os.path.lexists(folder / ".git"):
         return None, "is not a git checkout (it has no .git)"
@@ -571,8 +574,39 @@ def origin_repo(folder: Path) -> tuple[str | None, str]:
     return m[1], ""
 
 
-def migrate(data: dict) -> tuple[dict, list[str]]:
-    """A v2 version of a valid v1 file, and every judgement made on the way, in plain words."""
+def _git_dir_outside(folder: Path) -> str | None:
+    """Why the folder's .git leads outside it, if it does: then its config is another folder's."""
+    dot = folder / ".git"
+    if dot.is_symlink():
+        target = dot.resolve()
+        return None if target.is_relative_to(folder) else f"its .git is a symlink to {target}, outside the folder"
+    if dot.is_file():
+        try:
+            first = dot.read_text(errors="replace").partition("\n")[0]
+        except OSError:
+            return "its .git is a file that cannot be read"
+        target = (folder / first.removeprefix("gitdir:").strip()).resolve()
+        if not first.startswith("gitdir:") or not target.is_relative_to(folder):
+            return f"its .git is a gitfile pointing to {target}, outside the folder (a worktree or submodule)"
+    return None
+
+
+@dataclass
+class Pairing:
+    """A folder whose origin suggests it is a v1 write repo's own session; the user decides."""
+
+    folder: str
+    repo: str
+    flags: list[str] = field(default_factory=list)  # each one means the repo's name must be typed
+    warnings: list[str] = field(default_factory=list)
+
+
+def migrate(data: dict, decide) -> tuple[dict, list[str]]:
+    """A v2 version of a valid v1 file, and every judgement made on the way, in plain words.
+
+    Each folder whose origin is a v1 write repo is a proposed pairing, and `decide(pairing)` says
+    whether to make it: only then does the session get that repo as its own.
+    """
     notes: list[str] = []
     access: dict[str, str] = {}
     names: dict[str, str] = {}
@@ -592,7 +626,7 @@ def migrate(data: dict) -> tuple[dict, list[str]]:
             "as every conversation can today."
         )
     sessions: dict[str, dict] = {}
-    owned: set[str] = set()
+    pairings: list[Pairing] = []
     for w in data.get("workspaces", []):
         folder = Path(w).resolve()
         key = str(folder)
@@ -602,15 +636,18 @@ def migrate(data: dict) -> tuple[dict, list[str]]:
         if not folder.is_dir():
             notes.append(f"{w}: left out: the folder does not exist, and a session's folder must.")
             continue
-        entry: dict = {}
+        sessions[key] = {"read": ["@reads"]} if reads else {}
         repo, why = origin_repo(folder)
         level = access.get(repo.lower()) if repo else None
         if repo is None:
             notes.append(f"{key}: {why}, so the session has no repo of its own; it gets the reads only.")
         elif level == "write":
-            entry["repo"] = repo
-            owned.add(repo.lower())
-            notes.append(f"{key}: its origin is {repo}, write in [repos]: the session's own repo.")
+            pairing = Pairing(key, repo)
+            if outside := _git_dir_outside(folder):
+                pairing.flags.append(outside)
+            if folder.name.lower() != repo.partition("/")[2].lower():
+                pairing.warnings.append(f"the folder is named {folder.name}, the repo {repo}")
+            pairings.append(pairing)
         elif level == "read":
             notes.append(
                 f"{key}: its origin is {repo}, read-only in [repos]: kept read-only (through @reads), not made "
@@ -621,16 +658,31 @@ def migrate(data: dict) -> tuple[dict, list[str]]:
                 f"{key}: its origin is {repo}, which is not in [repos]: left out, as no conversation can reach "
                 f"it today. To make it the session's: gitgaterules grant {key} write {repo}"
             )
-        if reads:
-            entry["read"] = ["@reads"]
-        sessions[key] = entry
+    claims: dict[str, int] = {}
+    for p in pairings:
+        claims[p.repo.lower()] = claims.get(p.repo.lower(), 0) + 1
+    owned: set[str] = set()
+    for p in pairings:
+        if claims[p.repo.lower()] > 1:
+            p.flags.append(f"{p.repo} is claimed by more than one folder")
+        said = "; ".join(p.flags + p.warnings)
+        proposal = f"{p.folder}: its origin is {p.repo}, write in [repos]: proposed as the session's own repo"
+        if decide(p):
+            sessions[p.folder]["repo"] = p.repo
+            owned.add(p.repo.lower())
+            notes.append(f"{proposal}{f' ({said})' if said else ''}; paired.")
+        else:
+            notes.append(
+                f"{proposal}{f' ({said})' if said else ''}; not paired, so the session has no repo of its own. "
+                f"To pair it later: gitgaterules grant {p.folder} write {p.repo}"
+            )
     new["sessions"] = sessions
     if not sessions:
         notes.append("No workspace became a session, so the gate will refuse every call until one is added.")
     for name, level in sorted(access.items()):
         if level == "write" and name not in owned:
             notes.append(
-                f"{names[name]}: write in [repos] but no workspace's origin, so no session gets it; left out. "
+                f"{names[name]}: write in [repos] but paired with no workspace, so no session gets it; left out. "
                 f"To give it to a session: gitgaterules grant <folder> write {names[name]}"
             )
     if options:
@@ -643,8 +695,40 @@ def migrate(data: dict) -> tuple[dict, list[str]]:
     return new, notes
 
 
-def cmd_migrate(args: list[str], say) -> int:
-    if args not in ([], ["--write"]):
+def _ask(stdin, say):
+    """Ask about each pairing on the terminal; no is the default, and a flagged one needs its repo typed."""
+
+    def decide(p: Pairing) -> bool:
+        say(f"\n{p.folder}: its origin says {p.repo}. A session's own repo can be written by every conversation there.")
+        for w in p.warnings:
+            say(f"Warning: {w}.")
+        if p.flags:
+            say(f"Flagged: {'; '.join(p.flags)}.")
+            say(f"Type {p.repo} to pair them anyway, or press Enter to leave the session without a repo: ", end="")
+            return stdin.readline().strip().lower() == p.repo.lower()
+        say(f"Make {p.repo} the own repo (write) of {p.folder}? [y/N] ", end="")
+        return stdin.readline().strip().lower() in ("y", "yes")
+
+    return decide
+
+
+def _named(pairs: list[str], proposed: list[Pairing], say):
+    """`decide` for --yes-pairings: exactly the folder=repo pairs named, each one a proposed pairing."""
+    chosen = []
+    for pair in pairs:
+        folder, eq, repo = pair.rpartition("=")
+        match = [p for p in proposed if eq and _same_folder(p.folder, folder) and p.repo.lower() == repo.lower()]
+        if not match:
+            say(f"{pair} is not a proposed pairing; gitgaterules migrate lists them. Nothing written.")
+            return None
+        chosen += match
+    return lambda p: p in chosen
+
+
+def cmd_migrate(args: list[str], say, stdin) -> int:
+    write = args[:1] == ["--write"]
+    pairs = args[2:] if args[1:2] == ["--yes-pairings"] else None
+    if args not in ([], ["--write"]) and not (write and pairs is not None):
         return _usage(say)
     path = rules_path()
     loaded = _load(path, say)
@@ -658,21 +742,39 @@ def cmd_migrate(args: list[str], say) -> int:
     if checked.rules.version == 2:
         say(f"{path} is already a v2 file (it has [sessions]); nothing to migrate.")
         return 0
-    new_data, notes = migrate(tomllib.loads(text))
-    new = render(new_data)
-    if args:
-        say("Judgements:")
+    data = tomllib.loads(text)
+    proposed: list[Pairing] = []
+    migrate(data, lambda p: proposed.append(p) or True)
+    if not write:
+        new_data, notes = migrate(data, lambda p: True)
+        new = render(new_data)
+        say(new, end="")
+        say("\nJudgements:")
         for note in notes:
             say(f"- {note}")
-        return save(path, text.encode(), new, say)[0]
-    say(new, end="")
+        result = check_rules(new, config_dir())
+        _say_problems(result, new, say)
+        if proposed:
+            say("\nThis shows every proposed pairing made; with --write each is asked one by one, no by default.")
+        say(f"\nNothing written. To write it, keeping {path.name} as a backup: gitgaterules migrate --write")
+        return 1 if result.problems else 0
+    if pairs is not None:
+        decide = _named(pairs, proposed, say)
+        if decide is None:
+            return 1
+    elif proposed and not stdin.isatty():
+        named = " ".join(f"{p.folder}={p.repo}" for p in proposed)
+        say("Not written: each folder-to-repo pairing needs your yes, and there is no terminal to ask on.")
+        say("Run it in a terminal, or name the pairings you confirm:\n")
+        say(f"gitgaterules migrate --write --yes-pairings {named}")
+        return 1
+    else:
+        decide = _ask(stdin, say)
+    new_data, notes = migrate(data, decide)
     say("\nJudgements:")
     for note in notes:
         say(f"- {note}")
-    result = check_rules(new, config_dir())
-    _say_problems(result, new, say)
-    say(f"\nNothing written. To write it, keeping {path.name} as a backup: gitgaterules migrate --write")
-    return 1 if result.problems else 0
+    return save(path, text.encode(), render(new_data), say)[0]
 
 
 COMMANDS = {
@@ -683,11 +785,10 @@ COMMANDS = {
     "add-session": cmd_add_session,
     "remove-session": cmd_remove_session,
     "group": cmd_group,
-    "migrate": cmd_migrate,
 }
 
 
-def main(argv: list[str], *, stdout=sys.stdout) -> int:
+def main(argv: list[str], *, stdout=sys.stdout, stdin=sys.stdin) -> int:
     def say(text: str = "", end: str = "\n") -> None:
         stdout.write(text + end)
         stdout.flush()
@@ -698,6 +799,8 @@ def main(argv: list[str], *, stdout=sys.stdout) -> int:
     if argv[0] in ("-h", "--help", "help"):
         say(USAGE, end="")
         return 0
+    if argv[0] == "migrate":
+        return cmd_migrate(argv[1:], say, stdin)
     command = COMMANDS.get(argv[0])
     if command is None:
         say(USAGE, end="")
