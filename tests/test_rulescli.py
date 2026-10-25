@@ -84,12 +84,21 @@ def test_check_lists_every_problem_with_its_line(cfg):
     code, out = run("check")
     assert code == 1
     errors = [line for line in out.splitlines() if line.startswith("error:")]
-    assert len(errors) == 3, out
-    gone = next(e for e in errors if "/gone" in e)
-    assert gone.startswith("error: line 18: ") and "does not exist" in gone
-    nope = next(e for e in errors if "@nope" in e)
-    assert nope.startswith("error: line 22: ")
+    assert len(errors) == 1 and errors[0].startswith("error: line 22: ") and "@nope" in errors[0], out
+    gone = next(line for line in out.splitlines() if "/gone" in line)
+    assert gone.startswith("warning: line 18: ") and "does not exist" in gone
     assert "OK" not in out
+
+
+def test_check_passes_with_a_missing_folder_as_a_warning(cfg, tmp_path):
+    write(cfg, PINEAPPLE + '[sessions."{tmp}/gone"]\nrepo = "me/gone"\n')
+    code, out = run("check")
+    assert code == 0, out
+    assert any(
+        line.startswith("warning: ") and "does not exist" in line and f"remove-session {tmp_path}/gone" in line
+        for line in out.splitlines()
+    )
+    assert "OK: 4 sessions" in out
 
 
 def test_check_names_the_line_of_bad_toml(cfg):
@@ -250,7 +259,6 @@ def test_grant_accepts_a_relative_folder(cfg, tmp_path, monkeypatch):
         (("grant", "{tmp}/core", "admin", "me/x"), ["usage"]),
         (("revoke", "{tmp}/core", "me/never"), ["me/never", "not granted"]),
         (("add-session", "{tmp}/core"), ["already"]),
-        (("add-session", "{tmp}/missing", "--repo", "me/x"), ["does not exist", "Not written"]),
         (("remove-session", "{tmp}/nowhere"), ["No session"]),
         (("group", "reads", "remove", "me/never"), ["me/never", "not in"]),
         (("group", "reads", "add", "@pineapple"), []),
@@ -304,12 +312,16 @@ def test_removing_the_last_session_keeps_the_file_v2(cfg, tmp_path):
     assert load_rules(cfg).version == 2
 
 
-def test_remove_session_mends_a_file_whose_folder_is_gone(cfg, tmp_path):
+def test_remove_session_drops_a_session_whose_folder_is_gone(cfg, tmp_path):
     write(cfg, PINEAPPLE + '[sessions."{tmp}/gone"]\nrepo = "me/gone"\n')
-    with pytest.raises(Refused, match="does not exist"):
-        load_rules(cfg)
+    assert len(load_rules(cfg).sessions) == 4
     assert run("remove-session", f"{tmp_path}/gone")[0] == 0
-    assert load_rules(cfg).version == 2
+    assert len(load_rules(cfg).sessions) == 3
+
+
+def test_add_session_for_a_missing_folder_writes_it_with_a_warning(cfg, tmp_path):
+    code, out = run("add-session", f"{tmp_path}/later", "--repo", "me/x")
+    assert code == 0 and "warning: " in out and "does not exist" in out
 
 
 def test_group_add_and_remove(cfg, tmp_path):

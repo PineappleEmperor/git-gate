@@ -80,3 +80,9 @@ def test_files_are_exchanged_only_inside_the_sessions_folder(scoped):
 def test_the_agent_cannot_name_its_own_folder(scoped):
     with pytest.raises(Refused, match="unexpected keyword argument 'cwd'"):
         call(scoped, "clone", repo="other/lib", path=str(scoped.ws / "c"), cwd=str(scoped.other))
+
+
+def test_a_missing_session_folder_does_not_stop_the_other_sessions(scoped):
+    rules = scoped.cfg / "rules.toml"
+    rules.write_text(rules.read_text() + f'[sessions."{scoped.tmp}/deleted"]\nrepo = "me/gone"\n')
+    assert "Cloned me/app" in call(scoped, "clone", repo="me/app", path=str(scoped.ws / "c"))

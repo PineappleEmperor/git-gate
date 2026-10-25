@@ -181,7 +181,6 @@ def test_v1_is_unchanged_and_unscoped(cfg):
         ('[groups]\n"bad name" = []\n[sessions."{tmp}/a"]\n', ["'bad name'"]),
         ('[groups]\ng = 5\n[sessions."{tmp}/a"]\n', ["[groups] g", "list"]),
         ('[sessions."rel/a"]\n', ['[sessions."rel/a"]', "absolute"]),
-        ('[sessions."{tmp}/missing"]\n', ['[sessions."{tmp}/missing"]', "does not exist", "remove-session"]),
         ('[sessions."{tmp}/cfg/x"]\n', ["gate-owned"]),
         ('[sessions."{tmp}"]\n', ["gate-owned"]),
         ('[sessions."{tmp}/state"]\n', ["gate-owned"]),
@@ -232,3 +231,39 @@ def test_warnings(cfg):
     assert len(texts) == 2
     assert any(str(cfg.parent / "a") in t and "not a git checkout" in t for t in texts)
     assert any("me/unused" in t and "no session" in t for t in texts)
+
+
+def test_a_missing_folder_is_a_warning_and_its_session_matches_nothing(cfg):
+    """Deleting one project folder must not refuse every other session's calls."""
+    (cfg.parent / "file").write_text("")
+    write(
+        cfg,
+        """
+[sessions."{tmp}/a"]
+repo = "me/app"
+[sessions."{tmp}/gone"]
+repo = "me/gone"
+[sessions."{tmp}/file"]
+repo = "me/file"
+""",
+    )
+    checked = check_rules((cfg / "rules.toml").read_text(), cfg)
+    assert checked.problems == []
+    for name in ("gone", "file"):
+        assert any(
+            str(cfg.parent / name) in w.text and "does not exist" in w.text and "remove-session" in w.text
+            for w in checked.warnings
+        ), checked.warnings
+    rules = load_rules(cfg)
+    assert set(rules.scoped(str(cfg.parent / "a")).repos) == {"me/app"}
+    with pytest.raises(Refused, match="not a git-gate session"):
+        rules.scoped(str(cfg.parent / "gone"))
+    with pytest.raises(Refused, match="not a git-gate session"):
+        rules.scoped(str(cfg.parent / "gone/sub"))
+
+
+def test_a_missing_folders_session_is_still_checked(cfg):
+    write(cfg, '[sessions."{tmp}/gone"]\nrepo = "bad"\nread = ["@nope"]\n')
+    assert len(problems(cfg)) == 2
+    write(cfg, '[sessions."{tmp}/cfg/gone"]\n')
+    assert any("gate-owned" in p for p in problems(cfg))

@@ -188,7 +188,8 @@ class Rules:
     def session_for(self, cwd: str | None) -> Session | None:
         if cwd is None or not Path(cwd).is_absolute():
             return None
-        found = [s for s in self.sessions if Path(cwd).is_relative_to(s.folder)]
+        # A missing folder (a warning when loaded) holds no conversation's cwd, so it never matches.
+        found = [s for s in self.sessions if Path(cwd).is_relative_to(s.folder) and s.folder.is_dir()]
         return max(found, key=lambda s: len(s.folder.parts), default=None)
 
     def level(self, repo: object) -> str | None:
@@ -361,7 +362,7 @@ def _parse_v2(data: dict, forbidden: tuple[Path, ...], problems: list[Problem], 
     sessions: list[Session] = []
     seen: dict[Path, str] = {}
     for folder, entry in _table(data, "sessions", problems).items():
-        session = _parse_session(folder, entry, groups, forbidden, problems)
+        session = _parse_session(folder, entry, groups, forbidden, problems, warnings)
         if session is None:
             continue
         if session.folder in seen:
@@ -375,7 +376,7 @@ def _parse_v2(data: dict, forbidden: tuple[Path, ...], problems: list[Problem], 
             continue
         seen[session.folder] = folder
         sessions.append(session)
-        if not os.path.lexists(session.folder / ".git"):
+        if session.folder.is_dir() and not os.path.lexists(session.folder / ".git"):
             warnings.append(
                 Problem(
                     f"{label('sessions', folder)}: the folder {session.folder} is not a git checkout (it has no .git).",
@@ -493,8 +494,12 @@ def _parse_repo_options(table: dict, problems: list[Problem]) -> dict[str, RepoO
 
 
 def _parse_session(
-    folder: str, entry: object, groups: dict[str, tuple[str, ...]], forbidden: tuple[Path, ...], problems: list[Problem]
-) -> Session | None:
+    folder: str, entry: object, groups: dict[str, tuple[str, ...]], forbidden: tuple[Path, ...],
+    problems: list[Problem], warnings: list[Problem],
+) -> Session | None:  # fmt: skip
+    """A session, or None if it has problems. A folder that does not exist is only a warning: no
+    cwd can lie inside it, so its session matches no call, and deleting one project folder must not
+    refuse every other session's calls."""
     named = label("sessions", folder)
     where = ("sessions", folder)
     count = len(problems)
@@ -510,10 +515,10 @@ def _parse_session(
                 problems.append(Problem(f"{named}: the folder {real} overlaps gate-owned {f}.", where))
                 break
         if not real.is_dir():
-            problems.append(
+            warnings.append(
                 Problem(
-                    f"{named}: the folder {real} does not exist or is not a directory. If the project is gone, "
-                    f"remove the session with: gitgaterules remove-session {folder}",
+                    f"{named}: the folder {real} does not exist or is not a directory, so the session matches "
+                    f"no conversation. If the project is gone, remove it with: gitgaterules remove-session {folder}",
                     where,
                 )
             )

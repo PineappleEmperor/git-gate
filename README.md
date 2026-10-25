@@ -117,11 +117,12 @@ push_deploys = true
   one `pineapple` group of every site, read by each site's session, gives each write to its own repo
   and read to the rest. Naming the same repo in both `read` and `write` of one session is an error.
 - `repo` may be left out for a session that only gets grants.
-- Session folders must be absolute, exist, and stay clear of `~/.config/git-gate`,
-  `~/.local/state/git-gate` and `/opt/git-gate`. A session whose folder is deleted makes the whole
-  file invalid, so every call is refused until `gitgaterules remove-session <folder>`.
+- Session folders must be absolute and stay clear of `~/.config/git-gate`,
+  `~/.local/state/git-gate` and `/opt/git-gate`. A folder that does not exist is only a warning
+  (`gitgaterules check` names `gitgaterules remove-session <folder>`): its session simply matches
+  nothing.
 - Every problem refuses every call: an unknown key, a repo not written owner/name, an unknown or
-  recursive group, a bad folder, a folder listed twice.
+  recursive group, a relative or gate-owned folder, a folder listed twice.
 - `gitgatepush` is yours and is not scoped.
 - A file without `[sessions]` is v1 (`workspaces` plus `[repos]` with `access`, format in
   [docs/plan.md](docs/plan.md#config)) and works as before: every conversation reaches every repo in
