@@ -846,6 +846,7 @@ def test_main_rolls_the_audit_log_over(env, m, rules, checkout):
     h = stage(env, m, rules, checkout)
     log.write_text("x" * MAX_AUDIT)  # staging went through the gate, which wrote its own line
     assert run(env, [str(h.id)], "y\n")[0] == 0
-    assert (env.state / "audit.log.1").read_text() == "x" * MAX_AUDIT
+    [old] = env.state.glob("audit.log.*")
+    assert old.read_text() == "x" * MAX_AUDIT
     assert [line["outcome"] for line in audit_lines(env)] == ["pushed"]
     assert stat.S_IMODE(log.stat().st_mode) == 0o600

@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -159,24 +160,33 @@ def test_an_unwritable_audit_log_does_not_fail_the_call(env):
     assert "audit.log" in (env.state / "errors.log").read_text()
 
 
+def rotated(env) -> list[str]:
+    return sorted(p.name for p in env.state.glob("audit.log.*"))
+
+
 def test_audit_log_is_private_and_rolls_over(env):
     log = env.state / "audit.log"
     log.write_text("x" * MAX_AUDIT)
     log.chmod(0o644)  # written by a release from before the roll-over
     env.gate.call("prune", ok, repo="me/app")
-    assert (env.state / "audit.log.1").read_text() == "x" * MAX_AUDIT
+    [old] = rotated(env)
+    assert re.fullmatch(r"audit\.log\.\d{8}T\d{6}", old)
+    assert (env.state / old).read_text() == "x" * MAX_AUDIT
     assert [line["outcome"] for line in audit_lines(env)] == ["ok"]
     assert oct(log.stat().st_mode & 0o777) == "0o600"
     env.gate.call("prune", ok, repo="me/app")
     assert len(audit_lines(env)) == 2  # below the limit, it appends
 
 
-def test_audit_log_keeps_one_old_file(env, monkeypatch):
+def test_audit_log_rotation_never_deletes(env, monkeypatch):
     monkeypatch.setattr(call, "MAX_AUDIT", 1)
-    for _ in range(3):
-        env.gate.call("prune", ok, repo="me/app")
-    assert sorted(p.name for p in env.state.glob("audit.log*")) == ["audit.log", "audit.log.1"]
-    assert len(audit_lines(env)) == 1
+    monkeypatch.setattr(call, "_stamp", lambda: "20261025T120000")
+    for branch in "abcd":
+        env.gate.call("prune", ok, repo="me/app", branch=branch)
+    names = ["audit.log.20261025T120000", "audit.log.20261025T120000.1", "audit.log.20261025T120000.2"]
+    assert rotated(env) == names
+    kept = [json.loads((env.state / name).read_text())["args"]["branch"] for name in names]
+    assert kept + [audit_lines(env)[0]["args"]["branch"]] == list("abcd")
 
 
 # --- capped arguments ------------------------------------------------------------------------

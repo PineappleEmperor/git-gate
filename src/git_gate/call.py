@@ -19,7 +19,7 @@ from git_gate.config import state_dir
 # The only list of tool names: the server registers exactly these, and Gate.dispatch accepts only these.
 TOOLS = ("clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label")
 MAX_LOG = 1 << 20  # errors.log rolls over to errors.log.1 at this size
-MAX_AUDIT = 8 << 20  # audit.log rolls over to audit.log.1 at this size
+MAX_AUDIT = 8 << 20  # audit.log is moved aside to audit.log.<time> at this size; nothing deletes those
 
 
 def append(log: Path, text: str, limit: int) -> None:
@@ -30,15 +30,39 @@ def append(log: Path, text: str, limit: int) -> None:
             os.replace(log, log.with_name(log.name + ".1"))
     except FileNotFoundError:
         pass
+    _write(log, text)
+
+
+def audit(state: Path, line: str) -> None:
+    """One line to <state>/audit.log, which the gate's tool calls and gitgatepush share. Raises OSError.
+
+    A full log is moved aside under a name no file has yet, never over one: the gate keeps all of
+    its audit history, so an agent that fills the log quickly cannot push old lines out of it.
+    """
+    log = state / "audit.log"
+    try:
+        full = log.stat().st_size >= MAX_AUDIT
+    except FileNotFoundError:
+        full = False
+    if full:
+        base = f"{log.name}.{_stamp()}"
+        name, n = base, 0
+        while os.path.lexists(log.with_name(name)):
+            n += 1
+            name = f"{base}.{n}"
+        os.rename(log, log.with_name(name))
+    _write(log, line + "\n")
+
+
+def _write(log: Path, text: str) -> None:
     fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8", errors="replace") as f:
         os.fchmod(fd, 0o600)  # a log written before this release may be world-readable
         f.write(text)
 
 
-def audit(state: Path, line: str) -> None:
-    """One line to <state>/audit.log, which the gate's tool calls and gitgatepush share. Raises OSError."""
-    append(state / "audit.log", line + "\n", MAX_AUDIT)
+def _stamp() -> str:
+    return time.strftime("%Y%m%dT%H%M%S")
 
 
 def log_error(text: str) -> Path | None:
