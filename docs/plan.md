@@ -115,6 +115,10 @@ gh_timeout_seconds = 1800
 Workspaces may not overlap `~/.config/git-gate`, `~/.local/state/git-gate` or `/opt/git-gate`.
 Both files are re-read on every call, so edits apply without a restart.
 
+This is the v1 format. A file with `[sessions]` is v2, which scopes each conversation to its own
+project folder and repo; see the README's [Configure](../README.md#configure) section and the rework
+design's [Session scoping](superpowers/specs/2026-10-25-gate-rework-design.md#session-scoping).
+
 ## Install layout
 
 `install.sh install <sha>` is run by the user from their own terminal, not by an agent. The dev

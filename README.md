@@ -74,14 +74,105 @@ relay release need one restart, to replace their old server.
 
 ## Configure
 
-`~/.config/git-gate/token` (mode 0600) and `~/.config/git-gate/rules.toml`; format in
-[docs/plan.md](docs/plan.md#config) and, for per-repo `handover_paths` and `push_deploys`, the
-[rework design](docs/superpowers/specs/2026-10-25-gate-rework-design.md#rules-file). While
-`~/.config/git-gate/disabled` exists, every call is refused. Register once:
+`~/.config/git-gate/token` (mode 0600) and `~/.config/git-gate/rules.toml`, both re-read on every
+call. While `~/.config/git-gate/disabled` exists, every call is refused. Register once:
 
 ```bash
 claude mcp add --scope user git-gate -- /opt/git-gate/current/bin/git-gate
 ```
+
+### Sessions
+
+Each Claude Code conversation is sandboxed to one session: its project folder, the folder Claude
+Code was started in. A session reaches its own repo (read and write), the repos you grant it, and
+nothing else, for reads as well as writes. Its folder is its only workspace: bundles, body files,
+clone targets and downloads must be inside it. A worktree or subfolder belongs to the session of the
+longest session folder that holds it, so `<folder>/.tmp/wt-x` is `<folder>`'s. A conversation whose
+folder is no session's, or is unknown, reaches nothing; the refusal names the folder and the
+`gitgaterules` command that would grant it.
+
+```toml
+protected_branches = ["main", "master", "release/*"]
+
+[groups]                                     # named repo lists, used as "@name"
+ha-reads = ["home-assistant/core", "PineappleEmperor/release-flow"]
+
+[sessions."/home/juicebox/ha-lego"]
+repo = "PineappleEmperor/ha-lego"            # its own repo: read and write
+read = ["@ha-reads"]                         # read-only grants
+write = []                                   # write grants
+
+[sessions."/home/juicebox/claude-skills"]
+repo = "PineappleEmperor/ha-skills"
+write = ["PineappleEmperor/release-flow", "PineappleEmperor/ha-integration-ci"]
+read = ["@ha-reads"]
+
+[repos."PineappleEmperor/pineapple-core"]    # per-repo options; access is set per session
+handover_paths = []                          # paths added to the default handover paths
+push_deploys = true
+```
+
+- A session's access to a repo is the strongest of its grants: its own `repo` and `write` grants
+  write, `read` grants read. Groups may hold other groups, and a group may hold a session's own repo:
+  one `pineapple` group of every site, read by each site's session, gives each write to its own repo
+  and read to the rest. Naming the same repo in both `read` and `write` of one session is an error.
+- `repo` may be left out for a session that only gets grants.
+- Session folders must be absolute, exist, and stay clear of `~/.config/git-gate`,
+  `~/.local/state/git-gate` and `/opt/git-gate`. A session whose folder is deleted makes the whole
+  file invalid, so every call is refused until `gitgaterules remove-session <folder>`.
+- Every problem refuses every call: an unknown key, a repo not written owner/name, an unknown or
+  recursive group, a bad folder, a folder listed twice.
+- `gitgatepush` is yours and is not scoped.
+- A file without `[sessions]` is v1 (`workspaces` plus `[repos]` with `access`, format in
+  [docs/plan.md](docs/plan.md#config)) and works as before: every conversation reaches every repo in
+  `[repos]` and every workspace. `gitgaterules check` warns that it is not scoped.
+
+### gitgaterules
+
+Run it in your own terminal; the gate has no tool for it.
+
+```bash
+gitgaterules check [FILE]          # every problem, with line numbers; or "OK: N sessions, M repos"
+gitgaterules show                  # each session's repos, read or write, groups expanded
+gitgaterules grant <folder> read|write <repo|@group>
+gitgaterules revoke <folder> <repo|@group>
+gitgaterules add-session <folder> [--repo <owner/name>]
+gitgaterules remove-session <folder>
+gitgaterules group <name> add|remove <repo|@group>
+gitgaterules migrate [--write]
+```
+
+`check` also warns about a session folder that is not a git checkout. It does not ask GitHub
+whether the token covers a repo.
+
+Every edit builds the new file, checks it with the gate's own loader, and writes only a file that
+loads: it keeps the old one as `rules.toml.bak-<YYYYmmddTHHMMSS>` (0600), replaces `rules.toml`
+atomically (0600), and prints the diff. A symlinked `rules.toml` is written through. The file is
+written in one fixed, sorted order with a header saying `gitgaterules` manages it, and **comments are
+not kept**: keep notes elsewhere, or edit by hand and run `gitgaterules check`. Backups pile up;
+delete old ones yourself.
+
+### Moving from v1
+
+1. Install this release, then run `gitgaterules check`: it warns the file is v1.
+2. Run `gitgaterules migrate` and read the result and its judgements. Each workspace becomes a
+   session. Its git origin, read from that checkout's own config only, is just a suggestion for its
+   own repo, since agents working there can change it: a v1 `write` repo is proposed, a `read` repo
+   stays read-only, and a repo not in v1 is left out. The v1 `read` repos become group `reads`, read
+   by every session. A v1 `write` repo no workspace is paired with gets no session: grant it where it
+   belongs. `handover_paths` and `push_deploys` are kept.
+3. Run `gitgaterules migrate --write`. It asks about each proposed pairing, no by default. A repo two
+   folders claim, or a folder whose `.git` leads outside it (a worktree, a submodule, a symlink),
+   needs the repo's name typed. Without a terminal, name the pairings you confirm:
+   `gitgaterules migrate --write --yes-pairings <folder>=<owner/name> ...`. An unconfirmed pairing
+   leaves the session without a repo of its own.
+4. Add the write grants migrate reported as left out (`gitgaterules grant <folder> write <repo>`),
+   then `gitgaterules show` to read the result.
+5. Files a session hands the gate must now be inside its own folder. A conversation started outside
+   every session folder, such as in your home folder, reaches nothing.
+
+Releases from before session rules refuse every call while `rules.toml` is v2. To roll back to one,
+restore the v1 backup first.
 
 ## Audit log
 
