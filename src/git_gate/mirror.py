@@ -244,9 +244,9 @@ class Mirror:
                 repo, rules,
                 ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", _oid(fork), _oid(sha)],
             ).stdout  # fmt: skip
-            if any(_matches(p, patterns) for p in out.split("\0") if p):
+            if any(matches(p, patterns) for p in out.split("\0") if p):
                 hits = [sha]
-        if sha not in hits and any(_link_reaches(p, patterns) for p in self._symlinks(repo, sha, rules)):
+        if sha not in hits and any(link_reaches(p, patterns) for p in self._symlinks(repo, sha, rules)):
             hits.append(sha)
         return hits
 
@@ -273,9 +273,9 @@ class Mirror:
         for token in tokens:
             if token in wanted:
                 current = token
-            elif current and current not in hits and _matches(token, patterns):
+            elif current and current not in hits and matches(token, patterns):
                 hits.append(current)
-        if not hits and any(t not in wanted and _matches(t, patterns) for t in tokens):
+        if not hits and any(t not in wanted and matches(t, patterns) for t in tokens):
             hits.append(shas[0])  # output git framed in a way this parser did not expect: fail closed
         return hits
 
@@ -302,7 +302,7 @@ def _literal(pattern: str) -> str:
     return "/".join(takewhile(lambda part: not GLOB.search(part), pattern.split("/")))
 
 
-def _matches(path: str, patterns) -> bool:
+def matches(path: str, patterns) -> bool:
     """`PurePosixPath.full_match` ignoring case, plus a file where a pattern's directory would be."""
     path = path.casefold()
     p = PurePosixPath(path)
@@ -315,13 +315,13 @@ def _matches(path: str, patterns) -> bool:
     return False
 
 
-def _link_reaches(path: str, patterns) -> bool:
+def link_reaches(path: str, patterns) -> bool:
     """A symlink that matches any leading-component prefix of a pattern can lead into a handover path.
 
     For `skills/*/skill.md` that is `skills`, `skills/*` or the whole pattern; a pattern starting
     with `**` is reached by every symlink.
     """
-    if _matches(path, patterns):
+    if matches(path, patterns):
         return True
     p = PurePosixPath(path.casefold())
     for pattern in map(_normalise, patterns):

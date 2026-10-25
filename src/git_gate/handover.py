@@ -22,12 +22,11 @@ from pathlib import Path
 from git_gate import Refused
 from git_gate.config import DEFAULT_HANDOVER_PATHS, REPO_RE, Rules, load_rules, state_dir
 from git_gate.gitops import MAX_STDERR, Git
-from git_gate.mirror import OID, Mirror, _matches
+from git_gate.mirror import OID, Mirror, link_reaches, matches
 
 EXPIRES = 14 * 24 * 3600
 MAX_LOG = 50
 MAX_FILES = 100
-MAX_FORKS = 50
 ID_RE = re.compile(r"^[0-9]{1,9}$")
 USAGE = "usage: gitgatepush [<id>]"
 MAX_ID = 10**9 - 1
@@ -288,12 +287,19 @@ def _require_commit(mirror: Mirror, h: Handover, mirror_dir: Path, rules: Rules)
         )
 
 
-def _handover_paths(repo: str) -> tuple[str, ...]:
-    """The repo's handover patterns from rules.toml; the defaults when the rules cannot be loaded."""
+def _handover_paths(repo: str) -> tuple[tuple[str, ...], str | None]:
+    """The repo's handover patterns from rules.toml, and a note when the defaults stand in for them.
+
+    Any failure to load the rules falls back to the defaults, however the file is broken: this
+    runs in the user's terminal and must neither crash nor show less than the defaults would.
+    """
     try:
-        return load_rules().repo(repo).handover_paths
-    except Refused, OSError:
-        return DEFAULT_HANDOVER_PATHS
+        return load_rules().repo(repo).handover_paths, None
+    except Refused as e:
+        why = str(e).splitlines()[0] if str(e) else "Refused"
+    except Exception as e:
+        why = type(e).__name__
+    return DEFAULT_HANDOVER_PATHS, f"Note: rules.toml could not be used ({why}); using the default handover paths."
 
 
 def _show(mirror: Mirror, h: Handover, mirror_dir: Path, rules: Rules) -> str:
@@ -308,44 +314,58 @@ def _show(mirror: Mirror, h: Handover, mirror_dir: Path, rules: Rules) -> str:
             raise Refused(f"Could not show handover {h.id}:\n{proc.stderr.strip()[-MAX_STDERR:]}")
         return proc.stdout
 
-    # No base means a new branch: everything no mirrored branch already has.
-    new = [f"{h.base}..{h.sha}"] if h.base else [h.sha, "--not", "--branches"]
-    total = int(out(["rev-list", "--count", *new]).strip())
-    start = h.base or _fork_point(out, h, total)
+    # With no base the push is compared with nothing: what other mirrored branches hold is not
+    # assumed to be on GitHub's side of the target, since an agent can push those branches too.
+    new = [f"{h.base}..{h.sha}"] if h.base else [h.sha]
+    start = h.base or out(["hash-object", "-t", "tree", "--stdin"], stdin="").strip()
+    shas = out(["rev-list", *new]).split()
 
     commits = out(["log", "--oneline", "--no-decorate", f"--max-count={MAX_LOG}", *new]).rstrip()
-    if total > MAX_LOG:
-        commits += f"\n... and {total - MAX_LOG} more commits not shown"
+    if len(shas) > MAX_LOG:
+        commits += f"\n... and {len(shas) - MAX_LOG} more commits not shown"
 
     diff = ["--no-renames", start, h.sha, "--"]
     names = [f for f in out(["diff", "--name-only", "-z", *diff]).split("\0") if f]
-    patterns = _handover_paths(h.repo)
-    protected = [_clean(f) for f in names if _matches(f, patterns)]
     stat = out(["diff", "--stat=500,400", f"--stat-count={MAX_FILES}", *diff]).rstrip().splitlines()
     if len(names) > MAX_FILES:
         more = f" \u2026 and {len(names) - MAX_FILES} more files not listed"
         stat = [more if line.strip() == "..." else line for line in stat]
+
+    patterns, note = _handover_paths(h.repo)
+    protected = _protected(out, shas, h.sha, patterns)
     sections = [commits]
+    if note:
+        sections.append(note)
     if protected:
-        sections.append(f"Files under handover paths ({len(protected)}):\n" + "\n".join(f"  {f}" for f in protected))
+        listing = "\n".join(f"  {f}" for f in protected)
+        sections.append(f"Files under handover paths ({len(protected)}):\n{listing}")
+    if not h.base:
+        sections.append("No base was recorded, so this lists everything in the commit's history.")
     sections.append("\n".join(stat))
     return "\n\n".join(p for p in sections if p) or "(no new commits)"
 
 
-def _fork_point(out, h: Handover, total: int) -> str:
-    """Where a new branch leaves the mirror's branches, so only its own changes are compared.
+def _protected(out, shas: list[str], tip: str, patterns: tuple[str, ...]) -> list[str]:
+    """Every handover-path file any pushed commit touched, plus the tip's symlinks that reach one.
 
-    That is the nearest commit the new ones build on that a mirrored branch already has. The empty
-    tree is used only when the mirror has no branches or the history shares nothing with them.
+    Each commit is diffed on its own (merges dense-combined), the way `Mirror.touched` does, so a
+    file changed and changed back inside the push still shows. Every output token is tested, not
+    only the ones that look like file names, so a file named like a commit cannot slip by.
     """
-    empty = out(["hash-object", "-t", "tree", "--stdin"], stdin="").strip()
-    if not out(["for-each-ref", "--count=1", "--format=%(refname)", "refs/heads/"]).strip():
-        return empty
-    listed = out(["rev-list", "--boundary", h.sha, "--not", "--branches"]).splitlines()
-    forks = [line[1:] for line in listed if line.startswith("-")][:MAX_FORKS]
-    if not forks:
-        return h.sha if total == 0 else empty  # nothing new, or history unrelated to every branch
-    return min(forks, key=lambda f: int(out(["rev-list", "--count", f"{f}..{h.sha}"]).strip()))
+    found: dict[str, str] = {}
+    if shas:
+        tokens = out(
+            ["diff-tree", "--stdin", "-z", "-r", "--no-renames", "--name-only", "--cc", "--root"],
+            stdin="\n".join(shas) + "\n",
+        ).split("\0")
+        for token in tokens:
+            if token and matches(token, patterns):
+                found.setdefault(token, _clean(token))
+    for entry in out(["ls-tree", "-r", "-z", "--full-tree", tip]).split("\0"):
+        meta, _, path = entry.partition("\t")
+        if meta.startswith("120000 ") and link_reaches(path, patterns):
+            found[path] = _clean(path) + "  (symlink)"
+    return list(found.values())
 
 
 def _clean(text: str, *, lines: bool = False) -> str:
