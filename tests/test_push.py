@@ -179,7 +179,7 @@ def _setup_extra_path(env, checkout):
     )
     git("switch", "-q", "-c", "skill", cwd=checkout)
     commit(checkout, "skills/x/SKILL.md", "new")
-    return "skill", "skills/**", main_sha(env), None
+    return "skill", "skills", main_sha(env), None
 
 
 @pytest.mark.parametrize(

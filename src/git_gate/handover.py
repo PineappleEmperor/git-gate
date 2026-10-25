@@ -22,7 +22,7 @@ from pathlib import Path
 from git_gate import Refused
 from git_gate.config import DEFAULT_HANDOVER_PATHS, REPO_RE, Rules, load_rules, state_dir
 from git_gate.gitops import MAX_STDERR, Git
-from git_gate.mirror import OID, Mirror, link_reaches, matches
+from git_gate.mirror import OID, Mirror, protected, reaches
 
 EXPIRES = 14 * 24 * 3600
 MAX_LOG = 50
@@ -359,11 +359,11 @@ def _protected(out, shas: list[str], tip: str, patterns: tuple[str, ...]) -> lis
             stdin="\n".join(shas) + "\n",
         ).split("\0")
         for token in tokens:
-            if token and matches(token, patterns):
+            if token and protected(token, patterns):
                 found.setdefault(token, _clean(token))
     for entry in out(["ls-tree", "-r", "-z", "--full-tree", tip]).split("\0"):
         meta, _, path = entry.partition("\t")
-        if meta.startswith("120000 ") and link_reaches(path, patterns):
+        if meta.startswith("120000 ") and reaches(path, patterns):
             found[path] = _clean(path) + "  (symlink)"
     return list(found.values())
 

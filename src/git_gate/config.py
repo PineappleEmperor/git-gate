@@ -11,9 +11,44 @@ from git_gate import Refused
 
 REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
 ACCESS_LEVELS = ("read", "write")
-DEFAULT_HANDOVER_PATHS = (".github/workflows/**", ".githooks/**", ".pre-commit-config.yaml")
 REPO_KEYS = ("access", "handover_paths", "push_deploys")
+TOP_KEYS = ("workspaces", "protected_branches", "repos", "git_timeout_seconds", "gh_timeout_seconds")
+MAX_TIMEOUT = 86400
 OFF_SWITCH_MESSAGE = "git-gate is switched off: remove ~/.config/git-gate/disabled to turn it back on."
+
+
+def canonical_pattern(pattern: str) -> str:
+    """The one form a handover pattern is matched in: case-folded, anchored at the repository root.
+
+    Empty and "." segments are dropped (so a leading "/", "./" or "//" is harmless), and so are
+    trailing "**" segments, since a pattern covers everything below what it names anyway. What is
+    left empty means everything, stored as "**". Anything that could silently match less than it
+    reads as is refused: "..", a backslash, "**" glued to other characters, unprintable text.
+    """
+    if not isinstance(pattern, str) or not pattern:
+        raise Refused(f"handover pattern {pattern!r} is empty.")
+    if not pattern.isprintable():
+        raise Refused(f"handover pattern {pattern!r} has unprintable characters.")
+    if "\\" in pattern:
+        raise Refused(f"handover pattern {pattern!r} has a backslash; separate directories with /.")
+    parts = pattern.casefold().split("/")
+    if ".." in parts:
+        raise Refused(f"handover pattern {pattern!r} has a '..' segment.")
+    if any("**" in part and part != "**" for part in parts):
+        raise Refused(f"handover pattern {pattern!r} has '**' inside a segment; use it as a whole segment.")
+    parts = [part for part in parts if part not in ("", ".")]
+    while parts and parts[-1] == "**":
+        parts.pop()
+    return "/".join(parts) or "**"
+
+
+DEFAULT_HANDOVER_PATHS = tuple(
+    canonical_pattern(p)
+    for p in (
+        ".github/workflows/**", ".githooks/**", ".pre-commit-config.yaml", ".claude/**", ".mcp.json",
+        ".vscode/**", ".idea/**", ".envrc", ".devcontainer/**",
+    )
+)  # fmt: skip
 
 
 def config_dir() -> Path:
@@ -35,7 +70,7 @@ class RepoRules:
 class Rules:
     workspaces: tuple[Path, ...]
     repos: dict[str, RepoRules]  # lower-case "owner/name"
-    protected_branches: tuple[str, ...] = ("main", "master")
+    protected_branches: tuple[str, ...] = ("main", "master")  # fnmatchcase patterns: "*" crosses "/"
     git_timeout: int = 300
     gh_timeout: int = 1800
     forbidden: tuple[Path, ...] = field(default=())
@@ -67,12 +102,30 @@ def _parse_repo(path: Path, name: str, entry: object) -> RepoRules:
     if entry.get("access") not in ACCESS_LEVELS:
         raise Refused(f'{path}: repo {name!r} needs access = "read" or "write".')
     extra = entry.get("handover_paths", [])
-    if not isinstance(extra, list) or not all(isinstance(p, str) and p for p in extra):
+    if not isinstance(extra, list) or not all(isinstance(p, str) for p in extra):
         raise Refused(f"{path}: repo {name!r} handover_paths must be a list of path patterns.")
+    try:
+        patterns = [canonical_pattern(p) for p in extra]
+    except Refused as e:
+        raise Refused(f"{path}: repo {name!r}: {e}") from None
     push_deploys = entry.get("push_deploys", False)
     if not isinstance(push_deploys, bool):
         raise Refused(f"{path}: repo {name!r} push_deploys must be true or false.")
-    return RepoRules(entry["access"], DEFAULT_HANDOVER_PATHS + tuple(extra), push_deploys)
+    return RepoRules(entry["access"], tuple(dict.fromkeys(DEFAULT_HANDOVER_PATHS + tuple(patterns))), push_deploys)
+
+
+def _strings(path: Path, data: dict, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    value = data.get(key, list(default))
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise Refused(f"{path}: {key} must be a list of non-empty strings, got {value!r}.")
+    return tuple(value)
+
+
+def _timeout(path: Path, data: dict, key: str, default: int) -> int:
+    value = data.get(key, default)
+    if type(value) is not int or not 1 <= value <= MAX_TIMEOUT:
+        raise Refused(f"{path}: {key} must be a whole number of seconds from 1 to {MAX_TIMEOUT}, got {value!r}.")
+    return value
 
 
 def check_enabled(cfg: Path | None = None) -> None:
@@ -90,15 +143,23 @@ def load_rules(cfg: Path | None = None, extra_forbidden: tuple[Path, ...] = ()) 
     except tomllib.TOMLDecodeError as e:
         raise Refused(f"{path} is not valid TOML: {e}") from None
 
+    unknown = sorted(set(data) - set(TOP_KEYS))
+    if unknown:
+        raise Refused(f"{path}: unknown top-level keys {unknown}; allowed: {list(TOP_KEYS)}.")
+    table = data.get("repos", {})
+    if not isinstance(table, dict):
+        raise Refused(f"{path}: repos must be a table of owner/name entries.")
     repos = {}
-    for name, entry in data.get("repos", {}).items():
-        if not REPO_RE.match(name):
+    for name, entry in table.items():
+        if not REPO_RE.fullmatch(name):
             raise Refused(f"{path}: bad repo entry {name!r} = {entry!r}.")
+        if name.lower() in repos:
+            raise Refused(f"{path}: repo {name!r} is listed twice (repo names ignore case).")
         repos[name.lower()] = _parse_repo(path, name, entry)
 
     forbidden = tuple(p.resolve() for p in (cfg, state_dir(), Path("/opt/git-gate"), *extra_forbidden))
     workspaces = []
-    for w in data.get("workspaces", []):
+    for w in _strings(path, data, "workspaces", ()):
         wp = Path(w)
         if not wp.is_absolute():
             raise Refused(f"{path}: workspace {w!r} must be absolute.")
@@ -111,9 +172,9 @@ def load_rules(cfg: Path | None = None, extra_forbidden: tuple[Path, ...] = ()) 
     return Rules(
         workspaces=tuple(workspaces),
         repos=repos,
-        protected_branches=tuple(data.get("protected_branches", ("main", "master"))),
-        git_timeout=int(data.get("git_timeout_seconds", 300)),
-        gh_timeout=int(data.get("gh_timeout_seconds", 1800)),
+        protected_branches=_strings(path, data, "protected_branches", ("main", "master")),
+        git_timeout=_timeout(path, data, "git_timeout_seconds", 300),
+        gh_timeout=_timeout(path, data, "gh_timeout_seconds", 1800),
         forbidden=forbidden,
     )
 

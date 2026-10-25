@@ -1,7 +1,10 @@
+import json
+import re
+
 import pytest
 
 from git_gate import Refused
-from git_gate.config import DEFAULT_HANDOVER_PATHS, RepoRules, check_enabled, load_rules
+from git_gate.config import DEFAULT_HANDOVER_PATHS, RepoRules, canonical_pattern, check_enabled, load_rules
 
 
 def write_rules(tmp_path, repos_toml):
@@ -10,7 +13,10 @@ def write_rules(tmp_path, repos_toml):
 
 
 def test_default_handover_paths():
-    assert DEFAULT_HANDOVER_PATHS == (".github/workflows/**", ".githooks/**", ".pre-commit-config.yaml")
+    assert DEFAULT_HANDOVER_PATHS == (
+        ".github/workflows", ".githooks", ".pre-commit-config.yaml", ".claude", ".mcp.json", ".vscode", ".idea",
+        ".envrc", ".devcontainer",
+    )  # fmt: skip
 
 
 def test_string_form_still_works(tmp_path):
@@ -27,7 +33,7 @@ def test_table_form(tmp_path):
     )
     repo = load_rules(cfg).repo("me/app")
     assert repo.access == "write"
-    assert repo.handover_paths == DEFAULT_HANDOVER_PATHS + ("skills/**",)
+    assert repo.handover_paths == DEFAULT_HANDOVER_PATHS + ("skills",)
     assert repo.push_deploys is True
 
 
@@ -71,3 +77,69 @@ def test_off_switch(tmp_path):
     with pytest.raises(Refused) as e:
         check_enabled(tmp_path)
     assert str(e.value) == "git-gate is switched off: remove ~/.config/git-gate/disabled to turn it back on."
+
+
+# --- handover patterns are canonical --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "canonical"),
+    [
+        ("skills", "skills"),
+        ("skills/", "skills"),
+        ("skills/**", "skills"),
+        ("/Skills/**", "skills"),
+        ("./skills//**", "skills"),
+        (".github/workflows/**", ".github/workflows"),
+        ("**", "**"),
+        ("/", "**"),
+        ("skills/*/SKILL.md", "skills/*/skill.md"),
+    ],
+)
+def test_handover_patterns_are_canonical(tmp_path, raw, canonical):
+    assert canonical_pattern(raw) == canonical
+    cfg = write_rules(tmp_path, f'"me/app" = {{ access = "write", handover_paths = [{json.dumps(raw)}] }}')
+    paths = load_rules(cfg).repo("me/app").handover_paths
+    assert canonical in paths and len(paths) == len(set(paths))
+
+
+@pytest.mark.parametrize("raw", ["a/../b", "a\\b", "a/**b", "", "a\x00b", "a\nb", "a\u202eb"])
+def test_bad_handover_patterns_refused(tmp_path, raw):
+    cfg = write_rules(tmp_path, f'"me/app" = {{ access = "write", handover_paths = [{json.dumps(raw)}] }}')
+    with pytest.raises(Refused) as e:
+        load_rules(cfg)
+    assert "me/app" in str(e.value) and repr(raw) in str(e.value)
+    with pytest.raises(Refused):
+        canonical_pattern(raw)
+
+
+# --- the rules schema is strict -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("toml", "key"),
+    [
+        ('workspaces = []\nprotected_branches = "main"\n[repos]\n', "protected_branches"),
+        ("workspaces = []\nprotected_branch = []\n[repos]\n", "protected_branch"),
+        ('workspaces = "/x"\n[repos]\n', "workspaces"),
+        ("workspaces = []\ngit_timeout_seconds = true\n[repos]\n", "git_timeout_seconds"),
+        ("workspaces = []\ngit_timeout_seconds = 0\n[repos]\n", "git_timeout_seconds"),
+        ('workspaces = []\ngit_timeout_seconds = "5"\n[repos]\n', "git_timeout_seconds"),
+        ("workspaces = []\ngh_timeout_seconds = 86401\n[repos]\n", "gh_timeout_seconds"),
+        ("workspaces = [5]\n[repos]\n", "workspaces"),
+        ('workspaces = []\nprotected_branches = [""]\n[repos]\n', "protected_branches"),
+        ("workspaces = []\nrepos = 5\n", "repos"),
+        ('workspaces = []\n[repos]\n"Me/App" = "write"\n"me/app" = "read"\n', "me/app"),
+        ('workspaces = []\n[repos]\n"me/app\\n" = "write"\n', "me/app"),
+    ],
+)
+def test_rules_schema_is_strict(tmp_path, toml, key):
+    (tmp_path / "rules.toml").write_text(toml)
+    with pytest.raises(Refused, match=re.compile(re.escape(key), re.IGNORECASE)):
+        load_rules(tmp_path)
+
+
+def test_timeouts_in_range_load(tmp_path):
+    (tmp_path / "rules.toml").write_text("workspaces = []\ngit_timeout_seconds = 1\ngh_timeout_seconds = 86400\n")
+    rules = load_rules(tmp_path)
+    assert (rules.git_timeout, rules.gh_timeout, rules.repos) == (1, 86400, {})

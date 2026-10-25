@@ -12,7 +12,6 @@ import shutil
 import stat
 import subprocess
 from contextlib import contextmanager
-from itertools import takewhile
 from pathlib import Path, PurePosixPath
 
 from git_gate import Refused
@@ -24,7 +23,6 @@ INIT_TIMEOUT = 60
 INCOMING = "refs/gate/incoming/"
 HANDOVER_REF = re.compile(r"^refs/gate/handover/[0-9]+$")
 OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-GLOB = re.compile(r"[*?\[]")
 MISSING_PREREQS = ("lacks these prerequisite commits", "Repository lacks")
 BUNDLE_HOWTO = "git bundle create <file> {branch} --not --remotes=origin"
 
@@ -244,9 +242,9 @@ class Mirror:
                 repo, rules,
                 ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", _oid(fork), _oid(sha)],
             ).stdout  # fmt: skip
-            if any(matches(p, patterns) for p in out.split("\0") if p):
+            if any(protected(p, patterns) for p in out.split("\0") if p):
                 hits = [sha]
-        if sha not in hits and any(link_reaches(p, patterns) for p in self._symlinks(repo, sha, rules)):
+        if sha not in hits and any(reaches(p, patterns) for p in self._symlinks(repo, sha, rules)):
             hits.append(sha)
         return hits
 
@@ -273,9 +271,9 @@ class Mirror:
         for token in tokens:
             if token in wanted:
                 current = token
-            elif current and current not in hits and matches(token, patterns):
+            elif current and current not in hits and protected(token, patterns):
                 hits.append(current)
-        if not hits and any(t not in wanted and matches(t, patterns) for t in tokens):
+        if not hits and any(t not in wanted and protected(t, patterns) for t in tokens):
             hits.append(shas[0])  # output git framed in a way this parser did not expect: fail closed
         return hits
 
@@ -289,46 +287,30 @@ class Mirror:
         self._git(repo, rules, ["update-ref", "-d", _handover_ref(ref)])
 
 
-def _normalise(pattern: str) -> str:
-    """Case-folded, without "./" or "/" segments; a trailing "/" (or nothing at all) means everything below."""
-    parts = [part for part in pattern.casefold().split("/") if part not in ("", ".")]
-    if pattern.endswith("/") or not parts:
-        parts.append("**")
-    return "/".join(parts)
+def protected(path: str, patterns) -> bool:
+    """Whether `path` (as git prints it) is under a canonical handover pattern, ignoring case.
 
-
-def _literal(pattern: str) -> str:
-    """A normalised pattern's leading components up to the first glob (all of it if there is none)."""
-    return "/".join(takewhile(lambda part: not GLOB.search(part), pattern.split("/")))
-
-
-def matches(path: str, patterns) -> bool:
-    """`PurePosixPath.full_match` ignoring case, plus a file where a pattern's directory would be."""
-    path = path.casefold()
-    p = PurePosixPath(path)
-    for pattern in map(_normalise, patterns):
-        if p.full_match(pattern):
-            return True
-        literal = _literal(pattern)
-        if literal and literal != pattern and path == literal:
-            return True
-    return False
-
-
-def link_reaches(path: str, patterns) -> bool:
-    """A symlink that matches any leading-component prefix of a pattern can lead into a handover path.
-
-    For `skills/*/skill.md` that is `skills`, `skills/*` or the whole pattern; a pattern starting
-    with `**` is reached by every symlink.
+    A pattern covers what it names and everything below it, as a gitignore directory rule does:
+    `path` or any of its leading parts must `full_match` it. Patterns are anchored at the root.
     """
-    if matches(path, patterns):
+    parts = path.casefold().split("/")
+    prefixes = [PurePosixPath("/".join(parts[:k])) for k in range(1, len(parts) + 1)]
+    return any(pattern == "**" or any(p.full_match(pattern) for p in prefixes) for pattern in patterns)
+
+
+def reaches(path: str, patterns) -> bool:
+    """Whether a symlink or gitlink at `path` can lead into a handover path.
+
+    True when `path` is protected itself, or matches a leading part of a pattern: for
+    `skills/*/skill.md` that is `skills` or `skills/*`. A pattern starting with `**` is reached by
+    every link.
+    """
+    if protected(path, patterns):
         return True
     p = PurePosixPath(path.casefold())
-    for pattern in map(_normalise, patterns):
+    for pattern in patterns:
         parts = pattern.split("/")
-        if parts[0] == "**":
-            return True
-        if any(p.full_match("/".join(parts[:i])) for i in range(1, len(parts) + 1)):
+        if parts[0] == "**" or any(p.full_match("/".join(parts[:k])) for k in range(1, len(parts) + 1)):
             return True
     return False
 

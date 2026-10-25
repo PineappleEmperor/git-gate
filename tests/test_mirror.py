@@ -6,9 +6,9 @@ import pytest
 
 from conftest import TOKEN, commit, git
 from git_gate import Refused
-from git_gate.config import DEFAULT_HANDOVER_PATHS, load_rules
+from git_gate.config import DEFAULT_HANDOVER_PATHS, canonical_pattern, load_rules
 from git_gate.gitops import Git
-from git_gate.mirror import Mirror
+from git_gate.mirror import Mirror, protected, reaches
 
 REPO = "me/app"
 
@@ -37,6 +37,51 @@ def seed_push(env, path: str, content: str = "x") -> str:
     sha = commit(seed, path, content)
     git("push", "-q", env.url, "main", cwd=seed)
     return sha
+
+
+def canon(*patterns: str) -> tuple[str, ...]:
+    return tuple(canonical_pattern(p) for p in patterns)
+
+
+# --- matching ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("path", "pattern", "expected"),
+    [
+        ("skills/x", "skills", True),
+        ("skillsx", "skills", False),
+        (".github/workflows", None, True),
+        (".GitHub/Workflows/ci.yml", None, True),
+        ("x/.pre-commit-config.yaml", None, False),
+        (".github/workflows/a.yml", ".github/*", True),
+        ("skills/a/b/c", "skills/*/b", True),
+        ("anything", "**", True),
+        (".claude/settings.json", None, True),
+        (".mcp.json", None, True),
+        (".vscode/tasks.json", None, True),
+        (".github/dependabot.yml", None, False),
+    ],
+)
+def test_protected_table(path, pattern, expected):
+    patterns = DEFAULT_HANDOVER_PATHS if pattern is None else canon(pattern)
+    assert protected(path, patterns) is expected
+
+
+@pytest.mark.parametrize(
+    ("path", "pattern", "expected"),
+    [
+        (".github", None, True),
+        (".githooks", None, True),
+        ("skills/x", "skills/*/hooks/**", True),
+        ("docs", None, False),
+        ("a/b", "**/hooks", True),
+        ("skills/x/y", "skills/*.md", False),
+    ],
+)
+def test_reaches_table(path, pattern, expected):
+    patterns = DEFAULT_HANDOVER_PATHS if pattern is None else canon(pattern)
+    assert reaches(path, patterns) is expected
 
 
 # --- path, sync ----------------------------------------------------------------------------
@@ -475,18 +520,22 @@ def test_touched_ignores_replace_refs(env, m, rules, checkout):
 def test_touched_patterns(env, m, rules, checkout, path, extra, hit):
     git("switch", "-q", "-c", "topic", cwd=checkout)
     sha = commit(checkout, path)
-    _, hits = _touched(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + extra)
+    _, hits = _touched(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + canon(*extra))
     assert hits == ([sha] if hit else [])
 
 
 def test_touched_pattern_directory_as_file(env, m, rules, checkout):
-    """A file at the pattern's directory (`.github/workflows` itself) is a handover path too."""
+    """A file at the pattern's directory (`.github/workflows` itself) is a handover path too.
+
+    A regular file `skills` cannot hold anything `skills/*.md` names, so it is not one (a symlink
+    there would be: see `reaches`).
+    """
     git("switch", "-q", "-c", "topic", cwd=checkout)
     sha = commit(checkout, ".github/workflows", "not a directory")
     assert _touched(env, m, rules, checkout, "topic")[1] == [sha]
     git("switch", "-q", "-c", "sk", "main", cwd=checkout)
-    sha = commit(checkout, "skills", "file")
-    assert _touched(env, m, rules, checkout, "sk", ("skills/*.md",))[1] == [sha]
+    commit(checkout, "skills", "file")
+    assert _touched(env, m, rules, checkout, "sk", canon("skills/*.md"))[1] == []
 
 
 # --- push, handover refs -------------------------------------------------------------------
@@ -608,7 +657,7 @@ def test_touched_symlink_matching_extra_pattern_case_insensitively(env, m, rules
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "real/x.md")
     sha = link(checkout, "Skills", "real")
-    assert _touched(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + ("skills/**",))[1] == [sha]
+    assert _touched(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + canon("skills/**"))[1] == [sha]
 
 
 def test_touched_ordinary_symlinks_pass(env, m, rules, checkout):
@@ -637,5 +686,5 @@ def test_touched_symlink_under_wildcard_prefix(env, m, rules, checkout, path, ex
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "real/skill.md")
     sha = link(checkout, path, "/".join([".."] * path.count("/") + ["real"]))
-    hits = _touched(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + extra)[1]
+    hits = _touched(env, m, rules, checkout, "topic", DEFAULT_HANDOVER_PATHS + canon(*extra))[1]
     assert hits == ([sha] if hit else [])

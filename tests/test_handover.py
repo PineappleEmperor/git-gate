@@ -743,9 +743,9 @@ def test_main_keeps_git_output_lines_but_cleans_them(env, m, rules, checkout):
 
 
 BROKEN_RULES = {
-    "bad timeout": ('workspaces = []\ngit_timeout_seconds = "x"\n[repos]\n"me/app" = "write"\n', "ValueError"),
-    "repos not a table": ("workspaces = []\nrepos = 5\n", "AttributeError"),
-    "bad workspace": ('workspaces = [5]\n[repos]\n"me/app" = "write"\n', "TypeError"),
+    "bad timeout": ('workspaces = []\ngit_timeout_seconds = "x"\n[repos]\n"me/app" = "write"\n', "git_timeout"),
+    "repos not a table": ("workspaces = []\nrepos = 5\n", "repos must be a table"),
+    "bad workspace": ('workspaces = [5]\n[repos]\n"me/app" = "write"\n', "workspaces"),
     "not utf-8": (b"workspaces = []\n\xff\xfe\n", "UnicodeDecodeError"),
     "not toml": ("this is [not toml\n", None),
 }
