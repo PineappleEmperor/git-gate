@@ -45,6 +45,7 @@ FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
 WORKFLOW_SCOPE = "create or update workflow"
 MAX_NAMED = 20  # protected files named in a refusal; the handover record and screen hold them all
 PROC = Path("/proc")
+MAX_REASON = 300  # characters of a refusal's first line kept in audit.log
 
 
 class InternalError(Exception):
@@ -110,6 +111,7 @@ class Gate:
         """
         token = None
         outcome = "ok"
+        message = None  # what the agent is told when the outcome is not ok, scrubbed
         try:
             check_enabled(self.config)
             self._rate_limit(kwargs.get("repo"))
@@ -121,25 +123,29 @@ class Gate:
             result = fn(rules, token, **kwargs)
             return utf8_safe(_scrub(result, token))
         except HandedOver as e:
-            outcome = "handover"
-            raise Refused(utf8_safe(_scrub(str(e), token))) from None
+            outcome, message = "handover", utf8_safe(_scrub(str(e), token))
+            raise Refused(message) from None
         except FromGitHub as e:
-            outcome = "refused"
-            raise Refused(utf8_safe(writes.untrusted(_scrub(str(e), token)))) from None
+            outcome, message = "refused", utf8_safe(_scrub(str(e), token))
+            raise Refused(writes.untrusted(message)) from None
         except Refused as e:
-            outcome = "refused"
-            raise Refused(utf8_safe(_scrub(str(e), token))) from None
+            outcome, message = "refused", utf8_safe(_scrub(str(e), token))
+            raise Refused(message) from None
         except Exception as e:
             outcome = "error"
             # Nothing unplanned reaches the agent raw: the text is scrubbed and holds no lone surrogate.
-            raise InternalError(utf8_safe(_scrub(f"{type(e).__name__}: {e}", token))) from e
+            message = utf8_safe(_scrub(f"{type(e).__name__}: {e}", token))
+            raise InternalError(message) from e
         finally:
-            self._audit(tool, kwargs, outcome, token)
+            self._audit(tool, kwargs, outcome, token, message)
 
-    def _audit(self, tool: str, kwargs: dict, outcome: str, token: str | None) -> None:
+    def _audit(self, tool: str, kwargs: dict, outcome: str, token: str | None, message: str | None) -> None:
+        """One line per call. `reason` is the first line of what the agent was told, without the
+        untrusted-content marker a refusal carrying GitHub's text starts with."""
+        reason = message.strip().partition("\n")[0][:MAX_REASON] if message is not None else None
         line = json.dumps({
             "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "args": kwargs, "outcome": outcome,
-            "session": _session(), "cwd": _cwd(),
+            "reason": reason, "session": _session(), "cwd": _cwd(),
         })  # fmt: skip
         with open(self.state / "audit.log", "a") as f:
             f.write(_scrub(line, token) + "\n")

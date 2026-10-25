@@ -6,7 +6,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from git_gate import gate
+import pytest
+
+from conftest import TOKEN
+from git_gate import Refused, gate
+from git_gate.gate import HandedOver, InternalError
+from git_gate.github import FromGitHub
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
@@ -75,3 +80,51 @@ def test_cwd_is_null_when_the_folder_is_gone(env, monkeypatch):
     monkeypatch.setattr(gate.os, "getcwd", gone)
     assert env.gate.call("prune", ok, repo="me/app") == "ok"
     assert audit_lines(env)[-1]["cwd"] is None
+
+
+# --- reason ----------------------------------------------------------------------------------
+
+
+def raising(exc: Exception):
+    def tool(rules, token, **kw):
+        raise exc
+
+    return tool
+
+
+@pytest.mark.parametrize(
+    "exc,outcome,reason",
+    [
+        (Refused(f"me/app is not yours\nsecond line {TOKEN}"), "refused", "me/app is not yours"),
+        (Refused(f"bad token {TOKEN}"), "refused", "bad token [token]"),
+        (FromGitHub("gh exited 1:\nNot Found"), "refused", "gh exited 1:"),
+        (
+            HandedOver("Not pushed: it changes 1 file(s).\n\ngitgatepush 4"),
+            "handover",
+            "Not pushed: it changes 1 file(s).",
+        ),
+        (RuntimeError(f"boom {TOKEN}"), "error", "RuntimeError: boom [token]"),
+    ],
+)
+def test_audit_says_why_a_call_was_not_ok(env, exc, outcome, reason):
+    with pytest.raises((Refused, InternalError)):
+        env.gate.call("prune", raising(exc), repo="me/app")
+    line = audit_lines(env)[-1]
+    assert (line["outcome"], line["reason"]) == (outcome, reason)
+
+
+def test_audit_reason_is_null_when_ok(env):
+    env.gate.call("prune", ok, repo="me/app")
+    assert audit_lines(env)[-1]["reason"] is None
+
+
+def test_audit_reason_is_cut_at_300_characters(env):
+    with pytest.raises(Refused):
+        env.gate.call("prune", raising(Refused("x" * 1000)), repo="me/app")
+    assert audit_lines(env)[-1]["reason"] == "x" * 300
+
+
+def test_audit_reason_for_a_real_refusal(env):
+    with pytest.raises(Refused, match="allowlist") as e:
+        env.gate.call("fetch", env.gate.fetch, repo="nobody/x", bundle=str(env.ws / "f.bundle"))
+    assert audit_lines(env)[-1]["reason"] == str(e.value).splitlines()[0]
