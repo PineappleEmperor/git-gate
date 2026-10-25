@@ -51,6 +51,18 @@ sh ~/git-gate-install.sh install <sha>
 
 Later: `/opt/git-gate/current/install.sh install <sha>`, `rollback <sha>`, `list`.
 
+After switching `current`, `install` and `rollback` hand the remaining steps (the links below and
+their checks) to the script of the release now live, as `install.sh post-switch <sha>`, so a step a
+release adds runs on the install that brings it. Releases before session rules lack that hand-off:
+upgrading from one of them with its own `install.sh` runs its older steps, so after that one
+upgrade, run the new release's steps yourself:
+
+```bash
+/opt/git-gate/current/install.sh post-switch <sha>
+```
+
+Or upgrade with the extracted script, as for a first install, which needs no extra step.
+
 Each install and rollback also links `/usr/local/bin/gitgatepush` and `/usr/local/bin/gitgaterules`
 to the same names in `/opt/git-gate/current/bin/` (override the directory with `GIT_GATE_BIN_DIR`),
 then checks that each name in your shell resolves to its link and warns, naming the other path, if

@@ -76,3 +76,50 @@ def test_a_release_without_gitgaterules_leaves_its_link_alone(root):
     assert (root / "bin/gitgatepush").is_symlink()
     assert not os.path.lexists(root / "bin/gitgaterules")
     assert "gitgaterules" in proc.stdout and "has no" in proc.stdout
+
+
+# --- the steps after the switch are the new release's own -----------------------------------------
+# An upgrade runs the old release's install.sh; the links and checks a newer release adds must still run.
+
+STUB = """#!/bin/sh
+case $1 in
+    post-switch) echo "post-switch by the new release: $2 root=$GIT_GATE_ROOT bin=$GIT_GATE_BIN_DIR" ;;
+    *) exit 9 ;;
+esac
+"""
+
+
+def test_the_switch_hands_its_last_steps_to_the_new_release(root):
+    release(root, NEW, script=STUB)
+    proc = install(root, "rollback", NEW)
+    assert proc.returncode == 0, proc.stderr
+    assert f"post-switch by the new release: {NEW} root={root / 'opt'} bin={root / 'bin'}" in proc.stdout
+    assert not os.path.lexists(root / "bin/gitgatepush")  # the new release's script did the linking, not this one
+
+
+def test_a_release_whose_script_predates_post_switch_gets_this_scripts_steps(root):
+    release(root, OLD, script="#!/bin/sh\necho old script ran\nexit 9\n")
+    proc = install(root, "rollback", OLD)
+    assert proc.returncode == 0, proc.stderr
+    assert "old script ran" not in proc.stdout
+    assert (root / "bin/gitgatepush").is_symlink() and (root / "bin/gitgaterules").is_symlink()
+
+
+def test_this_script_as_the_new_release_links_everything(root):
+    release(root, NEW, script=INSTALL.read_text())
+    proc = install(root, "rollback", NEW)
+    assert proc.returncode == 0, proc.stderr
+    assert (root / "bin/gitgatepush").is_symlink() and (root / "bin/gitgaterules").is_symlink()
+
+
+def test_post_switch_runs_only_for_the_live_release(root):
+    release(root, NEW)
+    release(root, OLD)
+    (root / "opt/current").symlink_to(f"releases/{NEW}")
+    proc = install(root, "post-switch", OLD)
+    assert proc.returncode == 1 and "is not the live release" in proc.stderr
+    assert not os.path.lexists(root / "bin/gitgaterules")
+    proc = install(root, "post-switch", NEW)
+    assert proc.returncode == 0, proc.stderr
+    assert (root / "bin/gitgaterules").is_symlink()
+    assert install(root, "post-switch", "nope").returncode == 1
