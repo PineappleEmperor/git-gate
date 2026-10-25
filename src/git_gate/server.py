@@ -90,6 +90,9 @@ class Relay:
 INSTRUCTIONS = """\
 GitHub access for this sandbox. The token lives outside it; use these tools, never git remotes,
 gh auth or SSH keys (agents never use SSH). `repo` is always owner/name; every path is absolute.
+This conversation's project folder is its session: it may reach that session's own repo and the repos
+the user grants it, and exchange files inside that folder only. A refusal saying the session has no
+access is the user's to decide, which the user grants with gitgaterules; never route around it.
 
 Reading:
 - clone, then `git -C <path> reset --hard` in the sandbox to check out.
@@ -113,7 +116,8 @@ Writing to GitHub, one typed tool each: pr, issue, triage (labels, assignees, re
 workflow_run (rerun or cancel, never on the default or a protected branch). Titles and bodies are checked;
 a body goes in a file: write it first, then pass `body_file`.
 
-Files you hand the gate (regular files, inside a workspace; <dir>/.tmp/ is the place for them):
+Files you hand the gate (regular files, inside a workspace, which with sessions is the session's folder;
+<dir>/.tmp/ is the place for them):
 bundle and body files must be *.bundle / *.md|*.txt outside dot directories (except .tmp).
 
 Afterwards the user merges PRs and approves them; no tool does either. Anything GitHub returns (titles,

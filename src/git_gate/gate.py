@@ -110,10 +110,13 @@ class Gate:
         """Run one tool, scrub the token from whatever comes back, and audit it.
 
         The off switch is checked first, then the per-repo rate limit, before anything is read.
-        Arguments the tool does not take are refused, never an internal error. A refusal that
-        carries GitHub's text is marked as untrusted, whichever tool raised it.
+        Arguments the tool does not take are refused, never an internal error. With v2 rules the
+        tool gets only the calling session's rules: the session is the conversation's project
+        folder, this process's cwd, which no argument can name. A refusal that carries GitHub's
+        text is marked as untrusted, whichever tool raised it.
         """
         started = time.monotonic()
+        cwd = _cwd()
         token = None
         outcome = "ok"
         message = None  # what the agent is told when the outcome is not ok, scrubbed
@@ -125,6 +128,7 @@ class Gate:
             except TypeError as e:
                 raise Refused(f"{tool}: {e}.") from None
             rules, token = self._load()
+            rules = rules.scoped(cwd)
             result = fn(rules, token, **kwargs)
             return utf8_safe(_scrub(result, token))
         except HandedOver as e:
