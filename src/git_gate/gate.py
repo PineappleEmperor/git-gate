@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from git_gate import Refused, ghpolicy, writes
+from git_gate.call import TOOLS
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import FromGitHub, GitHub
 from git_gate.gitops import EMPTY, MAX_STDERR, Git
@@ -84,6 +85,14 @@ class Gate:
 
     def _load(self) -> tuple[Rules, str]:
         return load_rules(self.config), load_token(self.config)
+
+    def dispatch(self, tool: str, kwargs: dict) -> str:
+        """Run the named tool with `kwargs` through `call`: the one place a tool name becomes a method."""
+        if tool not in TOOLS:
+            raise Refused(f"git-gate has no tool {tool!r}.")
+        if not isinstance(kwargs, dict):
+            raise Refused(f"{tool}: the arguments must be a JSON object.")
+        return self.call(tool, getattr(self, tool), **kwargs)
 
     def call(self, tool: str, fn: Callable[..., str], **kwargs) -> str:
         """Run one tool, scrub the token from whatever comes back, and audit it.

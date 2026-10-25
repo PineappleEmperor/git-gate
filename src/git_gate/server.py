@@ -43,7 +43,7 @@ class Relay:
         target = (self.root / "current").resolve()
         if not (target / "src/git_gate/call.py").is_file():
             self._gate = self._gate or self._fallback()
-            return self._gate.call(tool, getattr(self._gate, tool), **kwargs)
+            return self._gate.dispatch(tool, kwargs)
         try:
             proc = subprocess.run(
                 [str(target / "bin/git-gate"), "call", tool],
@@ -106,15 +106,14 @@ Force-push, tags and workflow changes are the user's: hand them the command the 
 
 
 def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
+    if gate is not None and relay is not None:
+        raise ValueError("build takes a gate or a relay, not both")
     if relay is None:
         gate = gate or Gate()
     server = MCPServer("git-gate", instructions=INSTRUCTIONS)
 
     async def run(tool: str, **kwargs) -> str:
-        if relay is not None:
-            call = partial(relay, tool, kwargs)
-        else:
-            call = partial(gate.call, tool, getattr(gate, tool), **kwargs)
+        call = partial(relay, tool, kwargs) if relay is not None else partial(gate.dispatch, tool, kwargs)
         try:
             return await anyio.to_thread.run_sync(call)
         except Refused as e:

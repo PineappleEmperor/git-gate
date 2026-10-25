@@ -14,14 +14,13 @@ import traceback
 from git_gate import Refused
 from git_gate.config import state_dir
 
+# The only list of tool names: the server registers exactly these, and Gate.dispatch accepts only these.
 TOOLS = ("clone", "fetch", "push", "prune", "gh")
 
 
 def run(tool: str, kwargs: dict, gate) -> dict:
-    if tool not in TOOLS:
-        return {"refused": f"git-gate has no tool {tool!r}."}
     try:
-        return {"ok": gate.call(tool, getattr(gate, tool), **kwargs)}
+        return {"ok": gate.dispatch(tool, kwargs)}
     except Refused as e:
         return {"refused": str(e)}
 
