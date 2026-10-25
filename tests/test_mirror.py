@@ -176,9 +176,22 @@ def _fetch_into_new(env, b: Path, name: str) -> dict[str, str]:
     return dict(line.split(" ") for line in out.splitlines())
 
 
-def test_export_full_and_incremental(env, m, rules):
+def _fetch_into(repo: Path, b: Path) -> dict[str, str]:
+    git("fetch", "-q", str(b), "+refs/heads/*:refs/remotes/origin/*", cwd=repo)
+    out = git("for-each-ref", "--format=%(refname:lstrip=3) %(objectname)", "refs/remotes/origin/", cwd=repo)
+    return dict(line.split(" ") for line in out.splitlines() if not line.startswith("HEAD "))
+
+
+def _heads_of(b: Path) -> dict[str, str]:
+    out = git("bundle", "list-heads", str(b))
+    return {ref.removeprefix("refs/heads/"): sha for sha, ref in (line.split(" ") for line in out.splitlines())}
+
+
+def test_export_full_and_incremental(env, m, rules, checkout):
     seed = env.tmp / "seed"
-    main = git("rev-parse", "HEAD", cwd=seed)
+    m1 = seed_push(env, "m1.txt")
+    git("fetch", "-q", "origin", cwd=checkout)  # the agent now has m1
+    m2 = seed_push(env, "m2.txt")
     git("switch", "-q", "-c", "dev", cwd=seed)
     dev = commit(seed, "dev.txt", "dev " * 200)
     git("push", "-q", env.url, "dev", cwd=seed)
@@ -186,16 +199,57 @@ def test_export_full_and_incremental(env, m, rules):
 
     full = env.tmp / "full.bundle"
     assert m.export_bundle(REPO, full, [], rules) is True
-    assert _fetch_into_new(env, full, "fresh") == {"main": main, "dev": dev}
+    assert _fetch_into_new(env, full, "fresh") == {"main": m2, "dev": dev}
 
     part = env.tmp / "part.bundle"
-    assert m.export_bundle(REPO, part, [main], rules) is True
+    assert m.export_bundle(REPO, part, [m1], rules) is True
     assert part.stat().st_size < full.stat().st_size
-    assert git("bundle", "list-heads", str(part)).split() == [dev, "refs/heads/dev"]
+    assert _heads_of(part) == {"main": m2, "dev": dev}
+    assert _fetch_into(checkout, part) == {"main": m2, "dev": dev}
+
+    tip = env.tmp / "tip.bundle"
+    assert m.export_bundle(REPO, tip, [m2], rules) is True
+    assert _heads_of(tip) == {"main": m2, "dev": dev}
 
     none = env.tmp / "none.bundle"
-    assert m.export_bundle(REPO, none, [main, dev], rules) is False
+    assert m.export_bundle(REPO, none, [m2, dev], rules) is False
     assert not none.exists()
+
+
+def test_export_keeps_branches_whose_tips_the_agent_has(env, m, rules, checkout):
+    """A branch at a known commit, or fast-forwarded to one, still reaches origin/* in the clone."""
+    seed = env.tmp / "seed"
+    m1 = seed_push(env, "m1.txt")
+    git("switch", "-q", "-c", "dev", cwd=seed)
+    d1 = commit(seed, "d1.txt")
+    git("push", "-q", env.url, "dev", cwd=seed)
+    git("fetch", "-q", "origin", cwd=checkout)  # the agent has main=m1, dev=d1
+    d2 = commit(seed, "d2.txt")
+    git("push", "-q", env.url, "dev", f"{d1}:refs/heads/main", f"{m1}:refs/heads/at-known", cwd=seed)
+    m.sync(REPO, TOKEN, rules)
+
+    out = env.tmp / "inc.bundle"
+    assert m.export_bundle(REPO, out, [m1, d1], rules) is True
+    expected = {"main": d1, "dev": d2, "at-known": m1}
+    assert _heads_of(out) == expected
+    assert _fetch_into(checkout, out) == expected
+
+
+def test_export_keeps_a_branch_behind_every_have(env, m, rules, checkout):
+    """A tip below a have's parents would be excluded by rev-list; the bundle still carries it."""
+    root = git("rev-parse", "HEAD", cwd=checkout)
+    seed_push(env, "m1.txt")
+    m2 = seed_push(env, "m2.txt")
+    git("fetch", "-q", "origin", cwd=checkout)
+    m3 = seed_push(env, "m3.txt")
+    git("push", "-q", env.url, f"{root}:refs/heads/old", cwd=env.tmp / "seed")
+    m.sync(REPO, TOKEN, rules)
+
+    out = env.tmp / "old.bundle"
+    assert m.export_bundle(REPO, out, [m2], rules) is True
+    expected = {"main": m3, "old": root}
+    assert _heads_of(out) == expected
+    assert _fetch_into(checkout, out) == expected
 
 
 def test_export_empty_mirror(env, m, rules):
