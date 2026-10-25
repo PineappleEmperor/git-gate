@@ -274,10 +274,10 @@ class Gate:
                     advice.append(
                         f"If the rewrite was not meant, fetch, rebase or merge origin/{branch} and push again instead."
                     )
-                against = remote or heads.get(default)
-                new = self.mirror.new_commits(repo, sha, against, rules)
+                default_tip = heads.get(default)
+                new = self.mirror.new_commits(repo, sha, remote or default_tip, rules)
                 patterns = repo_rules.handover_paths
-                touched = self.mirror.touched(repo, new, against, sha, patterns, rules)
+                touched = self.mirror.touched(repo, sha, remote, default_tip, patterns, rules)
                 if touched:
                     reasons.append(
                         f"Commit(s) {', '.join(c[:12] for c in touched)} touch a handover path ({', '.join(patterns)})."

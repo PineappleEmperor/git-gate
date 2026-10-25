@@ -119,14 +119,39 @@ def test_clean_merge_of_main_with_workflow_change_passes(env, checkout):
     assert "Pushed" in push(env, checkout, "topic")
 
 
-def test_stale_fork_without_workflow_changes_passes(env, checkout):
-    """Main gaining a workflow change after the fork is not this branch's change."""
+def test_stale_fork_with_old_workflows_is_handed_over(env, checkout):
+    """Main gaining a workflow fix after the fork: the branch would run the old workflow on GitHub."""
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "topic.txt")
     seed = env.tmp / "seed"
     commit(seed, ".github/workflows/ci.yml", "on: push")
     git("push", "-q", env.url, "main", cwd=seed)
+    with pytest.raises(Refused, match=r"gitgatepush \d+"):
+        push(env, checkout, "topic")
+    assert remote_ref(env, "topic") == ""
+
+
+def test_stale_fork_without_workflow_drift_passes(env, checkout):
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "topic.txt")
+    seed = env.tmp / "seed"
+    commit(seed, "docs/later.md", "later")
+    git("push", "-q", env.url, "main", cwd=seed)
     assert "Pushed" in push(env, checkout, "topic")
+
+
+def test_merging_main_into_a_pushed_branch_after_a_workflow_change_passes(env, checkout):
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "topic.txt")
+    assert "Pushed" in push(env, checkout, "topic")
+    seed = env.tmp / "seed"
+    commit(seed, ".github/workflows/ci.yml", "on: push")
+    git("push", "-q", env.url, "main", cwd=seed)
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("merge", "-q", "--no-edit", "origin/main", cwd=checkout)
+    tip = git("rev-parse", "HEAD", cwd=checkout)
+    assert "Pushed" in push(env, checkout, "topic")
+    assert remote_ref(env, "topic") == tip
 
 
 # --- refusals become handovers -------------------------------------------------------------

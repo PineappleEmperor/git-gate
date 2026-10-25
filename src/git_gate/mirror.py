@@ -224,29 +224,40 @@ class Mirror:
         return self._git(repo, rules, args).stdout.split()
 
     def touched(
-        self, repo: str, shas: list[str], base: str | None, sha: str, patterns: tuple[str, ...] | list[str],
-        rules: Rules,
-    ) -> list[str]:  # fmt: skip
-        """Commits among shas whose own changes touch a path matching `patterns`.
+        self, repo: str, sha: str, remote: str | None, default_tip: str | None, patterns, rules: Rules
+    ) -> list[str]:
+        """Commits of this push whose own changes touch a path matching `patterns`.
 
-        Merges are diffed dense-combined (`--cc`), which hides a merge that keeps one parent's older
-        file, so when no commit is named the whole tree is also compared with where sha forked from
-        base; a difference there names sha itself. sha is also named when its tree holds a symlink at,
-        inside or above a handover path, since an edit to its target is an edit through that path.
-        Matching ignores case.
+        Only commits new to both the branch (`remote`) and the default branch (`default_tip`) are
+        diffed: what the default branch already holds is the user's. Merges are diffed
+        dense-combined (`--cc`), which hides a merge that keeps one parent's older file, so when no
+        commit is named the tree is also compared: a protected path that differs from both the
+        default branch's current tip and the branch on GitHub names sha itself. sha is also named
+        when its tree holds a symlink at, inside or above a handover path.
         """
+        exclude = comparison(remote, default_tip)
+        shas = self._git(repo, rules, ["rev-list", _oid(sha), *_not(exclude)]).stdout.split()
         hits = self._commit_touches(repo, shas, patterns, rules)
-        if not hits and base:
-            fork = self.merge_base(repo, base, sha, rules) or base
-            out = self._git(
-                repo, rules,
-                ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", _oid(fork), _oid(sha)],
-            ).stdout  # fmt: skip
-            if any(protected(p, patterns) for p in out.split("\0") if p):
+        if not hits:
+            net = self._changed(repo, default_tip or self._empty_tree(repo, rules), sha, patterns, rules)
+            if remote:
+                net &= self._changed(repo, remote, sha, patterns, rules)
+            if net:
                 hits = [sha]
         if sha not in hits and any(reaches(p, patterns) for p in self._symlinks(repo, sha, rules)):
             hits.append(sha)
         return hits
+
+    def _changed(self, repo: str, a: str, b: str, patterns, rules: Rules) -> set[str]:
+        """The protected paths that differ between two commits (or trees)."""
+        out = self._git(
+            repo, rules,
+            ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", _oid(a), _oid(b)],
+        ).stdout  # fmt: skip
+        return {p for p in out.split("\0") if p and protected(p, patterns)}
+
+    def _empty_tree(self, repo: str, rules: Rules) -> str:
+        return self._git(repo, rules, ["hash-object", "-t", "tree", "--stdin"], stdin="").stdout.strip()
 
     def _symlinks(self, repo: str, sha: str, rules: Rules) -> list[str]:
         out = self._git(repo, rules, ["ls-tree", "-r", "-z", "--full-tree", _oid(sha)]).stdout
@@ -313,6 +324,18 @@ def reaches(path: str, patterns) -> bool:
         if parts[0] == "**" or any(p.full_match("/".join(parts[:k])) for k in range(1, len(parts) + 1)):
             return True
     return False
+
+
+def comparison(remote: str | None, default_tip: str | None) -> tuple[str, ...]:
+    """The commits a push is compared with: the branch on GitHub and the default branch's tip.
+
+    No other branch ever is: agents can push those, so they are no trusted base.
+    """
+    return tuple(_oid(c) for c in (remote, default_tip) if c)
+
+
+def _not(exclude: tuple[str, ...]) -> list[str]:
+    return ["--not", *exclude] if exclude else []
 
 
 def _oid(value: str) -> str:

@@ -386,8 +386,17 @@ def _touched(env, m, rules, checkout, branch, patterns=DEFAULT_HANDOVER_PATHS):
     """Bundle `branch` from the checkout, import it, and run the checks as push will."""
     heads = m.sync(REPO, TOKEN, rules)
     sha = m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / f"{branch}.bundle", branch), branch, rules)
-    base = heads.get(branch) or heads.get("main")
-    return sha, m.touched(REPO, m.new_commits(REPO, sha, base, rules), base, sha, patterns, rules)
+    return sha, m.touched(REPO, sha, heads.get(branch), heads.get("main"), patterns, rules)
+
+
+def user_branch(env, name: str, path: str, content: str) -> str:
+    """The user pushes `name` to GitHub: main plus one commit writing `path`."""
+    seed = env.tmp / "seed"
+    git("switch", "-q", "-c", name, "main", cwd=seed)
+    sha = commit(seed, path, content)
+    git("push", "-q", env.url, name, cwd=seed)
+    git("switch", "-q", "main", cwd=seed)
+    return sha
 
 
 def test_touched_names_workflow_commits(env, m, rules, checkout):
@@ -448,12 +457,69 @@ def test_touched_merge_rolling_workflow_back(env, m, rules, checkout):
     assert hits == [sha]
 
 
-def test_touched_stale_fork_passes(env, m, rules, checkout):
-    """Main gaining a workflow change after the fork is not this branch's change."""
+def test_touched_stale_fork_with_old_workflows(env, m, rules, checkout):
+    """Main gaining a workflow fix after the fork: a new branch there would run the old workflows."""
     git("switch", "-q", "-c", "topic", cwd=checkout)
     commit(checkout, "topic.txt")
     seed_push(env, ".github/workflows/ci.yml", "on: push")
+    sha, hits = _touched(env, m, rules, checkout, "topic")
+    assert hits == [sha]
+
+
+def test_touched_stale_fork_without_workflow_drift_passes(env, m, rules, checkout):
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "topic.txt")
+    seed_push(env, "docs/later.md", "later")
     assert _touched(env, m, rules, checkout, "topic")[1] == []
+
+
+def test_touched_existing_branch_merges_main_after_user_workflow_change_passes(env, m, rules, checkout):
+    """The user's own workflow commit on main, merged into a pushed branch, is not re-checked."""
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "topic.txt")
+    git("push", "-q", env.url, "topic", cwd=checkout)
+    seed_push(env, ".github/workflows/ci.yml", "on: push")
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("merge", "-q", "--no-edit", "origin/main", cwd=checkout)
+    assert _touched(env, m, rules, checkout, "topic")[1] == []
+
+
+def test_touched_existing_branch_keeping_its_old_workflows_passes(env, m, rules, checkout):
+    seed_push(env, ".github/workflows/ci.yml", "v1")
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
+    commit(checkout, "topic.txt")
+    git("push", "-q", env.url, "topic", cwd=checkout)
+    seed_push(env, ".github/workflows/ci.yml", "v2")
+    commit(checkout, "more.txt")
+    assert _touched(env, m, rules, checkout, "topic")[1] == []
+
+
+def test_touched_rewrite_with_new_protected_content(env, m, rules, checkout):
+    seed_push(env, ".github/workflows/ci.yml", "v1")
+    user_branch(env, "feat", ".github/workflows/ci.yml", "v2")
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "feat", "origin/main", cwd=checkout)
+    v3 = commit(checkout, ".github/workflows/ci.yml", "v3")
+    assert _touched(env, m, rules, checkout, "feat")[1] == [v3]
+
+
+def test_touched_rewrite_back_to_the_fork_version_is_not_protected(env, m, rules, checkout):
+    seed_push(env, ".github/workflows/ci.yml", "v1")
+    user_branch(env, "feat", ".github/workflows/ci.yml", "v2")
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "feat", "origin/main", cwd=checkout)
+    commit(checkout, "other.txt")
+    assert _touched(env, m, rules, checkout, "feat")[1] == []
+
+
+def test_touched_fast_forward_keeping_the_remotes_protected_change_passes(env, m, rules, checkout):
+    seed_push(env, ".github/workflows/ci.yml", "v1")
+    user_branch(env, "feat", ".github/workflows/ci.yml", "v2")
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "feat", "origin/feat", cwd=checkout)
+    commit(checkout, "other.txt")
+    assert _touched(env, m, rules, checkout, "feat")[1] == []
 
 
 def test_touched_against_existing_remote_branch(env, m, rules, checkout):
@@ -472,7 +538,7 @@ def test_touched_root_commit_without_base(env, m, rules, checkout):
     m.sync(REPO, TOKEN, rules)
     sha = m.import_bundle(REPO, bundle(checkout, env.state / "tmp" / "f.bundle", "fresh"), "fresh", rules)
     assert sha == root
-    assert m.touched(REPO, m.new_commits(REPO, sha, None, rules), None, sha, DEFAULT_HANDOVER_PATHS, rules) == [root]
+    assert m.touched(REPO, sha, None, None, DEFAULT_HANDOVER_PATHS, rules) == [root]
 
 
 def test_touched_ignores_replace_refs(env, m, rules, checkout):
@@ -488,7 +554,7 @@ def test_touched_ignores_replace_refs(env, m, rules, checkout):
     assert mgit(m, "for-each-ref", "refs/replace/") != ""
     main = heads["main"]
     assert m.new_commits(REPO, bad, main, rules) == [bad]
-    assert m.touched(REPO, [bad], main, bad, DEFAULT_HANDOVER_PATHS, rules) == [bad]
+    assert m.touched(REPO, bad, None, main, DEFAULT_HANDOVER_PATHS, rules) == [bad]
 
 
 @pytest.mark.parametrize(
