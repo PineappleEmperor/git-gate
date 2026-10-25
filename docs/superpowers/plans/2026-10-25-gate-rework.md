@@ -207,3 +207,234 @@ git 2.43.0 and gh 2.45.0 at `/usr/bin`, pytest + ruff in the dev venv.
 - [ ] **Step 3: Write `docs/smoke.md`:** the live steps on `PineappleEmperor/ha-skills` (fetch; push a throwaway feature branch; a protected-branch refusal and its `gitgatepush` listing without running it; a typed `pr comment` on a PR the user names; prune after the user closes that PR), each with its expected reply.
 - [ ] **Step 4: Run** `./scripts/ci.sh` → pass.
 - [ ] **Step 5: Commit** `feat: link gitgatepush on install`, then `docs: add skills migration and smoke steps`
+
+---
+
+## Amendments after the planning review (2026-10-25)
+
+The planning review (`docs/superpowers/reviews/2026-10-25-planning-review.md`) is binding: its
+section 2 rules D1–D14 join the Global Constraints, and Task 5b runs after Task 5 and before Task 6.
+The user's decisions on its section 6 (2026-10-25):
+
+1. Workspace exchange: the fixed contract (D9) — `*.bundle` for bundles, `*.md`/`*.txt` for bodies, no
+   dot-named path component except `.tmp`, regular files with one link only.
+2. Default handover paths gain `.claude/**`, `.mcp.json`, `.vscode/**`, `.idea/**`, `.envrc`,
+   `.devcontainer/**`. Hook-called scripts are listed per repo later, not in this build. Handover paths
+   change only what the gate will push itself; what agents can read or edit stays with the sandbox.
+3. D2's comparison rule is confirmed (commits already on the default branch are never re-checked).
+4. Stale workflows: a protected path counts if it differs from both the branch on GitHub and the
+   default branch's **current** tip (the review's D2 `net` rule, amended in the copied review).
+5. `workflow_run` refuses rerun/rerun_failed/cancel only for runs on the default branch or a
+   `protected_branches` match; feature-branch reruns stay allowed.
+6. The spec's Handover section is reworded to: `gitgatepush` pushes with the user's own git config and
+   SSH key, hooks off. (Task 8 makes this edit.)
+7. `docs/skills-migration.md` notes that deploy secrets belong in an environment restricted to the
+   default branch, since any pushed branch runs its own build in Actions. (Task 8.)
+8. Tool shapes in this release are final (D13); the relay carries later behaviour changes.
+
+
+
+### Task 5b: Fixes from the planning review
+
+**Files:**
+- Modify: `src/git_gate/config.py`, `src/git_gate/mirror.py`, `src/git_gate/handover.py`,
+  `src/git_gate/gate.py`, `src/git_gate/paths.py`, `src/git_gate/gitops.py`, `src/git_gate/server.py`
+  (fetch/push docstrings only)
+- Test: `tests/test_config.py`, `tests/test_mirror.py`, `tests/test_handover.py`, `tests/test_push.py`,
+  `tests/test_fetch.py`, `tests/test_gh.py`, `tests/test_paths.py` (new)
+
+**Interfaces:**
+- Produces in `config.py`: `canonical_pattern(p: str) -> str` (raises `Refused`); `DEFAULT_HANDOVER_PATHS`
+  (user decision 2: `.github/workflows/**`, `.githooks/**`, `.pre-commit-config.yaml`, `.claude/**`,
+  `.mcp.json`, `.vscode/**`, `.idea/**`, `.envrc`, `.devcontainer/**`) and `RepoRules.handover_paths` hold
+  canonical patterns; `load_rules` refuses unknown top-level keys, non-list
+  `workspaces`/`protected_branches`, non-int or out-of-range timeouts, duplicate repo keys after lower-casing;
+  `check_enabled` uses `os.path.lexists`; every regex check uses `fullmatch`.
+- Produces in `mirror.py`: `protected(path, patterns) -> bool`; `reaches(path, patterns) -> bool`;
+  `@dataclass(frozen=True) class Protected(files: tuple[str, ...], commits: tuple[str, ...])` with
+  `__bool__ = files != ()`; `Mirror.protected_changes(repo, sha, remote: str | None, default_tip: str | None,
+  patterns, rules) -> Protected`; `Mirror.fork_point(repo, sha, default_tip, rules) -> str | None`;
+  `export_bundle` returns False only when the mirror has no branches.
+  Deletes: `touched`, `_commit_touches`, `_symlinks`, `matches`, `link_reaches`, `_normalise`, `_literal`.
+- Produces in `handover.py`: `Handover` gains `patterns: tuple[str, ...]`, `protected: tuple[str, ...]`,
+  `exclude: tuple[str, ...]`; `Handovers.create(repo, branch, sha, base, lease, reason, *, patterns, protected,
+  exclude)`; `_show` prints D5's sections from the record. Deletes: `_protected`, `_handover_paths`.
+- Produces in `paths.py`: `open_exchange(rules, path, purpose: str) -> tuple[int, Path]` (purpose `"bundle"`
+  or `"body"`), used by `copy_in` and `read_workspace_file`; `write_out` requires a `.bundle` name;
+  `copy_tree_into` writes only into a directory the gate created.
+- Produces in `gitops.py`: `Git.run` decodes `utf-8` with `surrogateescape`.
+- `Gate.push` computes `remote`, `default_tip`, `fork` once (D2), calls `protected_changes` once, records
+  `Protected` in the handover, closes the record if `keep` raises. `Gate.fetch` reply and docstring use
+  `git fetch --prune <bundle> '+refs/heads/*:refs/remotes/origin/*'`.
+
+- [ ] **Step 1: Write failing tests:**
+  - `test_config.py::test_handover_patterns_are_canonical` (parametrised): `"skills"`, `"skills/"`, `"skills/**"`,
+    `"/Skills/**"`, `"./skills//**"` → `"skills"`; `".github/workflows/**"` → `".github/workflows"`; `"**"` and `"/"`
+    → `"**"`; `"skills/*/SKILL.md"` → `"skills/*/skill.md"`.
+  - `test_config.py::test_bad_handover_patterns_refused` (parametrised): `"a/../b"`, `"a\\b"`, `"a/**b"`, `""`,
+    `"a\x00b"`, `"a\nb"`, `"a‮b"` → `Refused` naming the repo and the pattern.
+  - `test_config.py::test_rules_schema_is_strict` (parametrised): `protected_branches = "main"`, `protected_branch = []`,
+    `workspaces = "/x"`, `git_timeout_seconds = true`, `= 0`, `= "5"`, keys `"Me/App"` and `"me/app"` together →
+    each `Refused` naming the key.
+  - `test_config.py::test_off_switch_dangling_symlink`: `disabled` is a symlink to a missing file → `Refused`
+    with the exact off-switch message.
+  - `test_config.py::test_check_enabled_defaults_to_config_dir`: `GIT_GATE_CONFIG_DIR` set, `disabled` there,
+    `check_enabled()` → `Refused`.
+  - `test_config.py::test_identifiers_fullmatch`: `rules.repo("me/app\n")` → `Refused` "not an owner/name";
+    `mirror._oid(sha + "\n")` → `Refused`.
+  - `test_mirror.py::test_protected_table` (parametrised over (path, pattern, expected)):
+    (`skills/x`, `skills`, True), (`skillsx`, `skills`, False), (`.github/workflows`, default, True),
+    (`.GitHub/Workflows/ci.yml`, default, True), (`x/.pre-commit-config.yaml`, default, False),
+    (`.github/workflows/a.yml`, `.github/*`, True), (`skills/a/b/c`, `skills/*/b`, True), (`anything`, `**`, True).
+  - `test_mirror.py::test_reaches_table`: (`.github`, default, True), (`.githooks`, default, True),
+    (`skills/x`, `skills/*/hooks/**`, True), (`docs`, default, False), (`a/b`, `**/hooks`, True).
+  - `test_mirror.py::test_protected_changes_*`, each asserting `files` and `commits` exactly (port every
+    `test_touched_*` and add):
+    - `..._clean_merge_of_main_passes` (new branch) → `Protected((), ())`.
+    - `..._existing_branch_merges_main_after_user_workflow_change_passes`: remote = pushed topic, main gains
+      `.github/workflows/ci.yml`, topic merges main → `Protected((), ())`.
+    - `..._rollback_merge_names_the_file` → `files == (".github/workflows/ci.yml",)`, `commits == ()`.
+    - `..._evil_merge` → file listed, `commits == (merge,)`.
+    - `..._changed_and_changed_back` → file listed, `commits == (one, two)`.
+    - `..._rewrite_with_new_protected_content`: remote holds a user-pushed workflow edit, sha rewrites it to
+      a third version → file listed.
+    - `..._rewrite_back_to_the_fork_version_is_not_protected`: remote holds a user-pushed workflow edit, sha
+      rewrites without it → `Protected((), ())` (the push is still a lease handover).
+    - `..._fast_forward_keeping_the_remotes_protected_change_passes` → `Protected((), ())`.
+    - `..._stale_fork_with_old_workflows_is_protected` (user decision 4): main gains a workflow fix
+      after the agent forked; a new branch at the old fork with an unrelated change →
+      `files == (".github/workflows/ci.yml",)`, `commits == ()`.
+    - `..._stale_fork_without_workflow_drift_passes`: main moves on with no handover-path change →
+      `Protected((), ())`.
+    - `..._existing_branch_keeping_its_old_workflows_passes`: remote already holds the old workflows,
+      sha adds unrelated commits → `Protected((), ())`.
+    - `..._gitlink_and_symlink_entries`: `.githooks` added as gitlink via `update-index --cacheinfo 160000,<sha>,.githooks`
+      → listed; unchanged symlink `.github -> ci` → listed.
+    - `..._no_default_branch_checks_all_history`: `default_tip=None`, root commit touching `.githooks/x` → listed.
+    - `..._non_utf8_name`: a commit adding `.githooks/\xff` (via `update-index` with a raw path) → listed,
+      no exception.
+  - `test_mirror.py::test_export_always_lists_every_branch`: GitHub gains `release-1` at main's sha;
+    `have=[main sha]` → returns True, `list-heads` == {main, release-1}; `have` = every tip → True.
+  - `test_mirror.py::test_export_false_only_without_branches`.
+  - `test_handover.py::test_main_prints_stored_protected_files_first_and_uncapped`: record with 150 stored
+    `protected` names and no rules.toml → all 150 appear before `New commits`; no "Note:" line.
+  - `test_handover.py::test_main_always_prints_the_protected_section`: record with `protected=()` → output
+    contains `Files under handover paths: none.`
+  - `test_handover.py::test_main_discloses_a_rollback_merge`: the `e5.py` scenario pushed through `Gate.push`,
+    then `main([id])` answered `n` → contains `Files under handover paths (1):` and `.github/workflows/ci.yml`.
+  - `test_handover.py::test_main_rewrite_lists_what_it_removes`: remote has 2 commits not in sha → output contains
+    `REPLACES`, `Removes 2 commit(s) from feat:` and both subjects.
+  - `test_handover.py::test_main_audits_the_push`: after `y`, the last `audit.log` line has `tool == "gitgatepush"`,
+    `outcome == "pushed"`, the id and sha; after a failed push, `outcome == "failed"`.
+  - `test_handover.py::test_main_second_run_of_a_closed_id`: run `y` twice → second exits 1 with "No open handover".
+  - `test_handover.py::test_main_survives_non_utf8_names`: stored name with a surrogate → printed as `?`, exit 0 on `n`.
+  - Delete `test_main_uses_default_handover_paths_when_rules_cannot_be_loaded`,
+    `test_main_survives_broken_rules_and_uses_default_paths`, `test_main_names_extra_handover_paths_from_the_repo_rules`
+    (behaviour removed by D1); the stored-patterns test replaces them.
+  - `test_push.py::test_merging_main_into_a_pushed_branch_after_a_workflow_change_passes` → "Pushed".
+  - `test_push.py::test_handover_record_matches_the_refusal` (parametrised over the refusal cases):
+    `h.protected` equals the files named in the refusal message; `h.patterns == rules.repo(repo).handover_paths`;
+    `h.exclude` is `[remote, default_tip]` minus `None`.
+  - `test_push.py::test_keep_failure_leaves_no_open_record`: `Mirror.keep` patched to raise `Refused` →
+    `Refused`, `Handovers(state).open() == []`.
+  - `test_push.py::test_handover_base_is_never_another_branch`: an agent branch `aaa` exists; new branch push
+    refused → `h.base` is the fork with main, not `aaa`'s tip.
+  - `test_fetch.py::test_fetch_delivers_a_new_branch_at_a_known_sha`: as `pt/test_probe.py`; reply says
+    `Wrote 2 branch(es)`; `git fetch --prune` in the clone creates `origin/release-1`.
+  - `test_fetch.py::test_fetch_prune_removes_branches_gone_from_github`: delete `gone` on the remote, fetch
+    with `have` = all tips, run the reply's command → `origin/gone` absent.
+  - `test_fetch.py::test_fetch_output_must_be_an_exchange_name` (parametrised): `.mcp.json`, `x.txt`,
+    `.claude/settings.json`, `.git/x.bundle`, a hard-linked `x.bundle` → `Refused`, target bytes unchanged;
+    `.tmp/x.bundle` and `out/x.bundle` succeed.
+  - `test_paths.py::test_exchange_reads` (parametrised): directory → `Refused` (not `IsADirectoryError`);
+    hard link → `Refused`; `.env`, `secrets.yaml`, `.storage/x.md`, `a/.git/b.md`, symlinked parent resolving
+    into `.claude/` → `Refused`; `.tmp/body.md`, `notes/body.txt` → bytes returned.
+  - `test_gh.py::test_gh_body_file_must_be_an_exchange_file`: `--body-file <ws>/secrets.yaml` → `Refused`,
+    fake `gh` never invoked.
+  - `test_gh.py::test_gh_download_goes_into_a_new_directory`: `-D <existing dir>` → `Refused`; `-D <new dir>` →
+    files written there only; `--clobber` → `Refused`.
+- [ ] **Step 2: Run** `.venv/bin/pytest -q` → the new tests FAIL.
+- [ ] **Step 3: Implement** D1-D11 as pinned in `.superpowers/sdd/2026-10-25-gate-rework/planning-review.md`.
+  Delete the replaced functions; do not keep compatibility shims.
+- [ ] **Step 4: Run** `./scripts/ci.sh` → pass; `grep -n "_protected\|_handover_paths\|def touched\|_normalise\|link_reaches" src/git_gate/*.py` → nothing.
+- [ ] **Step 5: Commit**, one change per commit:
+  `fix: canonicalise handover patterns and validate rules strictly`,
+  `fix: decide and disclose protected changes with one function`,
+  `fix: let pushed branches merge the default branch`,
+  `fix: always bundle every branch and prune on fetch`,
+  `fix: exchange only suffixed non-dot files with workspaces`,
+  `fix: decode git output losslessly and fullmatch identifiers`,
+  `fix: audit gitgatepush and fail the off switch closed`.
+
+### Task 6 amendments (append to its Interfaces, then its Step 1)
+
+```markdown
+- Body files: `paths.read_workspace_file(rules, path, "body")` under the exchange contract (D9): `*.md`/`*.txt`,
+  no dot component except `.tmp`, nlink 1, UTF-8, at most 65 536 characters, no token.
+- `triage(..., add_reviewers=(), remove_reviewers=())` (ledger ruling); every name validated before the first call.
+- Titles: one printable line, at most 256 characters. Labels: name at most 50 characters, colour `[0-9a-fA-F]{6}`,
+  description at most 100. Numbers: `type(n) is int and n > 0`.
+- `workflow_run` GETs `repos/<repo>/actions/runs/<id>` first and refuses every action when `head_branch` is the default
+  branch or matches `protected_branches` (refusal says to use the web UI).
+- Refusals carry GitHub's `message` (scrubbed, at most 500 characters). Every POST sends a JSON body.
+- `gh` downloads: the target directory must not exist; the gate creates it; `--clobber` is refused.
+```
+
+```markdown
+  - `test_body_file_rules` gains: `secrets.yaml`, `.env`, `.claude/x.md`, a hard link, invalid UTF-8,
+    65 537 characters → `Refused`; `.tmp/body.md` → the body sent equals the file.
+  - `test_numbers_are_strict_ints` (parametrised): `True`, `0`, `-1`, `"7"`, `7.0` → `Refused`.
+  - `test_workflow_run_on_default_branch_refused` (parametrised over rerun, rerun_failed, cancel): fake run with
+    `head_branch == "main"` → `Refused` mentioning the web UI; no POST recorded.
+  - `test_github_message_reaches_the_agent`: fake 422 `{"message": "Validation Failed"}` → `Refused` containing it.
+  - `test_triage_validates_before_writing`: one bad remove name → no call recorded at all.
+  - `test_edit_without_fields_refused`, `test_issue_edit_base_refused`.
+  - `test_replies_are_marked_untrusted` also covers refusals that carry GitHub text.
+```
+
+### Task 7 amendments
+
+```markdown
+**Interfaces (add):**
+- `Gate.dispatch(tool: str, kwargs: dict) -> str` — the only caller of `Gate.call` with `getattr`; used by
+  `server.build`, `Relay` fallback and `call.run`.
+- `call.TOOLS` is the single tool-name list (ten names); `server.build` registers exactly those.
+- `python -m git_gate call` with other than one tool argument prints usage to stderr and exits 2.
+- `INSTRUCTIONS` and docstrings carry these exact agent commands:
+  `git bundle create <dir>/.tmp/<name>.bundle <branch> --not --remotes=origin`,
+  `git fetch --prune <bundle> '+refs/heads/*:refs/remotes/origin/*'`,
+  `have`: `git for-each-ref --format='%(objectname)' refs/remotes/origin`,
+  and "bundle and body files must be *.bundle / *.md|*.txt outside dot directories (except .tmp)".
+- `errors.log` opened with mode 0o600 and rolled over at 1 MiB; relay refusals name the cause (no answer,
+  timeout, could not start).
+
+- [ ] Step 1 tests (add):
+  - `test_server_tools_equal_call_tools`: `set(registered) == set(call.TOOLS)`.
+  - `test_dispatch_is_the_only_path`: `grep`-style test that `getattr(gate, tool)` appears once in `src/`.
+  - `test_call_with_bad_arity_exits_without_serving`: `subprocess.run([... "call"], timeout=5)` → returncode 2.
+  - `test_instructions_carry_the_agent_steps` asserts the four strings above and `gitgatepush`, "the user merges".
+  - `test_relay_timeout_and_oserror_messages_differ`.
+  - `test_build_refuses_gate_and_relay_together`.
+```
+
+### Task 8 amendments
+
+```markdown
+- `install.sh`: after `switch_to` and in `rollback`, link `${GIT_GATE_BIN_DIR:-/usr/local/bin}/gitgatepush`;
+  then `command -v gitgatepush` must equal that path, else print a warning naming the shadowing path.
+  `switch_to` stops telling the user to restart sessions (the relay applies installs to the next call).
+- `bin/gitgatepush` exits 1 with a message unless `readlink -f "$0"` is under `${GIT_GATE_ROOT:-/opt/git-gate}/releases/`.
+- Step 1 dry run adds: a fake earlier-on-PATH `gitgatepush` → install prints the warning; a copy of
+  `bin/gitgatepush` outside releases → refuses to run.
+- `docs/smoke.md` adds, each with its expected reply:
+  - fetch after the user creates a branch at main's sha in the web UI → the branch arrives (I3 regression);
+  - push a branch that merges main after a workflow change on main → "Pushed" (I2 regression);
+  - a handover whose confirmation shows "Files under handover paths" for a rollback merge (I1 regression),
+    run with `n`;
+  - a bodyless typed write (`workflow_run cancel` on a feature-branch run, `pr ready`) → no 411;
+  - push on a private Free-plan repo → the 403 "Upgrade to GitHub Pro" path passes.
+- `docs/skills-migration.md` adds: bundles and body files live in `<repo>/.tmp/`; fetch uses `--prune`; how to
+  compute `have`.
+```
+
+---
