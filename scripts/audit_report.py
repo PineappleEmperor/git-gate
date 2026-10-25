@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Summarise git-gate's audit.log: run it from your own terminal, `python3 scripts/audit_report.py`.
 
-Reads <log>.1, then <log> (default ~/.local/state/git-gate/audit.log, or $GIT_GATE_STATE_DIR's).
+Reads the rotated <log>.<YYYYmmddTHHMMSS>[.<n>] files oldest first, then <log> (default
+~/.local/state/git-gate/audit.log, or $GIT_GATE_STATE_DIR's).
 Lines from releases before session, cwd, reason and ms were recorded count with what they have;
 lines that are not JSON objects with a time and a tool are counted and skipped. Standard library only.
 """
@@ -10,6 +11,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -17,16 +19,27 @@ from pathlib import Path
 OUTCOMES = ("ok", "refused", "handover", "error")
 TOP_REASONS = 20
 UNRECORDED = "(not recorded)"
+ROTATED = re.compile(r"(\d{8}T\d{6})(?:\.(\d+))?")  # the suffix after "audit.log."; fullmatch only
 
 
 def default_log() -> Path:
     return Path(os.environ.get("GIT_GATE_STATE_DIR", Path.home() / ".local/state/git-gate")) / "audit.log"
 
 
+def logs(log: Path) -> list[Path]:
+    """The rotated files, oldest first, then the log itself."""
+    rotated = []
+    for path in log.parent.glob(f"{log.name}.*") if log.parent.is_dir() else ():
+        m = ROTATED.fullmatch(path.name.removeprefix(log.name + "."))
+        if m:
+            rotated.append(((m[1], int(m[2] or 0)), path))
+    return [path for _, path in sorted(rotated)] + [log]
+
+
 def read(log: Path) -> tuple[list[dict], int, list[Path]]:
-    """The audit lines of <log>.1 then <log>, the number of malformed lines, and the files read."""
+    """The audit lines of every file `logs` names, the number of malformed lines, and the files read."""
     lines, bad, read_from = [], 0, []
-    for path in (log.with_name(log.name + ".1"), log):
+    for path in logs(log):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except FileNotFoundError:
@@ -134,14 +147,15 @@ def main(argv: list[str]) -> int:
 
     lines, bad, read_from = read(args.log)
     if not read_from:
-        print(f"no audit log at {args.log} or {args.log.name}.1 beside it")
+        print(f"no audit log at {args.log}, nor rotated ones beside it")
         return 1
     if args.since:
         lines = [line for line in lines if line["time"][:10] >= args.since]
     days = sorted(line["time"][:10] for line in lines)
     span = f", {days[0]} to {days[-1]}" if days else ""
     skipped = f"; {bad} malformed line(s) skipped" if bad else ""
-    print(f"{', '.join(map(str, read_from))}: {len(lines)} line(s){span}{skipped}")
+    rotated = sum(path != args.log for path in read_from)
+    print(f"{args.log} and {rotated} rotated file(s): {len(lines)} line(s){span}{skipped}")
     print()
     print("\n".join(report(lines)))
     return 0

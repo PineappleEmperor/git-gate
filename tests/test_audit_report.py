@@ -52,7 +52,7 @@ def row(lines: list[str], *words: str) -> list[str]:
 @pytest.fixture
 def log(tmp_path) -> Path:
     write(
-        tmp_path / "audit.log.1",
+        tmp_path / "audit.log.20261001T090000",
         gate_line("2026-10-01", outcome="refused", reason="me/app is read-only", session="1-1", cwd="/w/old"),
         "not json at all",
     )
@@ -128,8 +128,21 @@ def test_no_log(capsys, tmp_path):
     assert "no audit log" in out
 
 
-def test_reads_the_old_file_alone(capsys, tmp_path):
-    write(tmp_path / "audit.log.1", gate_line(session="1-1", cwd="/w/x"))
+def test_reads_rotated_files_oldest_first(tmp_path):
+    names = [
+        "audit.log.20260930T235959",
+        "audit.log.20261025T120000",
+        "audit.log.20261025T120000.2",
+        "audit.log.20261025T120000.10",
+        "audit.log",
+    ]
+    for name in [*names, "audit.log.1", "audit.log.tmp", "audit.lock"]:
+        write(tmp_path / name, gate_line())
+    assert report.logs(tmp_path / "audit.log") == [tmp_path / name for name in names]
+
+
+def test_reads_rotated_files_alone(capsys, tmp_path):
+    write(tmp_path / "audit.log.20261020T090000", gate_line(session="1-1", cwd="/w/x"))
     code, out = run(capsys, str(tmp_path / "audit.log"))
     assert code == 0
     assert row(section(out, "Calls per session folder"), "/w/x")[2] == "1"
