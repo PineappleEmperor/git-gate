@@ -17,6 +17,7 @@ import urllib.parse
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from typing import NoReturn
 
 from git_gate import Refused, ghpolicy, writes
 from git_gate.call import TOOLS
@@ -40,6 +41,8 @@ MAX_BUNDLE = 512 << 20
 RATE_LIMIT = 60
 RATE_WINDOW = 60
 FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
+# What GitHub says when a token without the Workflows permission pushes a change to .github/workflows.
+WORKFLOW_SCOPE = "create or update workflow"
 MAX_NAMED = 20  # protected files named in a refusal; the handover record and screen hold them all
 
 
@@ -313,23 +316,17 @@ class Gate:
                 fork = self.mirror.fork_point(repo, sha, default_tip, rules)
                 if found:
                     reasons.append(_refusal_for(found))
+                hand_over = functools.partial(
+                    self._hand_over, rules, repo, branch, sha, remote or fork, lease,
+                    patterns=patterns, protected=found.files, exclude=comparison(remote, default_tip),
+                )  # fmt: skip
                 if reasons:
-                    h = self.handovers.create(
-                        repo, branch, sha, remote or fork, lease, " ".join(reasons),
-                        patterns=patterns, protected=found.files, exclude=comparison(remote, default_tip),
-                    )  # fmt: skip
-                    try:
-                        self.mirror.keep(repo, h.ref, sha, rules)
-                    except BaseException:
-                        self.handovers.close(h.id)  # a record must never name a commit the mirror may lose
-                        raise
-                    raise HandedOver(
-                        f"Not pushed: {' '.join(reasons)} That push is the user's. The gate kept {sha[:12]} as "
-                        f"handover {h.id}; hand the user this command, which shows the commits and asks before "
-                        f"pushing from their own terminal:\n\ngitgatepush {h.id}" + "".join(f"\n\n{a}" for a in advice)
-                    )
+                    hand_over(reasons, advice)
                 new = self.mirror.new_commits(repo, sha, remote or default_tip, rules)
                 proc = self.mirror.push(repo, sha, branch, token, rules)
+                if proc.returncode != 0 and WORKFLOW_SCOPE in proc.stdout + proc.stderr:
+                    # The PAT has no Workflows permission; the user's own push is not bound by it (I1).
+                    hand_over(["GitHub refuses workflow changes from the gate's token."], [])
         if proc.returncode != 0:
             raise Refused(f"git push was rejected:\n{(proc.stdout + proc.stderr).strip()[-MAX_STDERR:]}")
         lines = [f"Pushed {len(new)} commit(s) to {repo} {branch} ({(remote or 'new')[:12]} -> {sha[:12]})."]
@@ -345,6 +342,23 @@ class Gate:
         if repo_rules.push_deploys:
             lines.append("This push deploys.")
         return "\n".join(lines)
+
+    def _hand_over(
+        self, rules: Rules, repo: str, branch: str, sha: str, base: str | None, lease: str | None,
+        reasons: list[str], advice: list[str], **record,
+    ) -> NoReturn:  # fmt: skip
+        """Keep sha for the user's `gitgatepush` and tell the agent so; the caller holds the mirror lock."""
+        h = self.handovers.create(repo, branch, sha, base, lease, " ".join(reasons), **record)
+        try:
+            self.mirror.keep(repo, h.ref, sha, rules)
+        except BaseException:
+            self.handovers.close(h.id)  # a record must never name a commit the mirror may lose
+            raise
+        raise HandedOver(
+            f"Not pushed: {' '.join(reasons)} That push is the user's. The gate kept {sha[:12]} as "
+            f"handover {h.id}; hand the user this command, which shows the commits and asks before "
+            f"pushing from their own terminal:\n\ngitgatepush {h.id}" + "".join(f"\n\n{a}" for a in advice)
+        )
 
     def prune(self, rules: Rules, token: str, repo: str, branch: str) -> str:
         rules.require_write(repo)

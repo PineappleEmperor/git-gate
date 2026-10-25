@@ -10,7 +10,7 @@ import pytest
 
 import git_gate.gate as gate_module
 from conftest import TOKEN, call, commit, git, make_bundle, push
-from git_gate import Refused
+from git_gate import Refused, handover
 from git_gate.config import load_rules
 from git_gate.gate import Gate
 from git_gate.github import GitHub
@@ -202,6 +202,64 @@ def test_merging_main_into_a_pushed_branch_after_a_workflow_change_passes(env, c
     tip = git("rev-parse", "HEAD", cwd=checkout)
     assert "Pushed" in push(env, checkout, "topic")
     assert remote_ref(env, "topic") == tip
+
+
+WORKFLOW_SCOPE = (
+    "refusing to allow a Personal Access Token to create or update workflow `.github/workflows/ci.yml` "
+    "without `workflow` scope"
+)
+
+
+def reject_pushes(env, message: str) -> None:
+    """GitHub's receive side, as far as a test needs it: refuse every push with `message`."""
+    hook = env.bare / "hooks/pre-receive"
+    hook.write_text(f"#!/bin/sh\necho '{message}' >&2\nexit 1\n")
+    hook.chmod(0o755)
+    git("config", "core.hooksPath", str(env.bare / "hooks"), cwd=env.bare)  # the gate's config turns hooks off
+
+
+def test_github_refusing_the_tokens_workflow_push_becomes_a_handover(env, checkout):
+    """I1: merging main after a workflow change can pass the gate yet die at GitHub for want of the
+    Workflows permission. The user's own push is not bound by the token, so it is handed over."""
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "topic.txt")
+    first = remote_ref(env, "main")
+    assert "Pushed" in push(env, checkout, "topic")
+    pushed = remote_ref(env, "topic")
+    seed = env.tmp / "seed"
+    commit(seed, ".github/workflows/ci.yml", "on: push")
+    git("push", "-q", env.url, "main", cwd=seed)
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("merge", "-q", "--no-edit", "origin/main", cwd=checkout)
+    tip = git("rev-parse", "HEAD", cwd=checkout)
+    reject_pushes(env, WORKFLOW_SCOPE)
+    with pytest.raises(Refused) as e:
+        push(env, checkout, "topic")
+    msg = str(e.value)
+    assert "GitHub refuses workflow changes from the gate's token" in msg
+    hid = int(re.findall(r"gitgatepush (\d+)", msg)[0])
+    h = Handovers(env.state).get(hid)
+    assert (h.sha, h.base, h.lease, h.branch) == (tip, pushed, None, "topic")
+    assert "GitHub refuses workflow changes" in h.reason
+    assert mirror_ref(env, f"refs/gate/handover/{hid}") == tip
+    assert remote_ref(env, "topic") == pushed != first
+    assert json.loads((env.state / "audit.log").read_text().splitlines()[-1])["outcome"] == "handover"
+
+    (env.bare / "hooks/pre-receive").unlink()  # the user's SSH push is not bound by the token
+    out = io.StringIO()
+    assert handover.main([str(hid)], stdin=io.StringIO("y\n"), stdout=out, base_url=env.gate.git.base_url) == 0
+    assert remote_ref(env, "topic") == tip
+    assert Handovers(env.state).open() == []
+
+
+def test_other_github_rejections_stay_plain_refusals(env, checkout):
+    git("switch", "-q", "-c", "topic", cwd=checkout)
+    commit(checkout, "topic.txt")
+    reject_pushes(env, "pre-receive hook declined")
+    with pytest.raises(Refused, match="git push was rejected") as e:
+        push(env, checkout, "topic")
+    assert "gitgatepush" not in str(e.value)
+    assert Handovers(env.state).open() == []
 
 
 # --- refusals become handovers -------------------------------------------------------------
