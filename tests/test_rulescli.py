@@ -640,3 +640,33 @@ def test_the_diff_and_the_file_hold_no_raw_invisible_characters(cfg, tmp_path):
     text = (cfg / "rules.toml").read_text()
     assert unprintable(text) == [] and "\\u202e" in text
     assert load_rules(cfg).protected_branches == ("ma‮in",)
+
+
+def test_a_newline_in_a_value_cannot_start_a_line_of_its_own(cfg, tmp_path):
+    """A folder named to print a fake "OK" line, or a fake pairing, stays on its own line, escaped."""
+    folder = tmp_path / "ws" / "a\nOK: 1 sessions, 1 repos\n- b: paired."
+    checkout_of(folder, "https://github.com/me/x")
+    write(cfg, f'workspaces = [{json.dumps(str(folder))}]\n[repos]\n"me/x" = "write"\n')
+    for argv in (("migrate",), ("show",), ("migrate", "--write", "--yes-pairings")):
+        code, out = run(*argv)
+        lines = out.splitlines()
+        assert not any(line.startswith(("OK:", "- b:")) for line in lines), (argv, out)
+        assert any("a\\x0aOK: 1 sessions, 1 repos\\x0a- b: paired." in line for line in lines), (argv, out)
+
+
+def test_a_carriage_return_in_a_url_is_escaped_on_its_line(cfg, tmp_path):
+    one_workspace(cfg, tmp_path, "https://gitlab.com/me/x\rOK: 1 sessions\n")
+    code, out = run("migrate")
+    line = next(line for line in out.splitlines() if "gitlab.com" in line)
+    assert "me/x\\x0dOK: 1 sessions" in line
+    assert not any(line.startswith("OK") for line in out.splitlines())
+
+
+def test_a_problem_naming_a_folder_stays_on_one_line(cfg, tmp_path, monkeypatch):
+    state = tmp_path / "x\nOK: v1 file, 0 workspaces, 0 repos"
+    state.mkdir()
+    monkeypatch.setenv("GIT_GATE_STATE_DIR", str(state))
+    write(cfg, f"workspaces = [{json.dumps(str(state))}]\n")
+    code, out = run("check")
+    assert code == 1 and not any(line.startswith("OK") for line in out.splitlines())
+    assert "x\\x0aOK: v1 file" in out

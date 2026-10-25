@@ -59,18 +59,23 @@ MAX_LINE = 2000  # characters of one printed line
 MAX_VALUE = 300  # characters of a URL or git's stderr in a message
 
 
-def clean(text: str, limit: int = MAX_LINE) -> str:
-    """Text as it may reach the user's terminal, which every line gitgaterules prints goes through:
-    whatever is not printable (control characters, escape sequences, bidi and zero-width marks) as
-    an escape, the rule scripts/audit_report.py uses, and each line at most `limit` characters.
+def shown(value: object, limit: int = MAX_LINE) -> str:
+    """One value from a file, git or the command line (a folder, a URL, git's stderr) as one line:
+    whatever is not printable (control characters, newlines and CRs, escape sequences, bidi and
+    zero-width marks) as an escape, the rule scripts/audit_report.py uses, at most `limit` characters.
 
-    Remote URLs, git's stderr, folder names and the rules file can all hold text an agent wrote.
+    Remote URLs, git's stderr, folder names and the rules file can all hold text an agent wrote, so
+    each such value goes through here before it is put into a message: then no value can start a
+    line of its own, such as a made-up "OK".
     """
-    lines = []
-    for line in text.split("\n"):
-        line = "".join(c if c.isprintable() else _escape(c) for c in line)
-        lines.append(line if len(line) <= limit else line[:limit] + "…")
-    return "\n".join(lines)
+    text = "".join(c if c.isprintable() else _escape(c) for c in str(value))
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def clean(text: str) -> str:
+    """A whole message, built from gitgaterules' own wording around `shown` values, as printed:
+    its lines kept, anything else not printable escaped. Every line gitgaterules prints goes through."""
+    return "\n".join(shown(line) for line in text.split("\n"))
 
 
 def _escape(c: str) -> str:
@@ -123,16 +128,16 @@ def _say_problems(checked: Checked, text: str, say) -> None:
     for kind, found in (("error", checked.problems), ("warning", checked.warnings)):
         for p in found:
             n = line_of(text, p.where)
-            say(f"{kind}: {f'line {n}: ' if n else ''}{p.text}")
+            say(f"{kind}: {f'line {n}: ' if n else ''}{shown(p.text)}")
 
 
 def _read(path: Path, say) -> str | None:
     try:
         return path.read_text()
     except FileNotFoundError:
-        say(f"No rules file at {path}.")
+        say(f"No rules file at {shown(path)}.")
     except (OSError, UnicodeDecodeError) as e:
-        say(f"Cannot read {path}: {e}.")
+        say(f"Cannot read {shown(path)}: {shown(e)}.")
     return None
 
 
@@ -186,18 +191,18 @@ def cmd_show(args: list[str], say) -> int:
         say("v1 rules, not scoped: every conversation reaches all of these.")
         say("workspaces:")
         for w in rules.workspaces:
-            say(f"  {w}")
+            say(f"  {shown(w)}")
         say("repos:")
         for name, repo in sorted(rules.repos.items()):
             say(f"  {repo.access:<5}  {name}")
         return 0
     blocks = []
     for s in sorted(rules.sessions, key=lambda s: str(s.folder)):
-        lines = [str(s.folder)]
+        lines = [shown(s.folder)]
         width = max((len(n) for n in s.names.values()), default=0)
         for key in sorted(s.access, key=lambda k: (s.access[k] != "write", k)):
             via = ", ".join(VIA.get(v, v) for v in s.via[key])
-            lines.append(f"  {s.access[key]:<5}  {s.names[key]:<{width}}  {via}")
+            lines.append(f"  {s.access[key]:<5}  {s.names[key]:<{width}}  {shown(via)}")
         if len(lines) == 1:
             lines.append("  (no repos)")
         blocks.append("\n".join(lines))
@@ -355,29 +360,29 @@ def save(path: Path, old: bytes | None, new: str, say) -> tuple[int, Checked | N
     """Validate `new` as the gate would, keep a backup of `old`, write `new` and show the diff."""
     old_text = old.decode() if old is not None else ""
     if old_text == new:
-        say(f"No change: {path} already says so.")
+        say(f"No change: {shown(path)} already says so.")
         return 0, None
     checked = check_rules(new, config_dir())
     if checked.problems:
         _say_problems(Checked(None, checked.problems, []), new, say)
-        say(f"Not written: the result would not load, so {path} is unchanged.")
+        say(f"Not written: the result would not load, so {shown(path)} is unchanged.")
         return 1, None
     target = path.resolve()  # a symlinked rules.toml (dotfiles) is written through, not replaced
     now = target.read_bytes() if target.exists() else None
     if now != old:
-        say(f"Not written: {path} changed while gitgaterules was editing it; run the command again.")
+        say(f"Not written: {shown(path)} changed while gitgaterules was editing it; run the command again.")
         return 1, None
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     backup = _backup(target, old) if old is not None else None
     _replace(target, new)
     diff = difflib.unified_diff(
-        old_text.splitlines(keepends=True), new.splitlines(keepends=True), f"{path} (before)", str(path)
+        old_text.splitlines(keepends=True), new.splitlines(keepends=True), f"{shown(path)} (before)", shown(path)
     )
     say("".join(diff), end="")
     if backup:
-        say(f"Backup of the old file: {backup}")
+        say(f"Backup of the old file: {shown(backup)}")
     _say_problems(Checked(None, [], checked.warnings), new, say)
-    say(f"Wrote {path}.")
+    say(f"Wrote {shown(path)}.")
     return 0, checked
 
 
@@ -392,10 +397,10 @@ def _edit(say, change) -> tuple[int, Checked | None]:
     try:
         data = tomllib.loads(old.decode()) if old is not None else {}
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
-        say(f"{path} cannot be read as TOML ({e}); fix it by hand, then run gitgaterules check.")
+        say(f"{shown(path)} cannot be read as TOML ({shown(e)}); fix it by hand, then run gitgaterules check.")
         return 1, None
     if old is not None and "sessions" not in data:
-        say(f"{path} is a v1 file; gitgaterules edits v2 files. Run gitgaterules migrate first.")
+        say(f"{shown(path)} is a v1 file; gitgaterules edits v2 files. Run gitgaterules migrate first.")
         return 1, None
     data.setdefault("sessions", {})
     try:
@@ -423,7 +428,9 @@ def _session(data: dict, folder: str) -> tuple[str, dict]:
             if not isinstance(entry, dict):
                 raise EditError(f"{label('sessions', key)} is not a table; fix it by hand.")
             return key, entry
-    raise EditError(f"No session for {folder}. Add it first: gitgaterules add-session {folder} --repo <owner/name>")
+    raise EditError(
+        f"No session for {shown(folder)}. Add it first: gitgaterules add-session {shown(folder)} --repo <owner/name>"
+    )
 
 
 def _target(target: str) -> str:
@@ -466,7 +473,7 @@ def cmd_grant(args: list[str], say) -> int:
             raise EditError(f"{label('sessions', key)} {level} is not a list; fix it by hand.")
         if not any(isinstance(e, str) and _same_entry(e, target) for e in entries):
             entries.append(target)
-        return f"{key}: {target} moved from {other} to {level}." if moved else ""
+        return f"{shown(key)}: {target} moved from {other} to {level}." if moved else ""
 
     return _edit(say, change)[0]
 
@@ -486,7 +493,9 @@ def cmd_revoke(args: list[str], say) -> int:
             del entry["repo"]
             dropped.append("repo")
         if not dropped:
-            raise EditError(f"{target} is not granted to {key} by name; gitgaterules show lists what reaches what.")
+            raise EditError(
+                f"{shown(target)} is not granted to {shown(key)} by name; gitgaterules show lists what reaches what."
+            )
         return ""
 
     code, checked = _edit(say, change)
@@ -494,7 +503,7 @@ def cmd_revoke(args: list[str], say) -> int:
         session = next(s for s in checked.rules.sessions if _same_folder(str(s.folder), found[0]))
         if target.lower() in session.access:
             via = ", ".join(session.via[target.lower()])
-            say(f"Note: {target} is still reached through {via} ({session.access[target.lower()]}).")
+            say(f"Note: {shown(target)} is still reached through {shown(via)} ({session.access[target.lower()]}).")
     return code
 
 
@@ -509,9 +518,9 @@ def cmd_add_session(args: list[str], say) -> int:
         except EditError:
             pass
         else:
-            raise EditError(f"{key} is already a session; gitgaterules grant adds to it.")
+            raise EditError(f"{shown(key)} is already a session; gitgaterules grant adds to it.")
         data["sessions"][folder] = {"repo": _target(args[2])} if len(args) == 3 else {}
-        return f"The session is stored as {folder}." if folder != args[0] else ""
+        return f"The session is stored as {shown(folder)}." if folder != args[0] else ""
 
     return _edit(say, change)[0]
 
@@ -541,11 +550,11 @@ def cmd_group(args: list[str], say) -> int:
         if action == "add":
             entries = groups.setdefault(name, [])
             if not isinstance(entries, list):
-                raise EditError(f"[groups] {name} is not a list; fix it by hand.")
+                raise EditError(f"[groups] {shown(name)} is not a list; fix it by hand.")
             if not any(isinstance(e, str) and _same_entry(e, target) for e in entries):
                 entries.append(target)
         elif not _drop(groups.get(name), target):
-            raise EditError(f"{target} is not in [groups] {name}.")
+            raise EditError(f"{shown(target)} is not in [groups] {shown(name)}.")
         return ""
 
     return _edit(say, change)[0]
@@ -562,7 +571,9 @@ GITHUB_URL_RE = re.compile(
 
 def shown_url(url: str) -> str:
     """A remote URL fit to print: no user name or password (all before the netloc's last "@"), no
-    query and no fragment, escaped and cut by `clean`. scp-like URLs (user@host:path) too."""
+    query and no fragment, escaped and cut by `shown`. scp-like URLs (user@host:path) too. It is
+    escaped first: urlsplit would drop a tab, CR or newline unseen, and the escapes keep its shape."""
+    url = shown(url, limit=len(url) * 10)
     try:
         parts = urllib.parse.urlsplit(url)
     except ValueError:
@@ -572,7 +583,7 @@ def shown_url(url: str) -> str:
     else:
         host, colon, path = url.partition(":")
         url = host.rpartition("@")[2] + colon + re.split(r"[?#]", path, maxsplit=1)[0]
-    return clean(url, MAX_VALUE)
+    return shown(url, MAX_VALUE)
 
 
 def origin_repo(folder: Path) -> tuple[str | None, str]:
@@ -595,13 +606,12 @@ def origin_repo(folder: Path) -> tuple[str | None, str]:
             env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=30, check=False,
         )  # fmt: skip
     except (OSError, subprocess.TimeoutExpired) as e:
-        return None, f"could not be read by git ({e})"
+        return None, f"could not be read by git ({shown(e, MAX_VALUE)})"
     if proc.returncode == 1:
         return None, "has no origin remote"
     if proc.returncode != 0:
         # Decoded here, not in text mode, which would turn a stray \r into a line break unseen.
-        stderr = proc.stderr.decode(errors="replace").strip().replace("\n", " ")
-        return None, f"could not be read by git ({clean(stderr, MAX_VALUE)})"
+        return None, f"could not be read by git ({shown(proc.stderr.decode(errors='replace').strip(), MAX_VALUE)})"
     url = proc.stdout.decode(errors="replace").strip()
     m = GITHUB_URL_RE.fullmatch(url)
     if not m or not valid_repo(m[1]):
@@ -614,7 +624,9 @@ def _git_dir_outside(folder: Path) -> str | None:
     dot = folder / ".git"
     if dot.is_symlink():
         target = dot.resolve()
-        return None if target.is_relative_to(folder) else f"its .git is a symlink to {target}, outside the folder"
+        return (
+            None if target.is_relative_to(folder) else f"its .git is a symlink to {shown(target)}, outside the folder"
+        )
     if dot.is_file():
         try:
             first = dot.read_text(errors="replace").partition("\n")[0]
@@ -622,7 +634,7 @@ def _git_dir_outside(folder: Path) -> str | None:
             return "its .git is a file that cannot be read"
         target = (folder / first.removeprefix("gitdir:").strip()).resolve()
         if not first.startswith("gitdir:") or not target.is_relative_to(folder):
-            return f"its .git is a gitfile pointing to {target}, outside the folder (a worktree or submodule)"
+            return f"its .git is a gitfile pointing to {shown(target)}, outside the folder (a worktree or submodule)"
     return None
 
 
@@ -666,32 +678,32 @@ def migrate(data: dict, decide) -> tuple[dict, list[str]]:
         folder = Path(w).resolve()
         key = str(folder)
         if key in sessions:
-            notes.append(f"{w}: the same folder as an earlier workspace, {key}; one session.")
+            notes.append(f"{shown(w)}: the same folder as an earlier workspace, {shown(key)}; one session.")
             continue
         if not folder.is_dir():
-            notes.append(f"{w}: left out: the folder does not exist, and a session's folder must.")
+            notes.append(f"{shown(w)}: left out: the folder does not exist, and a session's folder must.")
             continue
         sessions[key] = {"read": ["@reads"]} if reads else {}
         repo, why = origin_repo(folder)
         level = access.get(repo.lower()) if repo else None
         if repo is None:
-            notes.append(f"{key}: {why}, so the session has no repo of its own; it gets the reads only.")
+            notes.append(f"{shown(key)}: {why}, so the session has no repo of its own; it gets the reads only.")
         elif level == "write":
             pairing = Pairing(key, repo)
             if outside := _git_dir_outside(folder):
                 pairing.flags.append(outside)
             if folder.name.lower() != repo.partition("/")[2].lower():
-                pairing.warnings.append(f"the folder is named {folder.name}, the repo {repo}")
+                pairing.warnings.append(f"the folder is named {shown(folder.name)}, the repo {repo}")
             pairings.append(pairing)
         elif level == "read":
             notes.append(
-                f"{key}: its origin is {repo}, read-only in [repos]: kept read-only (through @reads), not made "
-                f"the session's own repo. To let it write: gitgaterules grant {key} write {repo}"
+                f"{shown(key)}: its origin is {repo}, read-only in [repos]: kept read-only (through @reads), not "
+                f"made the session's own repo. To let it write: gitgaterules grant {shown(key)} write {repo}"
             )
         else:
             notes.append(
-                f"{key}: its origin is {repo}, which is not in [repos]: left out, as no conversation can reach "
-                f"it today. To make it the session's: gitgaterules grant {key} write {repo}"
+                f"{shown(key)}: its origin is {repo}, which is not in [repos]: left out, as no conversation can "
+                f"reach it today. To make it the session's: gitgaterules grant {shown(key)} write {repo}"
             )
     claims: dict[str, int] = {}
     for p in pairings:
@@ -701,7 +713,7 @@ def migrate(data: dict, decide) -> tuple[dict, list[str]]:
         if claims[p.repo.lower()] > 1:
             p.flags.append(f"{p.repo} is claimed by more than one folder")
         said = "; ".join(p.flags + p.warnings)
-        proposal = f"{p.folder}: its origin is {p.repo}, write in [repos]: proposed as the session's own repo"
+        proposal = f"{shown(p.folder)}: its origin is {p.repo}, write in [repos]: proposed as the session's own repo"
         if decide(p):
             sessions[p.folder]["repo"] = p.repo
             owned.add(p.repo.lower())
@@ -709,7 +721,7 @@ def migrate(data: dict, decide) -> tuple[dict, list[str]]:
         else:
             notes.append(
                 f"{proposal}{f' ({said})' if said else ''}; not paired, so the session has no repo of its own. "
-                f"To pair it later: gitgaterules grant {p.folder} write {p.repo}"
+                f"To pair it later: gitgaterules grant {shown(p.folder)} write {p.repo}"
             )
     new["sessions"] = sessions
     if not sessions:
@@ -734,14 +746,15 @@ def _ask(stdin, say):
     """Ask about each pairing on the terminal; no is the default, and a flagged one needs its repo typed."""
 
     def decide(p: Pairing) -> bool:
-        say(f"\n{p.folder}: its origin says {p.repo}. A session's own repo can be written by every conversation there.")
+        say(f"\n{shown(p.folder)}: its origin says {p.repo}.")
+        say("A session's own repo can be written by every conversation started in its folder.")
         for w in p.warnings:
             say(f"Warning: {w}.")
         if p.flags:
             say(f"Flagged: {'; '.join(p.flags)}.")
             say(f"Type {p.repo} to pair them anyway, or press Enter to leave the session without a repo: ", end="")
             return stdin.readline().strip().lower() == p.repo.lower()
-        say(f"Make {p.repo} the own repo (write) of {p.folder}? [y/N] ", end="")
+        say(f"Make {p.repo} the own repo (write) of {shown(p.folder)}? [y/N] ", end="")
         return stdin.readline().strip().lower() in ("y", "yes")
 
     return decide
@@ -754,7 +767,7 @@ def _named(pairs: list[str], proposed: list[Pairing], say):
         folder, eq, repo = pair.rpartition("=")
         match = [p for p in proposed if eq and _same_folder(p.folder, folder) and p.repo.lower() == repo.lower()]
         if not match:
-            say(f"{pair} is not a proposed pairing; gitgaterules migrate lists them. Nothing written.")
+            say(f"{shown(pair)} is not a proposed pairing; gitgaterules migrate lists them. Nothing written.")
             return None
         chosen += match
     return lambda p: p in chosen
@@ -775,7 +788,7 @@ def cmd_migrate(args: list[str], say, stdin) -> int:
         say("Fix these in the v1 file first; nothing was migrated.")
         return 1
     if checked.rules.version == 2:
-        say(f"{path} is already a v2 file (it has [sessions]); nothing to migrate.")
+        say(f"{shown(path)} is already a v2 file (it has [sessions]); nothing to migrate.")
         return 0
     data = tomllib.loads(text)
     proposed: list[Pairing] = []
@@ -791,14 +804,14 @@ def cmd_migrate(args: list[str], say, stdin) -> int:
         _say_problems(result, new, say)
         if proposed:
             say("\nThis shows every proposed pairing made; with --write each is asked one by one, no by default.")
-        say(f"\nNothing written. To write it, keeping {path.name} as a backup: gitgaterules migrate --write")
+        say(f"\nNothing written. To write it, keeping {shown(path.name)} as a backup: gitgaterules migrate --write")
         return 1 if result.problems else 0
     if pairs is not None:
         decide = _named(pairs, proposed, say)
         if decide is None:
             return 1
     elif proposed and not stdin.isatty():
-        named = " ".join(f"{p.folder}={p.repo}" for p in proposed)
+        named = " ".join(f"{shown(p.folder)}={p.repo}" for p in proposed)
         say("Not written: each folder-to-repo pairing needs your yes, and there is no terminal to ask on.")
         say("Run it in a terminal, or name the pairings you confirm:\n")
         say(f"gitgaterules migrate --write --yes-pairings {named}")
