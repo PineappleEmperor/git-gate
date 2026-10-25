@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from conftest import TOKEN, call
@@ -167,8 +169,22 @@ def test_gh_env_and_scrubbing(env, fake_gh):
     assert TOKEN not in out and "[token]" in out
     rec = fake_gh()
     assert rec["args"] == ["pr", "list", "-R", "me/app"]
-    assert rec["env"]["GH_TOKEN"] == TOKEN
-    assert rec["env"]["GH_CONFIG_DIR"] == str(env.state / "gh")
+    assert rec["env"]["GH_PROMPT_DISABLED"] == "1"
+
+
+def test_gh_takes_the_token_from_a_private_per_call_hosts_file(env, fake_gh):
+    """The token is never in gh's environment, where a jq filter could read it (C1)."""
+    call(env, "gh", repo="me/app", args=["pr", "list"])
+    call(env, "gh", repo="me/app", args=["pr", "view", "1"])
+    rec = fake_gh()
+    assert not [k for k, v in rec["env"].items() if TOKEN in v or k in ("GH_TOKEN", "GITHUB_TOKEN")]
+    cfg = Path(rec["env"]["GH_CONFIG_DIR"])
+    assert cfg.parent.parent == env.state / "tmp"
+    assert rec["hosts"]["mode"] == "0o600" and rec["hosts"]["dir_mode"] == "0o700"
+    assert f'oauth_token: "{TOKEN}"' in rec["hosts"]["text"]
+    assert rec["hosts"]["text"].startswith("github.com:\n")
+    assert not cfg.exists()
+    assert not [p for p in env.state.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
     assert rec["env"]["GH_PROMPT_DISABLED"] == "1"
     assert rec["cwd"] == str(env.state / "empty")
     assert "GIT_GATE_TOKEN" not in rec["env"]

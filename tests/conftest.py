@@ -193,7 +193,12 @@ def fake_gh(env):
         f"rec = pathlib.Path({str(record)!r})\n"
         "args = sys.argv[1:]\n"
         "files = {a: pathlib.Path(a).read_text() for a in args if a.startswith('/') and pathlib.Path(a).is_file()}\n"
-        "rec.write_text(json.dumps({'args': args, 'cwd': os.getcwd(), 'env': dict(os.environ), 'files': files}))\n"
+        "cfg = pathlib.Path(os.environ.get('GH_CONFIG_DIR', '/nonexistent'))\n"
+        "hosts = cfg / 'hosts.yml'\n"
+        "seen = {'text': hosts.read_text(), 'mode': oct(hosts.stat().st_mode & 0o777),\n"
+        "        'dir_mode': oct(cfg.stat().st_mode & 0o777)} if hosts.is_file() else {}\n"
+        "rec.write_text(json.dumps({'args': args, 'cwd': os.getcwd(), 'env': dict(os.environ), 'files': files,\n"
+        "                           'hosts': seen}))\n"
         "if '999' in args:\n"
         "    print('GraphQL: Could not resolve to a PullRequest with the number of 999.', file=sys.stderr)\n"
         "    sys.exit(1)\n"
@@ -202,7 +207,7 @@ def fake_gh(env):
         "    (d / '.claude').mkdir(); (d / '.claude/settings.json').write_text('{}')\n"
         "if '-O' in args:\n"
         "    pathlib.Path(args[args.index('-O') + 1]).write_text('asset')\n"
-        "print('ok', os.environ.get('GH_TOKEN'))\n"
+        "print('ok', os.environ.get('GH_TOKEN') or seen.get('text'))\n"
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     env.gate.gh_bin = str(script)

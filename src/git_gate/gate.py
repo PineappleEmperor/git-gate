@@ -82,8 +82,7 @@ class Gate:
         self.gh_bin = gh
         self.github = github
         self.clock = clock
-        for d in ("gh", "rate"):
-            (self.state / d).mkdir(exist_ok=True, mode=0o700)
+        (self.state / "rate").mkdir(exist_ok=True, mode=0o700)
 
     # --- plumbing -----------------------------------------------------------------------
 
@@ -460,7 +459,7 @@ class Gate:
             try:
                 proc = subprocess.run(
                     [self.gh_bin, *p.argv],
-                    env=self._gh_env(token) | p.env,
+                    env=self._gh_env(_gh_config(work, token)) | p.env,
                     cwd=self.state / EMPTY,
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
@@ -490,11 +489,11 @@ class Gate:
         note = f"; skipped symlinks and dot-named entries: {', '.join(skipped)}" if skipped else ""
         return f"\nSaved to {real}: {', '.join(written) or 'nothing'}{note}"
 
-    def _gh_env(self, token: str) -> dict[str, str]:
+    def _gh_env(self, config: Path) -> dict[str, str]:
+        """gh's whole environment. It never holds the token: `--jq` filters can read it (`$ENV`, `env`)."""
         return self.git.env() | {
-            "GH_TOKEN": token,
             "GH_HOST": "github.com",
-            "GH_CONFIG_DIR": str(self.state / "gh"),
+            "GH_CONFIG_DIR": str(config),
             "GH_PROMPT_DISABLED": "1",
             "GH_NO_UPDATE_NOTIFIER": "1",
             "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
@@ -508,6 +507,30 @@ class Gate:
             "BROWSER": "false",
             "NO_COLOR": "1",
         }
+
+
+def _gh_config(work: Path, token: str) -> Path:
+    """A fresh gh config directory for one call, its token in hosts.yml (0600) rather than the environment.
+
+    Written in gh's multi-account layout with `version: "1"`, so gh migrates nothing and asks
+    GitHub for no user name. The directory goes when `work` does, at the end of the call.
+    """
+    config = work / "gh"
+    config.mkdir(mode=0o700)
+    quoted = json.dumps(token)  # a JSON string is a valid YAML scalar
+    files = {
+        "config.yml": 'version: "1"\n',
+        "hosts.yml": (
+            "github.com:\n"
+            f"    users:\n        git-gate:\n            oauth_token: {quoted}\n"
+            f"    git_protocol: https\n    user: git-gate\n    oauth_token: {quoted}\n"
+        ),
+    }
+    for name, text in files.items():
+        fd = os.open(config / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+    return config
 
 
 def _refusal_for(found: Protected) -> str:
