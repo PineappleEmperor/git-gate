@@ -159,3 +159,27 @@ def test_runs_as_a_script(log):
     proc = subprocess.run([sys.executable, str(SCRIPT), str(log)], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     assert "Calls per repo and tool" in proc.stdout
+
+
+def test_log_text_cannot_drive_the_terminal(capsys, tmp_path):
+    """Agents and GitHub put text in the log; JSON keeps control characters, json.loads restores them."""
+    log = write(
+        tmp_path / "audit.log",
+        gate_line(outcome="refused", reason="\x1b[2K\x1b[1Aall clear", cwd="/w/a\rFAKE", repo="me/\x9bapp"),
+        gate_line(tool="gh‮", outcome="refused", reason="r" * 300, cwd="/w/b"),
+    )
+    out = run(capsys, str(log))[1]
+    for c in out:
+        assert c == "\n" or c.isprintable(), repr(c)
+    assert "\\x1b[2K\\x1b[1Aall clear" in out
+    assert "/w/a\\x0dFAKE" in out
+    assert "me/\\x9bapp" in out
+    assert "gh\\u202e" in out
+    assert "r" * report.MAX_CELL + "…" in out and "r" * (report.MAX_CELL + 1) not in out
+
+
+def test_cell(tmp_path):
+    assert report.cell("plain text") == "plain text"
+    assert report.cell("a\x00b\x7fc\x85d") == "a\\x00b\\x7fc\\x85d"
+    assert report.cell("\u200b\udcff\U000e0041") == "\\u200b\\udcff\\U000e0041"  # zero-width, lone surrogate, tag
+    assert report.cell("x" * 1000) == "x" * report.MAX_CELL + "…"

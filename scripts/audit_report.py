@@ -19,6 +19,7 @@ from pathlib import Path
 OUTCOMES = ("ok", "refused", "handover", "error")
 TOP_REASONS = 20
 UNRECORDED = "(not recorded)"
+MAX_CELL = 200  # characters of one table cell; past it, "…"
 ROTATED = re.compile(r"(\d{8}T\d{6})(?:\.(\d+))?")  # the suffix after "audit.log."; fullmatch only
 
 
@@ -70,9 +71,24 @@ def text_of(value: object, default: str) -> str:
     return value if isinstance(value, str) and value else default
 
 
+def cell(text: str) -> str:
+    """Log text as it may reach a terminal: whatever is not printable (control characters C0 and C1,
+    DEL, bidi and zero-width marks) as an escape, and at most MAX_CELL characters.
+
+    Agents and GitHub put text in the log, and json.loads restores the control characters JSON escaped.
+    """
+    text = "".join(c if c.isprintable() else _escape(c) for c in text)
+    return text if len(text) <= MAX_CELL else text[:MAX_CELL] + "…"
+
+
+def _escape(c: str) -> str:
+    n = ord(c)
+    return f"\\x{n:02x}" if n < 0x100 else f"\\u{n:04x}" if n < 0x10000 else f"\\U{n:08x}"
+
+
 def table(headers: list[str], rows: list[list]) -> list[str]:
     """Columns two spaces apart: numbers right-aligned, text left-aligned, the last column unpadded."""
-    cells = [headers, *[[str(c) for c in r] for r in rows]]
+    cells = [headers, *[[str(c) if isinstance(c, int) else cell(c) for c in r] for r in rows]]
     widths = [max(len(r[i]) for r in cells) for i in range(len(headers))]
     numeric = [all(isinstance(r[i], int) for r in rows) for i in range(len(headers))]
     out = []
@@ -147,15 +163,15 @@ def main(argv: list[str]) -> int:
 
     lines, bad, read_from = read(args.log)
     if not read_from:
-        print(f"no audit log at {args.log}, nor rotated ones beside it")
+        print(f"no audit log at {cell(str(args.log))}, nor rotated ones beside it")
         return 1
     if args.since:
         lines = [line for line in lines if line["time"][:10] >= args.since]
     days = sorted(line["time"][:10] for line in lines)
-    span = f", {days[0]} to {days[-1]}" if days else ""
+    span = f", {cell(days[0])} to {cell(days[-1])}" if days else ""
     skipped = f"; {bad} malformed line(s) skipped" if bad else ""
     rotated = sum(path != args.log for path in read_from)
-    print(f"{args.log} and {rotated} rotated file(s): {len(lines)} line(s){span}{skipped}")
+    print(f"{cell(str(args.log))} and {rotated} rotated file(s): {len(lines)} line(s){span}{skipped}")
     print()
     print("\n".join(report(lines)))
     return 0
