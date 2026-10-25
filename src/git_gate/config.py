@@ -383,7 +383,7 @@ def _parse_v2(data: dict, forbidden: tuple[Path, ...], problems: list[Problem], 
             )
     reached = {name for s in sessions for name in s.access}
     for name in options:
-        if name not in reached:
+        if name not in reached and not problems:  # a session with problems reaches nothing yet
             warnings.append(
                 Problem(f"{label('repos', name)} sets options for a repo no session reaches.", ("repos", name))
             )
