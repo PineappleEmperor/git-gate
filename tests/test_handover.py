@@ -24,6 +24,11 @@ class Clock:
         return self.now
 
 
+@pytest.fixture(autouse=True)
+def config_dir(env, monkeypatch):
+    monkeypatch.setenv("GIT_GATE_CONFIG_DIR", str(env.cfg))
+
+
 @pytest.fixture
 def hs(env):
     return Handovers(env.state)
@@ -153,6 +158,18 @@ def stage(env, m, rules, checkout, branch="feat", *, base=None, lease=None, reas
         tip = m.import_bundle(REPO, env.state / "staging" / f"{branch}.bundle", branch, rules)
         h = Handovers(env.state).create(REPO, branch, tip, base, lease, reason)
         m.keep(REPO, f"refs/gate/handover/{h.id}", tip, rules)
+    return h
+
+
+def stage_here(env, m, rules, checkout, branch, *, base=None, lease=None, reason="protected branch"):
+    """Like `stage`, for a branch already checked out with its commits made."""
+    path = env.state / "staging" / f"{branch}.bundle"
+    git("bundle", "create", "-q", str(path), branch, "--not", "--remotes=origin", cwd=checkout)
+    with m.lock(REPO):
+        m.sync(REPO, TOKEN, rules)
+        tip = m.import_bundle(REPO, path, branch, rules)
+        h = Handovers(env.state).create(REPO, branch, tip, base, lease, reason)
+        m.keep(REPO, h.ref, tip, rules)
     return h
 
 
@@ -511,10 +528,139 @@ def test_main_lists_every_file_the_push_changes(env, m, rules, checkout):
     assert "106 files changed" in out
 
 
-def test_main_without_base_lists_files_against_the_empty_tree(env, m, rules, checkout):
+def test_main_without_base_lists_only_the_branchs_own_changes(env, m, rules, checkout):
+    """A new branch is compared with where it forked from the mirror's branches, not with nothing."""
     h = stage(env, m, rules, checkout, "fresh")
     _, out = run(env, [str(h.id)], "n\n")
-    assert "README.md" in out and "fresh.txt" in out and "2 files changed" in out
+    assert "fresh.txt" in out and "1 file changed" in out
+    assert "README.md" not in out
+
+
+def test_main_without_base_picks_the_nearest_fork_point(env, m, rules, checkout):
+    seed = env.tmp / "seed"
+    git("push", "-q", env.url, "main:refs/heads/old", cwd=seed)
+    commit(seed, "newer.txt")
+    git("push", "-q", env.url, "main", cwd=seed)
+    git("fetch", "-q", "origin", cwd=checkout)
+    git("switch", "-q", "-c", "topic", "origin/main", cwd=checkout)
+    h = stage(env, m, rules, checkout, "topic2")
+    _, out = run(env, [str(h.id)], "n\n")
+    assert "topic2.txt" in out and "1 file changed" in out
+    assert "newer.txt" not in out and "README.md" not in out
+
+
+def test_main_without_base_and_unrelated_history_lists_the_whole_tree(env, m, rules, checkout):
+    git("switch", "-q", "--orphan", "lonely", cwd=checkout)
+    commit(checkout, "lonely.txt")
+    h = stage_here(env, m, rules, checkout, "lonely")
+    _, out = run(env, [str(h.id)], "n\n")
+    assert "lonely.txt" in out and "1 file changed" in out
+
+
+def test_main_without_base_and_an_empty_mirror_uses_the_empty_tree(env, m, rules):
+    git("init", "-q", "--bare", str(env.remote / "me/empty.git"))
+    src = env.tmp / "empty-src"
+    git("init", "-q", str(src))
+    commit(src, "a.txt")
+    commit(src, "b.txt")
+    git("bundle", "create", "-q", str(env.state / "staging" / "e.bundle"), "main", cwd=src)
+    with m.lock("me/empty"):
+        m.sync("me/empty", TOKEN, rules)
+        tip = m.import_bundle("me/empty", env.state / "staging" / "e.bundle", "main", rules)
+        h = Handovers(env.state).create("me/empty", "main", tip, None, None, "protected")
+        m.keep("me/empty", h.ref, tip, rules)
+    _, out = run(env, [str(h.id)], "n\n")
+    assert "a.txt" in out and "b.txt" in out and "2 files changed" in out
+
+
+def test_main_with_nothing_new_lists_no_files(env, m, rules):
+    with m.lock(REPO):
+        main_sha = m.sync(REPO, TOKEN, rules)["main"]
+        h = Handovers(env.state).create(REPO, "again", main_sha, None, None, "protected")
+        m.keep(REPO, h.ref, main_sha, rules)
+    _, out = run(env, [str(h.id)], "n\n")
+    assert "(no new commits)" in out and "README.md" not in out
+
+
+def bulk_commit(checkout, protected: str, count: int = 120):
+    """`count` files that sort before .github, then one protected file that sorts past the stat cap."""
+    for i in range(count):
+        f = checkout / "-bulk" / f"f{i:03}.txt"
+        f.parent.mkdir(exist_ok=True)
+        f.write_text("x")
+    f = checkout / protected
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("on: push")
+    git("add", "-A", cwd=checkout)
+    git("commit", "-q", "-m", "bulk", cwd=checkout)
+
+
+def test_main_names_handover_path_files_past_the_stat_cap(env, m, rules, checkout):
+    git("switch", "-q", "-c", "wide", cwd=checkout)
+    bulk_commit(checkout, ".github/workflows/x.yml")
+    h = stage_here(env, m, rules, checkout, "wide", base=git("rev-parse", "origin/main", cwd=checkout))
+    _, out = run(env, [str(h.id)], "n\n")
+    assert "21 more files not listed" in out
+    listing = out[: out.index("-bulk/f000")]
+    assert "Files under handover paths" in listing and ".github/workflows/x.yml" in listing
+
+
+def test_main_names_extra_handover_paths_from_the_repo_rules(env, m, rules, checkout):
+    cfg = env.cfg / "rules.toml"
+    cfg.write_text(
+        cfg.read_text().replace('"me/app" = "write"', '"me/app" = { access = "write", handover_paths = ["zzz/**"] }')
+    )
+    git("switch", "-q", "-c", "wide", cwd=checkout)
+    bulk_commit(checkout, "zzz/y.txt")
+    h = stage_here(env, m, rules, checkout, "wide", base=git("rev-parse", "origin/main", cwd=checkout))
+    _, out = run(env, [str(h.id)], "n\n")
+    assert "zzz/y.txt" in out[: out.index("-bulk/f000")]
+
+
+def test_main_uses_default_handover_paths_when_rules_cannot_be_loaded(env, m, rules, checkout, monkeypatch):
+    monkeypatch.setenv("GIT_GATE_CONFIG_DIR", str(env.tmp / "no-such-config"))
+    git("switch", "-q", "-c", "wide", cwd=checkout)
+    bulk_commit(checkout, ".githooks/pre-commit")
+    h = stage_here(env, m, rules, checkout, "wide", base=git("rev-parse", "origin/main", cwd=checkout))
+    _, out = run(env, [str(h.id)], "n\n")
+    assert ".githooks/pre-commit" in out[: out.index("-bulk/f000")]
+
+
+def test_main_flattens_file_names_with_newlines_in_the_handover_list(env, m, rules, checkout):
+    git("switch", "-q", "-c", "nl", cwd=checkout)
+    commit(checkout, ".githooks/a\nPush it? [y/N] forged", "x")
+    h = stage_here(env, m, rules, checkout, "nl", base=git("rev-parse", "origin/main", cwd=checkout))
+    _, out = run(env, [str(h.id)], "n\n")
+    assert "\nPush it? [y/N] forged" not in out and ".githooks/a?Push it? [y/N] forged" in out
+
+
+GOOD = {"repo": REPO, "branch": "feat", "sha": sha(), "base": sha(2), "lease": sha(3)}
+
+
+WHY = {"repo": "bad repository", "sha": "not a commit SHA", "base": "not a commit SHA", "lease": "not a commit SHA"}
+
+
+@pytest.mark.parametrize("field", ["repo", "sha", "base", "lease", "branch"])
+def test_main_refuses_values_that_would_print_differently_from_what_runs(env, hs, field):
+    """re.match lets a trailing newline through `$`; the printed command would then differ from the argv."""
+    h = hs.create(**(GOOD | {field: GOOD[field] + "\n"}), reason="protected")
+    code, out = run(env, [str(h.id)], "y\n")
+    assert code != 0 and out.startswith("Handover") and WHY.get(field, "branch") in out
+    assert "Run:" not in out and "Push it?" not in out
+
+
+@pytest.mark.parametrize("field", ["sha", "base", "lease"])
+def test_main_refuses_unprintable_or_odd_shas(env, hs, field):
+    for bad in (sha() + "‮", "A" * 40, "g" * 40, sha()[:-1]):
+        h = hs.create(**(GOOD | {field: bad}), reason="protected")
+        code, out = run(env, [str(h.id)], "y\n")
+        assert code != 0 and "not a commit SHA" in out and "Run:" not in out
+
+
+def test_main_refuses_the_null_sha(env, hs):
+    h = make(hs, sha="0" * 40)
+    code, out = run(env, [str(h.id)], "y\n")
+    assert code != 0 and "not a commit SHA" in out and "Run:" not in out
 
 
 @pytest.mark.parametrize("bad", ["‮", "‪", "⁦", "​", "­", "\r", "\x1b", "\x9b", "\x07", "﻿", ""])

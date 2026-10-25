@@ -20,13 +20,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from git_gate import Refused
-from git_gate.config import REPO_RE, Rules, state_dir
+from git_gate.config import DEFAULT_HANDOVER_PATHS, REPO_RE, Rules, load_rules, state_dir
 from git_gate.gitops import MAX_STDERR, Git
-from git_gate.mirror import OID, Mirror
+from git_gate.mirror import OID, Mirror, _matches
 
 EXPIRES = 14 * 24 * 3600
 MAX_LOG = 50
 MAX_FILES = 100
+MAX_FORKS = 50
 ID_RE = re.compile(r"^[0-9]{1,9}$")
 USAGE = "usage: gitgatepush [<id>]"
 MAX_ID = 10**9 - 1
@@ -261,15 +262,20 @@ def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
 
 
 def _check(h: Handover, git: Git, rules: Rules) -> None:
-    """The record is the gate's own, but it is checked before it becomes a command line."""
-    if not REPO_RE.match(h.repo):
+    """The record is the gate's own, but it is checked before it becomes a command line.
+
+    Every value must match in full and print as itself, so the command shown is the argv that runs.
+    """
+    if not (h.repo.isprintable() and REPO_RE.fullmatch(h.repo)):
         raise Refused(f"Handover {h.id} names a bad repository.")
     if not h.branch.isprintable():
         raise Refused(f"Handover {h.id} names a branch with unprintable characters.")
     git.check_branch(h.branch, rules)
     for value in (h.sha, h.base, h.lease):
-        if value is not None and not OID.match(value):
+        if value is not None and not (value.isprintable() and OID.fullmatch(value)):
             raise Refused(f"Handover {h.id} holds a value that is not a commit SHA.")
+    if not h.sha.strip("0"):
+        raise Refused(f"Handover {h.id} holds a value that is not a commit SHA.")
 
 
 def _require_commit(mirror: Mirror, h: Handover, mirror_dir: Path, rules: Rules) -> None:
@@ -280,6 +286,14 @@ def _require_commit(mirror: Mirror, h: Handover, mirror_dir: Path, rules: Rules)
         raise Refused(
             f"The gate's mirror no longer holds {h.sha[:12]} for handover {h.id}; ask the agent to push again."
         )
+
+
+def _handover_paths(repo: str) -> tuple[str, ...]:
+    """The repo's handover patterns from rules.toml; the defaults when the rules cannot be loaded."""
+    try:
+        return load_rules().repo(repo).handover_paths
+    except Refused, OSError:
+        return DEFAULT_HANDOVER_PATHS
 
 
 def _show(mirror: Mirror, h: Handover, mirror_dir: Path, rules: Rules) -> str:
@@ -294,22 +308,44 @@ def _show(mirror: Mirror, h: Handover, mirror_dir: Path, rules: Rules) -> str:
             raise Refused(f"Could not show handover {h.id}:\n{proc.stderr.strip()[-MAX_STDERR:]}")
         return proc.stdout
 
-    # No base means a new branch: everything no mirrored branch already has, against the empty tree.
+    # No base means a new branch: everything no mirrored branch already has.
     new = [f"{h.base}..{h.sha}"] if h.base else [h.sha, "--not", "--branches"]
-    start = h.base or out(["hash-object", "-t", "tree", "--stdin"], stdin="").strip()
+    total = int(out(["rev-list", "--count", *new]).strip())
+    start = h.base or _fork_point(out, h, total)
 
     commits = out(["log", "--oneline", "--no-decorate", f"--max-count={MAX_LOG}", *new]).rstrip()
-    total = int(out(["rev-list", "--count", *new]).strip())
     if total > MAX_LOG:
         commits += f"\n... and {total - MAX_LOG} more commits not shown"
 
     diff = ["--no-renames", start, h.sha, "--"]
-    files = len([f for f in out(["diff", "--name-only", "-z", *diff]).split("\0") if f])
+    names = [f for f in out(["diff", "--name-only", "-z", *diff]).split("\0") if f]
+    patterns = _handover_paths(h.repo)
+    protected = [_clean(f) for f in names if _matches(f, patterns)]
     stat = out(["diff", "--stat=500,400", f"--stat-count={MAX_FILES}", *diff]).rstrip().splitlines()
-    if files > MAX_FILES:
-        more = f" \u2026 and {files - MAX_FILES} more files not listed"
+    if len(names) > MAX_FILES:
+        more = f" \u2026 and {len(names) - MAX_FILES} more files not listed"
         stat = [more if line.strip() == "..." else line for line in stat]
-    return "\n\n".join(p for p in (commits, "\n".join(stat)) if p) or "(no new commits)"
+    sections = [commits]
+    if protected:
+        sections.append(f"Files under handover paths ({len(protected)}):\n" + "\n".join(f"  {f}" for f in protected))
+    sections.append("\n".join(stat))
+    return "\n\n".join(p for p in sections if p) or "(no new commits)"
+
+
+def _fork_point(out, h: Handover, total: int) -> str:
+    """Where a new branch leaves the mirror's branches, so only its own changes are compared.
+
+    That is the nearest commit the new ones build on that a mirrored branch already has. The empty
+    tree is used only when the mirror has no branches or the history shares nothing with them.
+    """
+    empty = out(["hash-object", "-t", "tree", "--stdin"], stdin="").strip()
+    if not out(["for-each-ref", "--count=1", "--format=%(refname)", "refs/heads/"]).strip():
+        return empty
+    listed = out(["rev-list", "--boundary", h.sha, "--not", "--branches"]).splitlines()
+    forks = [line[1:] for line in listed if line.startswith("-")][:MAX_FORKS]
+    if not forks:
+        return h.sha if total == 0 else empty  # nothing new, or history unrelated to every branch
+    return min(forks, key=lambda f: int(out(["rev-list", "--count", f"{f}..{h.sha}"]).strip()))
 
 
 def _clean(text: str, *, lines: bool = False) -> str:
