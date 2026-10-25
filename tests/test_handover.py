@@ -137,10 +137,19 @@ def stage(env, m, rules, checkout, branch="feat", *, base=None, lease=None, reas
     """Commit on `branch`, import it into the mirror as a push would, pin it and record the handover."""
     git("switch", "-q", "-c", branch, cwd=checkout)
     commit(checkout, f"{branch}.txt", message=f"add {branch}")
-    git("bundle", "create", "-q", str(env.tmp / f"{branch}.bundle"), branch, "--not", "--remotes=origin", cwd=checkout)
+    git(
+        "bundle",
+        "create",
+        "-q",
+        str(env.state / "staging" / f"{branch}.bundle"),
+        branch,
+        "--not",
+        "--remotes=origin",
+        cwd=checkout,
+    )
     with m.lock(REPO):
         m.sync(REPO, TOKEN, rules)
-        tip = m.import_bundle(REPO, env.tmp / f"{branch}.bundle", branch, rules)
+        tip = m.import_bundle(REPO, env.state / "staging" / f"{branch}.bundle", branch, rules)
         h = Handovers(env.state).create(REPO, branch, tip, base, lease, reason)
         m.keep(REPO, f"refs/gate/handover/{h.id}", tip, rules)
     return h
@@ -235,10 +244,19 @@ def test_main_shows_base_range_and_stat(env, m, rules, checkout):
 def test_main_strips_terminal_escapes(env, m, rules, checkout):
     git("switch", "-q", "-c", "evil", cwd=checkout)
     commit(checkout, "e.txt", message="innocent \x1b[2J\x1b]0;pwned\x07 subject")
-    git("bundle", "create", "-q", str(env.tmp / "evil.bundle"), "evil", "--not", "--remotes=origin", cwd=checkout)
+    git(
+        "bundle",
+        "create",
+        "-q",
+        str(env.state / "staging" / "evil.bundle"),
+        "evil",
+        "--not",
+        "--remotes=origin",
+        cwd=checkout,
+    )
     with m.lock(REPO):
         m.sync(REPO, TOKEN, rules)
-        tip = m.import_bundle(REPO, env.tmp / "evil.bundle", "evil", rules)
+        tip = m.import_bundle(REPO, env.state / "staging" / "evil.bundle", "evil", rules)
         h = Handovers(env.state).create(REPO, "evil", tip, None, None, "protected")
         m.keep(REPO, f"refs/gate/handover/{h.id}", tip, rules)
     _, out = run(env, [str(h.id)], "n\n")
@@ -270,3 +288,139 @@ def test_push_ref_is_dropped_only_after_success(env, m, rules, checkout):
     h = stage(env, m, rules, checkout)
     assert run(env, [str(h.id)], "n\n")[0] == 1
     assert git(f"--git-dir={m.path(REPO)}", "rev-parse", f"refs/gate/handover/{h.id}") == h.sha
+
+
+# --- fix round 1: records and ids -----------------------------------------------------------
+
+
+def test_deleted_counter_never_overwrites_open_records(env, hs):
+    a, b = make(hs), make(hs, branch="topic")
+    (env.state / "handovers/next").unlink()
+    c = make(hs, branch="third")
+    assert c.id == 3
+    assert hs.open() == [a, b, c]
+
+
+def test_corrupt_counter_is_recovered(env, hs):
+    a = make(hs)
+    (env.state / "handovers/next").write_text("not a number\x00")
+    b = make(hs)
+    assert b.id == 2
+    assert hs.get(a.id) == a
+    (env.state / "handovers/next").write_text("")
+    assert make(hs).id == 3
+
+
+def test_stale_counter_never_overwrites_existing_record(env, hs):
+    """A crash between writes (or a restored counter) leaves `next` behind the records."""
+    a, b = make(hs), make(hs)
+    (env.state / "handovers/next").write_text("1\n")
+    c = make(hs, branch="third")
+    assert c.id == 3
+    assert hs.get(a.id) == a and hs.get(b.id) == b
+    assert int((env.state / "handovers/next").read_text()) == 4
+
+
+def test_unreadable_record_files_still_reserve_their_id(env, hs):
+    (env.state / "handovers").mkdir()
+    (env.state / "handovers/7.json").write_text("{broken")
+    assert make(hs).id == 8
+    assert (env.state / "handovers/7.json").read_text() == "{broken"
+
+
+def test_counter_is_written_before_the_record(env, hs, monkeypatch):
+    """If writing the record fails, the id is spent rather than reused."""
+    make(hs)
+
+    def boom(self, h):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Handovers, "_write", boom)
+    with pytest.raises(OSError):
+        make(hs)
+    monkeypatch.undo()
+    assert make(hs).id == 3
+
+
+def test_purging_an_expired_handover_drops_its_mirror_ref(env, m, rules, checkout):
+    clock = Clock(1_000_000.0)
+    git("switch", "-q", "-c", "feat", cwd=checkout)
+    commit(checkout, "feat.txt")
+    git(
+        "bundle",
+        "create",
+        "-q",
+        str(env.state / "staging" / "f.bundle"),
+        "feat",
+        "--not",
+        "--remotes=origin",
+        cwd=checkout,
+    )
+    with m.lock(REPO):
+        m.sync(REPO, TOKEN, rules)
+        tip = m.import_bundle(REPO, env.state / "staging" / "f.bundle", "feat", rules)
+        old = Handovers(env.state, clock=clock, mirror=m).create(REPO, "feat", tip, None, None, "protected")
+        m.keep(REPO, old.ref, tip, rules)
+    assert mirror_refs(m) == old.ref
+
+    hs = Handovers(env.state, clock=Clock(clock.now + 10 * DAY), mirror=m)
+    young = hs.create(REPO, "feat", tip, None, None, "protected")
+    with m.lock(REPO):
+        m.keep(REPO, young.ref, tip, rules)
+    assert sorted(mirror_refs(m).split()) == [old.ref, young.ref]  # not expired yet
+
+    hs = Handovers(env.state, clock=Clock(clock.now + 15 * DAY), mirror=m)
+    hs.create(REPO, "other", tip, None, None, "protected")
+    assert mirror_refs(m) == young.ref  # old expired and dropped; young (5 days old) kept
+
+
+def test_purge_ignores_missing_mirror_and_ref(env, m):
+    clock = Clock()
+    hs = Handovers(env.state, clock=clock, mirror=m)
+    make(hs, repo="me/never-mirrored")
+    make(hs, repo="not a repo")  # a record the mirror refuses to name
+    clock.now += 15 * DAY
+    fresh = make(hs)
+    assert hs.open() == [fresh]
+
+
+# --- fix round 1: re-checking after the prompt ----------------------------------------------
+
+
+class Meddler:
+    """A stdin whose answer arrives after the record was rewritten, as a concurrent edit would."""
+
+    def __init__(self, rewrite, answer="y\n"):
+        self.rewrite, self.answer = rewrite, answer
+
+    def readline(self) -> str:
+        self.rewrite()
+        return self.answer
+
+
+def run_with(env, argv, stdin) -> tuple[int, str]:
+    out = io.StringIO()
+    code = main(argv, stdin=stdin, stdout=out, base_url=env.gate.git.base_url)
+    return code, out.getvalue()
+
+
+def test_main_refuses_a_record_changed_after_it_was_shown(env, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    path = env.state / f"handovers/{h.id}.json"
+    main_sha = remote_has(env, "main")  # a commit the mirror has, so only the record differs
+
+    def rewrite():
+        data = json.loads(path.read_text())
+        path.write_text(json.dumps(data | {"sha": main_sha}))
+
+    code, out = run_with(env, [str(h.id)], Meddler(rewrite))
+    assert code != 0 and "changed while waiting; run it again" in out
+    assert remote_has(env, "feat") is None
+    assert remote_has(env, "main") == main_sha
+
+
+def test_main_refuses_a_record_that_vanished_after_it_was_shown(env, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    code, out = run_with(env, [str(h.id)], Meddler(lambda: Handovers(env.state).close(h.id)))
+    assert code != 0 and "No open handover" in out
+    assert remote_has(env, "feat") is None

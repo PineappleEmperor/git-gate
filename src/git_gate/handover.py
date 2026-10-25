@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -27,6 +28,10 @@ MAX_LOG = 50
 ID_RE = re.compile(r"^[0-9]{1,9}$")
 UNSAFE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 USAGE = "usage: gitgatepush [<id>]"
+MAX_ID = 10**9 - 1
+# The mirror calls made here read only git_timeout from the rules, so the user's rules.toml (which
+# may be broken or absent) is not needed to run, or to purge, a handover.
+RULES = Rules(workspaces=(), repos={})
 
 
 @dataclass(frozen=True)
@@ -48,23 +53,38 @@ class Handover:
 class Handovers:
     """JSON records under <state>/handovers/<id>.json, ids from the flock-guarded <state>/handovers/next."""
 
-    def __init__(self, state: Path, clock: Callable[[], float] = time.time):
+    def __init__(self, state: Path, clock: Callable[[], float] = time.time, mirror: Mirror | None = None):
         self.dir = state / "handovers"
         self.clock = clock
+        self.mirror = mirror  # when given, purging an expired record also drops its handover ref
 
     def create(self, repo: str, branch: str, sha: str, base: str | None, lease: str | None, reason: str) -> Handover:
+        """Record a handover under the next free id.
+
+        The id is the larger of the counter and one past the highest record file, so a lost, stale
+        or corrupt counter can never reuse an id, and the counter is advanced before the record is
+        written, so a crash between the two spends an id rather than reusing it.
+        """
         self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(self.dir / "next", os.O_RDWR | os.O_CREAT, 0o600)
         with os.fdopen(fd, "r+") as counter:
             fcntl.flock(counter, fcntl.LOCK_EX)
-            number = int(counter.read().strip() or 1)
-            h = Handover(number, repo, branch, sha, base, lease, reason, self.clock())
-            self._write(h)
+            try:
+                stored = int(counter.read().strip())
+            except ValueError:
+                stored = 0
+            number = max(stored if 0 < stored <= MAX_ID else 0, self._highest() + 1, 1)
             counter.seek(0)
             counter.truncate()
             counter.write(f"{number + 1}\n")
             counter.flush()
-            self._purge()
+            os.fsync(counter.fileno())
+            h = Handover(number, repo, branch, sha, base, lease, reason, self.clock())
+            self._write(h)
+            expired = self._purge()
+        # After the counter lock is released: a caller may hold the mirror lock around create().
+        for old in expired:
+            self._drop_ref(old)
         return h
 
     def get(self, id: int) -> Handover:
@@ -104,10 +124,22 @@ class Handovers:
             json.dump(asdict(h), f)
         tmp.replace(path)
 
-    def _purge(self) -> None:
-        for h in self._all():
-            if self._expired(h):
-                self.close(h.id)
+    def _purge(self) -> list[Handover]:
+        expired = [h for h in self._all() if self._expired(h)]
+        for h in expired:
+            self.close(h.id)
+        return expired
+
+    def _drop_ref(self, h: Handover) -> None:
+        """Unpin an expired handover's commit; a missing mirror or ref is nothing to clean up."""
+        if self.mirror is not None:
+            with suppress(Refused, OSError):
+                self.mirror.drop(h.repo, h.ref, RULES)
+
+    def _highest(self) -> int:
+        """The highest id with a record file, readable or not."""
+        ids = [int(p.stem) for p in self.dir.glob("*.json") if ID_RE.match(p.stem)]
+        return max(ids, default=0)
 
     def _all(self) -> list[Handover]:
         found = []
@@ -180,9 +212,7 @@ def _list(handovers: Handovers, say) -> int:
 
 
 def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
-    # Only git_timeout is read from rules by the mirror calls used here, so the user's rules.toml
-    # (which may be broken or absent) is not needed to run a handover.
-    rules = Rules(workspaces=(), repos={})
+    rules = RULES
     h = handovers.get(id)
     _check(h, mirror.git, rules)
     url = mirror.git.user_push_url(h.repo)
@@ -205,7 +235,10 @@ def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
         return 1
 
     with mirror.lock(h.repo):
-        h = handovers.get(id)  # another gitgatepush may have finished it while we waited
+        again = handovers.get(id)  # another gitgatepush may have finished it while we waited
+        if again != h:
+            raise Refused(f"Handover {id} changed while waiting; run it again.")
+        _check(again, mirror.git, rules)
         _require_commit(mirror, h, mirror_dir, rules)
         proc = subprocess.run(
             push_command(h, mirror_dir, url), stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False
