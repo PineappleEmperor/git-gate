@@ -46,6 +46,8 @@ WORKFLOW_SCOPE = "create or update workflow"
 MAX_NAMED = 20  # protected files named in a refusal; the handover record and screen hold them all
 PROC = Path("/proc")
 MAX_REASON = 300  # characters of a refusal's first line kept in audit.log
+MAX_ARG = 1000  # characters of one string argument kept in audit.log
+MAX_ARGS = 8 << 10  # characters of all the arguments, as JSON, kept in audit.log; past it, only their size
 
 
 class InternalError(Exception):
@@ -144,15 +146,16 @@ class Gate:
         """One line per call. `reason` is the first line of what the agent was told, without the
         untrusted-content marker a refusal carrying GitHub's text starts with."""
         reason = message.strip().partition("\n")[0][:MAX_REASON] if message is not None else None
-        line = json.dumps({
-            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "args": kwargs, "outcome": outcome,
-            "reason": reason, "ms": ms, "session": _session(), "cwd": _cwd(),
-        })  # fmt: skip
         try:
+            line = json.dumps({
+                "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "args": _logged_args(kwargs, token),
+                "outcome": outcome, "reason": reason, "ms": ms, "session": _session(), "cwd": _cwd(),
+            })  # fmt: skip
             audit(self.state, _scrub(line, token))
-        except OSError as e:
+        except Exception as e:
             # The call has already happened: failing it now would misreport what was done.
-            log_error(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {tool} audit.log could not be written: {e}\n")
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            log_error(_scrub(f"{stamp} {tool} audit.log could not be written: {type(e).__name__}: {e}\n", token))
 
     def _rate_limit(self, repo: object) -> None:
         """At most RATE_LIMIT calls per RATE_WINDOW seconds per repo, counted in a file: each call may
@@ -579,6 +582,27 @@ def _refusal_for(found: Protected) -> str:
     if found.commits:
         reason += f" Commit(s) {', '.join(c[:12] for c in found.commits)} change them."
     return reason
+
+
+def _logged_args(kwargs: dict, token: str | None) -> dict:
+    """The arguments as audit.log keeps them: each string scrubbed, then cut at MAX_ARG, and all of
+    them at MAX_ARGS. They are the agent's, so this is what bounds how fast it can fill the log."""
+
+    def cut(value):
+        if isinstance(value, str):
+            value = _scrub(value, token)  # before the cut, which could leave half a token unmatched
+            return value if len(value) <= MAX_ARG else f"{value[:MAX_ARG]}…[+{len(value) - MAX_ARG} chars]"
+        if isinstance(value, list | tuple):
+            return [cut(v) for v in value]
+        if isinstance(value, dict):
+            return {cut(k): cut(v) for k, v in value.items()}
+        return value
+
+    args = cut(kwargs)
+    if len(json.dumps(args)) <= MAX_ARGS:
+        return args
+    repo = args.get("repo")
+    return ({"repo": repo} if isinstance(repo, str) else {}) | {"truncated": True, "chars": len(json.dumps(kwargs))}
 
 
 def _session(proc: Path = PROC) -> str:

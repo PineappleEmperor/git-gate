@@ -177,3 +177,47 @@ def test_audit_log_keeps_one_old_file(env, monkeypatch):
         env.gate.call("prune", ok, repo="me/app")
     assert sorted(p.name for p in env.state.glob("audit.log*")) == ["audit.log", "audit.log.1"]
     assert len(audit_lines(env)) == 1
+
+
+# --- capped arguments ------------------------------------------------------------------------
+
+
+def test_audit_cuts_long_argument_strings(env):
+    env.gate.call("gh", ok, repo="me/app", args=["api", "q" * 1500], branch="b" * 1001)
+    args = audit_lines(env)[-1]["args"]
+    assert args["args"] == ["api", "q" * 1000 + "…[+500 chars]"]
+    assert args["branch"] == "b" * 1000 + "…[+1 chars]"
+    assert args["repo"] == "me/app"
+
+
+def test_audit_scrubs_the_token_before_cutting(env):
+    """A token across the cut must not leave its first characters behind."""
+    with pytest.raises(Refused):
+        env.gate.call("prune", raising(Refused("no")), repo="me/app", branch="x" * 990 + TOKEN + "y" * 100)
+    line = (env.state / "audit.log").read_text()
+    assert TOKEN[:8] not in line
+    assert json.loads(line)["args"]["branch"].startswith("x" * 990 + "[token]")
+
+
+def test_audit_caps_all_the_arguments(env):
+    have = ["a" * 40] * 1000
+    env.gate.call("fetch", ok, repo="me/app", bundle="/w/f.bundle", have=have)
+    args = audit_lines(env)[-1]["args"]
+    size = len(json.dumps({"repo": "me/app", "bundle": "/w/f.bundle", "have": have}))
+    assert args == {"repo": "me/app", "truncated": True, "chars": size}
+
+
+def test_huge_arguments_make_a_short_line(env):
+    """An agent cannot fill audit.log faster than a few KiB a call, whatever it sends."""
+    env.gate.call("prune", ok, repo="r" * 10**6, **{"k" * 10**6: "v" * 10**6})
+    line = (env.state / "audit.log").read_text()
+    assert len(line) < 10_000
+    assert json.loads(line)["args"]["repo"] == "r" * 1000 + "…[+999000 chars]"
+
+
+def test_arguments_the_log_cannot_hold_do_not_fail_the_call(env):
+    deep = []
+    for _ in range(100_000):
+        deep = [deep]
+    assert env.gate.call("prune", ok, repo="me/app", branch=deep) == "ok"
+    assert "RecursionError" in (env.state / "errors.log").read_text()
