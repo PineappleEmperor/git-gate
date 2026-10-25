@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -187,6 +188,27 @@ def test_audit_log_rotation_never_deletes(env, monkeypatch):
     assert rotated(env) == names
     kept = [json.loads((env.state / name).read_text())["args"]["branch"] for name in names]
     assert kept + [audit_lines(env)[0]["args"]["branch"]] == list("abcd")
+
+
+def test_concurrent_writers_lose_no_lines(env, monkeypatch):
+    """Each call is its own process; the rotation is decided and done under audit.lock."""
+    monkeypatch.setattr(call, "MAX_AUDIT", 300)
+    monkeypatch.setattr(call, "_stamp", lambda: "20261025T120000")
+    errors = []
+
+    def write(worker: int) -> None:
+        for i in range(40):
+            try:
+                call.audit(env.state, json.dumps({"line": f"{worker}-{i}"}))
+            except OSError as e:
+                errors.append(e)
+
+    with ThreadPoolExecutor(8) as pool:
+        list(pool.map(write, range(8)))
+    assert errors == []
+    lines = [json.loads(x)["line"] for p in env.state.glob("audit.log*") for x in p.read_text().splitlines()]
+    assert sorted(lines) == sorted(f"{w}-{i}" for w in range(8) for i in range(40))
+    assert oct((env.state / "audit.lock").stat().st_mode & 0o777) == "0o600"
 
 
 # --- capped arguments ------------------------------------------------------------------------

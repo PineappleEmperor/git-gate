@@ -6,6 +6,7 @@ restarting them. The answer is one JSON object on stdout: {"ok": text}, {"refuse
 or {"error": message}.
 """
 
+import fcntl
 import json
 import os
 import sys
@@ -38,20 +39,25 @@ def audit(state: Path, line: str) -> None:
 
     A full log is moved aside under a name no file has yet, never over one: the gate keeps all of
     its audit history, so an agent that fills the log quickly cannot push old lines out of it.
+    Each call is its own process, so the size is read, and the log moved and written, under
+    <state>/audit.lock: two writers can neither both move it nor write to the one being moved.
     """
     log = state / "audit.log"
-    try:
-        full = log.stat().st_size >= MAX_AUDIT
-    except FileNotFoundError:
-        full = False
-    if full:
-        base = f"{log.name}.{_stamp()}"
-        name, n = base, 0
-        while os.path.lexists(log.with_name(name)):
-            n += 1
-            name = f"{base}.{n}"
-        os.rename(log, log.with_name(name))
-    _write(log, line + "\n")
+    fd = os.open(state / "audit.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            full = log.stat().st_size >= MAX_AUDIT
+        except FileNotFoundError:
+            full = False
+        if full:
+            base = f"{log.name}.{_stamp()}"
+            name, n = base, 0
+            while os.path.lexists(log.with_name(name)):
+                n += 1
+                name = f"{base}.{n}"
+            os.rename(log, log.with_name(name))
+        _write(log, line + "\n")
 
 
 def _write(log: Path, text: str) -> None:
