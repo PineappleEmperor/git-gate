@@ -148,6 +148,9 @@ def fake_gh(env):
         "rec.write_text(json.dumps({'args': args, 'cwd': os.getcwd(), 'env': dict(os.environ), 'files': files}))\n"
         "if '-D' in args:\n"
         "    d = pathlib.Path(args[args.index('-D') + 1]); (d / 'art').mkdir(); (d / 'art/log.txt').write_text('L')\n"
+        "    (d / '.claude').mkdir(); (d / '.claude/settings.json').write_text('{}')\n"
+        "if '-O' in args:\n"
+        "    pathlib.Path(args[args.index('-O') + 1]).write_text('asset')\n"
         "print('ok', os.environ.get('GH_TOKEN'))\n"
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
@@ -197,14 +200,50 @@ def test_gh_refuses_body_containing_token(env, fake_gh):
         call(env, "gh", repo="me/app", args=["pr", "comment", "1", "-F", str(body)])
 
 
-def test_gh_download_goes_through_gate(env, fake_gh):
-    out_dir = env.ws / "artifacts"
-    out_dir.mkdir()
+def test_gh_body_file_must_be_an_exchange_file(env, fake_gh):
+    """The gate reads outside the sandbox: a masked secret must never become a comment."""
+    record = env.tmp / "gh-call.json"
+    for rel in ("secrets.yaml", ".env", ".claude/x.md", "a/.git/x.md"):
+        path = env.ws / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("password: hunter2")
+        with pytest.raises(Refused):
+            call(env, "gh", repo="me/app", args=["pr", "comment", "1", "--body-file", str(path)])
+        assert not record.exists()
+
+
+def test_gh_download_goes_into_a_new_directory(env, fake_gh):
+    existing = env.ws / "artifacts"
+    existing.mkdir()
+    with pytest.raises(Refused, match="already exists"):
+        call(env, "gh", repo="me/app", args=["run", "download", "7", "-D", str(existing)])
+    assert list(existing.iterdir()) == []
+    with pytest.raises(Refused, match="--clobber"):
+        plan("me/app", "read", ["run", "download", "7", "-D", "/w/new", "--clobber"])
+    for dotted in (".claude", "x/.vscode"):
+        with pytest.raises(Refused):
+            call(env, "gh", repo="me/app", args=["run", "download", "7", "-D", str(env.ws / dotted)])
+    before = sorted(p.name for p in env.ws.iterdir())
+    out_dir = env.ws / "new-artifacts"
     out = call(env, "gh", repo="me/app", args=["run", "download", "7", "-D", str(out_dir)])
     rec = fake_gh()
     assert rec["args"][rec["args"].index("-D") + 1].startswith(str(env.state))
     assert (out_dir / "art/log.txt").read_text() == "L"
-    assert "Saved to" in out
+    assert sorted(p.name for p in env.ws.iterdir()) == sorted([*before, "new-artifacts"])
+    assert sorted(str(p.relative_to(out_dir)) for p in out_dir.rglob("*")) == ["art", "art/log.txt"]
+    assert "Saved to" in out and "skipped" in out and ".claude" in out
+
+
+def test_gh_release_download_to_a_new_file(env, fake_gh):
+    target = env.ws / "dist/app.tar.gz"
+    target.parent.mkdir()
+    out = call(env, "gh", repo="me/app", args=["release", "download", "v1", "-O", str(target)])
+    assert target.read_text() == "asset" and "Saved to" in out
+    with pytest.raises(Refused, match="already exists"):
+        call(env, "gh", repo="me/app", args=["release", "download", "v1", "-O", str(target)])
+    with pytest.raises(Refused):
+        call(env, "gh", repo="me/app", args=["release", "download", "v1", "-O", str(env.ws / ".envrc")])
+    assert not (env.ws / ".envrc").exists()
 
 
 def test_gh_download_into_symlink_refused(env, fake_gh):

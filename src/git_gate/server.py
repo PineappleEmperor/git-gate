@@ -129,7 +129,8 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
 
     @server.tool()
     async def fetch(repo: str, bundle: str, have: list[str] | None = None) -> str:
-        """Write every GitHub branch of `repo` to a bundle file at `bundle` (absolute, in a workspace).
+        """Write every GitHub branch of `repo` to a bundle file at `bundle` (absolute, in a workspace,
+        named *.bundle outside dot directories except .tmp, e.g. <dir>/.tmp/fetch.bundle).
 
         Then, in the sandbox: git fetch --prune <bundle> '+refs/heads/*:refs/remotes/origin/*',
         which makes origin/* exactly GitHub's branches. To leave out history you already hold, pass
@@ -142,7 +143,8 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
     async def push(repo: str, branch: str, bundle: str) -> str:
         """Fast-forward push the one branch in `bundle` to the same branch on GitHub.
 
-        Make the bundle in the sandbox: git bundle create <bundle> <branch> --not --remotes=origin.
+        Make the bundle in the sandbox: git bundle create <dir>/.tmp/<name>.bundle <branch> --not
+        --remotes=origin. Bundle files must be named *.bundle, outside dot directories except .tmp.
         Protected or default branches, non-fast-forward updates and handover paths are refused
         and kept for the user, who runs the `gitgatepush <id>` the refusal names.
         """

@@ -23,7 +23,16 @@ from git_gate.github import PROTECTING_RULES, GitHub
 from git_gate.gitops import EMPTY, MAX_STDERR, Git
 from git_gate.handover import Handovers
 from git_gate.mirror import MAX_HAVE, Mirror, Protected, comparison
-from git_gate.paths import copy_in, copy_tree_into, open_dir, read_workspace_file, require_absolute, write_out
+from git_gate.paths import (
+    check_new_target,
+    copy_in,
+    copy_tree_into,
+    open_dir,
+    place_new_file,
+    read_workspace_file,
+    require_absolute,
+    write_out,
+)
 
 MAX_OUTPUT = 200_000
 MAX_BUNDLE = 512 << 20
@@ -239,7 +248,7 @@ class Gate:
                 wrote = self.mirror.export_bundle(repo, tmp, list(have), rules)
             if not wrote:
                 return f"{repo} has no branches on GitHub yet; nothing to fetch, and no bundle was written."
-            write_out(rules, bundle, tmp, "Bundle output")
+            write_out(rules, bundle, tmp, "bundle")
         listing = "\n".join(f"{name} {sha}" for name, sha in sorted(heads.items()))
         return (
             f"Wrote {len(heads)} branch(es) of {repo} to {bundle}. Inside the sandbox run:\n\n"
@@ -255,7 +264,7 @@ class Gate:
         repo_rules = rules.repo(repo)
         self.git.check_branch(branch, rules)
         with self._staged("push") as staged:
-            copy_in(rules, bundle, staged, MAX_BUNDLE, "Bundle")
+            copy_in(rules, bundle, staged, MAX_BUNDLE, "bundle")
             api = self.github(token)
             default = api.default_branch(repo)
             protected = self._protection(rules, api, repo, branch, default)
@@ -347,14 +356,15 @@ class Gate:
         work = Path(tempfile.mkdtemp(dir=self.state / "tmp"))
         try:
             for i, (index, src) in enumerate(sorted(p.uploads.items())):
-                data = read_workspace_file(rules, src, "Body file")
+                data = read_workspace_file(rules, src, "body")
                 if token.encode() in data:
                     raise Refused(f"{src} contains the gate's token; refusing to upload it.")
                 copy = work / f"upload-{i}"
                 copy.write_bytes(data)
                 p.argv[index] = str(copy)
             if p.download:
-                index, _, is_dir = p.download
+                index, target, is_dir = p.download
+                check_new_target(rules, target, "Download target")
                 dl = work / "download"
                 dl.mkdir()
                 p.argv[index] = str(dl if is_dir else dl / Path(p.download[1]).name)
@@ -381,10 +391,15 @@ class Gate:
 
     def _deliver(self, rules: Rules, p: ghpolicy.GhPlan, dl: Path) -> str:
         _, target, is_dir = p.download
-        dest = Path(target) if is_dir else Path(target).parent
-        with open_dir(rules, dest, "Download target") as (fd, real):
-            written = copy_tree_into(dl, fd, p.clobber)
-        return f"\nSaved to {real}: {', '.join(written) or 'nothing'}"
+        if is_dir:
+            real, written, skipped = copy_tree_into(rules, dl, target, "Download target")
+        else:
+            got = dl / Path(target).name
+            if not got.is_file() or got.is_symlink():
+                return "\nNothing was downloaded."
+            real, written, skipped = place_new_file(rules, got, target, "Download target"), [Path(target).name], []
+        note = f"; skipped symlinks and dot-named entries: {', '.join(skipped)}" if skipped else ""
+        return f"\nSaved to {real}: {', '.join(written) or 'nothing'}{note}"
 
     def _gh_env(self, token: str) -> dict[str, str]:
         return self.git.env() | {

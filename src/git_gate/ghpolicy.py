@@ -60,7 +60,6 @@ class GhPlan:
     env: dict[str, str] = field(default_factory=dict)
     uploads: dict[int, str] = field(default_factory=dict)  # argv index -> agent path to copy
     download: tuple[int, str, bool] | None = None  # (argv index, agent path, is_dir)
-    clobber: bool = False
 
 
 def plan(repo: str, access: str, args: list[str]) -> GhPlan:
@@ -110,7 +109,10 @@ def _plan_command(repo: str, cmd: tuple[str, ...], rest: list[str]) -> GhPlan:
         if name in DENIED_FLAGS:
             raise Refused(f"gh flag {name} is not allowed through the gate.")
         if name == "--clobber":
-            result.clobber = True
+            raise Refused(
+                "gh --clobber is not allowed through the gate: downloads go into a new directory "
+                "(or a new file) the gate creates, and never replace anything."
+            )
         if name in SEARCH_FLAGS:
             value = t.split("=", 1)[1] if "=" in t else (rest[i + 1] if i + 1 < len(rest) else "")
             if SCOPE_QUALIFIER.search(value):

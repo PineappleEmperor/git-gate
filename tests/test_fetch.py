@@ -123,6 +123,36 @@ def test_fetch_output_path_refused(env, kind):
     assert not target.exists() or target.is_dir() and list(target.iterdir()) == []
 
 
+OUTPUTS = {
+    ".mcp.json": ".mcp.json",
+    "x.txt": "x.txt",
+    ".claude/settings.json": ".claude/settings.json",
+    ".git/x.bundle": ".git/x.bundle",
+    "hard-link": "x.bundle",
+}
+
+
+@pytest.mark.parametrize("kind", list(OUTPUTS))
+def test_fetch_output_must_be_an_exchange_name(env, checkout, kind):
+    """The gate writes outside the sandbox: never over config the sandbox write-protects."""
+    target = checkout / OUTPUTS[kind]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"precious")
+    if kind == "hard-link":
+        os.link(target, checkout / "other.bundle")
+    with pytest.raises(Refused):
+        call(env, "fetch", repo="me/app", bundle=str(target))
+    assert target.read_bytes() == b"precious"
+
+
+@pytest.mark.parametrize("rel", [".tmp/x.bundle", "out/x.bundle"])
+def test_fetch_output_exchange_names_succeed(env, checkout, rel):
+    target = checkout / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    run_reply(call(env, "fetch", repo="me/app", bundle=str(target)), checkout)
+    assert origin_refs(checkout) == heads(env)
+
+
 @pytest.mark.parametrize(
     "have", ["abc", {"a": 1}, [1], ["a" * 40, None], ["0" * 40] * 1001], ids=["str", "dict", "int", "none", "many"]
 )

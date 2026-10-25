@@ -378,6 +378,29 @@ def test_push_bundle_paths(env, checkout, monkeypatch, kind):
     assert staging_empty(env)
 
 
+@pytest.mark.parametrize("rel", [".git/x.bundle", "x.txt", ".x.bundle", "hard-link"])
+def test_push_bundle_must_be_an_exchange_name(env, checkout, rel):
+    real = _bundle_in(env, checkout)
+    if rel == "hard-link":
+        path = env.ws / "linked.bundle"
+        os.link(real, path)
+    else:
+        path = env.ws / rel
+        path.parent.mkdir(exist_ok=True)
+        real.rename(path)
+    with pytest.raises(Refused):
+        call(env, "push", repo="me/app", branch="feat", bundle=str(path))
+    assert remote_ref(env, "feat") == ""
+
+
+def test_push_bundle_from_the_scratch_dir(env, checkout):
+    real = _bundle_in(env, checkout)
+    (checkout / ".tmp").mkdir()
+    path = checkout / ".tmp/feat.bundle"
+    real.rename(path)
+    assert "Pushed" in call(env, "push", repo="me/app", branch="feat", bundle=str(path))
+
+
 def test_concurrent_pushes(env, checkout):
     """Two conversations push to one repo at once: each in its own process, sharing only the state dir."""
     bundles = {}
