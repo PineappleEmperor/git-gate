@@ -15,6 +15,7 @@
 #   install.sh install <sha> [--repo DIR] [--python PATH]
 #   install.sh rollback <sha>
 #   install.sh list
+#   install.sh post-switch <sha>   (the links and checks after a switch; install and rollback run it)
 set -eu
 
 ROOT=${GIT_GATE_ROOT:-/opt/git-gate}
@@ -87,21 +88,48 @@ switch_to() {
     sudo ln -sfn "releases/$1" "$ROOT/current.new"
     sudo mv -T "$ROOT/current.new" "$ROOT/current"
     echo "current -> releases/$1."
-    link_gitgatepush
+    post_switch_in "$1"
 }
 
-# Point $BIN_DIR/gitgatepush at the live release's launcher, so it works in any shell and always
-# runs the root-owned copy. Warn when another gitgatepush earlier on PATH would win.
-link_gitgatepush() {
-    link=$BIN_DIR/gitgatepush
-    sudo ln -sfn "$ROOT/current/bin/gitgatepush" "$link"
-    echo "$link -> $ROOT/current/bin/gitgatepush"
-    found=$(command -v gitgatepush || true)
-    if [ -z "$found" ]; then
-        echo "install.sh: warning: gitgatepush is not on your PATH; add $BIN_DIR to it." >&2
-    elif [ "$found" != "$link" ]; then
-        echo "install.sh: warning: running gitgatepush will start $found, not $link. Remove or rename it." >&2
+# The steps after a switch come from the release now live, not from this script: an upgrade runs
+# the old release's install.sh, which cannot know the steps a newer release adds. That release's
+# script is root-owned, like the rest of it. A release from before post-switch gets this script's
+# own steps instead.
+post_switch_in() {
+    script=$RELEASES/$1/install.sh
+    if [ -f "$script" ] && grep -q '^    post-switch)' "$script"; then
+        GIT_GATE_ROOT=$ROOT GIT_GATE_BIN_DIR=$BIN_DIR sh "$script" post-switch "$1"
+    else
+        link_launchers
     fi
+}
+
+cmd_post_switch() {
+    check_sha "$1"
+    cur=$(current_sha)
+    [ "$cur" = "$1" ] || die "$1 is not the live release (current is ${cur:-unset}); post-switch only follows a switch."
+    link_launchers
+}
+
+# Point $BIN_DIR/gitgatepush and $BIN_DIR/gitgaterules at the live release's launchers, so they
+# work in any shell and always run the root-owned copy. Warn when another one earlier on PATH would
+# win. A release without a launcher (gitgaterules is newer) leaves that link as it is.
+link_launchers() {
+    for name in gitgatepush gitgaterules; do
+        link=$BIN_DIR/$name
+        if [ ! -e "$ROOT/current/bin/$name" ]; then
+            echo "This release has no $name; $link is left as it is."
+            continue
+        fi
+        sudo ln -sfn "$ROOT/current/bin/$name" "$link"
+        echo "$link -> $ROOT/current/bin/$name"
+        found=$(command -v "$name" || true)
+        if [ -z "$found" ]; then
+            echo "install.sh: warning: $name is not on your PATH; add $BIN_DIR to it." >&2
+        elif [ "$found" != "$link" ]; then
+            echo "install.sh: warning: running $name will start $found, not $link. Remove or rename it." >&2
+        fi
+    done
 }
 
 cmd_list() {
@@ -180,5 +208,8 @@ case $action in
         check_sha "$1"
         switch_to "$1" ;;
     list) cmd_list ;;
-    *) die "usage: install.sh install <sha> | rollback <sha> | list" ;;
+    post-switch)
+        [ $# -eq 1 ] || die "usage: install.sh post-switch <sha>"
+        cmd_post_switch "$1" ;;
+    *) die "usage: install.sh install <sha> | rollback <sha> | list | post-switch <sha>" ;;
 esac

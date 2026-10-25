@@ -36,6 +36,8 @@ def check_inside(rules: Rules, real: Path, what: str) -> None:
         if real.is_relative_to(f):
             raise Refused(f"{what} {real} is inside gate-owned {f}.")
     if not any(real.is_relative_to(w) for w in rules.workspaces):
+        if rules.session:
+            raise Refused(f"{what} {real} is outside this session's folder, {rules.session.folder}.")
         raise Refused(f"{what} {real} is outside the workspaces in rules.toml.")
 
 

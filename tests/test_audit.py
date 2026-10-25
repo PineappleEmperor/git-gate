@@ -86,6 +86,48 @@ def test_cwd_is_null_when_the_folder_is_gone(env, monkeypatch):
     assert audit_lines(env)[-1]["cwd"] is None
 
 
+# --- access ----------------------------------------------------------------------------------
+
+
+def sessions(env, monkeypatch):
+    (env.cfg / "rules.toml").write_text(f'[sessions."{env.ws}"]\nrepo = "me/app"\nread = ["other/lib"]\n')
+    monkeypatch.chdir(env.ws)
+
+
+def test_access_is_null_for_v1_rules(env):
+    env.gate.call("prune", ok, repo="me/app")
+    assert audit_lines(env)[-1]["access"] is None
+
+
+def test_access_records_the_sessions_decision(env, monkeypatch):
+    sessions(env, monkeypatch)
+    env.gate.call("prune", ok, repo="me/app")
+    env.gate.call("prune", ok, repo="other/lib")
+    with pytest.raises(Refused, match="has no access"):
+        env.gate.call("prune", env.gate.prune, repo="nobody/x", branch="x")
+    lines = audit_lines(env)[-3:]
+    assert [(line["access"], line["outcome"]) for line in lines] == [
+        ("write", "ok"), ("read", "ok"), ("none", "refused"),
+    ]  # fmt: skip
+
+
+def test_access_names_a_call_from_no_session(env, monkeypatch):
+    sessions(env, monkeypatch)
+    monkeypatch.chdir(env.tmp)
+    with pytest.raises(Refused, match="not a git-gate session"):
+        env.gate.call("prune", ok, repo="me/app")
+    line = audit_lines(env)[-1]
+    assert (line["access"], line["outcome"], line["cwd"]) == ("no-session", "refused", str(env.tmp))
+
+
+def test_access_is_null_before_the_rules_are_read(env, monkeypatch):
+    sessions(env, monkeypatch)
+    (env.cfg / "disabled").touch()
+    with pytest.raises(Refused):
+        env.gate.call("prune", ok, repo="me/app")
+    assert audit_lines(env)[-1]["access"] is None
+
+
 # --- reason ----------------------------------------------------------------------------------
 
 

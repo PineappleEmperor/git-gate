@@ -1,0 +1,16 @@
+#!/bin/sh
+# Launcher for an installed release (/opt/git-gate/releases/<sha>/bin/gitgaterules), run by the user
+# as `gitgaterules <command>`, outside the sandbox. Linked from /usr/local/bin by install.sh.
+# Resolves its own path first, so a running command keeps its release when `current` moves.
+set -eu
+self=$(readlink -f "$0")
+root=$(readlink -f "${GIT_GATE_ROOT:-/opt/git-gate}")
+case $self in
+    "$root"/releases/*/bin/gitgaterules) ;;
+    *)
+        echo "gitgaterules: $self is not an installed release under $root/releases/; refusing to run." >&2
+        echo "Run it through the link install.sh makes, or reinstall with install.sh." >&2
+        exit 1 ;;
+esac
+release=${self%/bin/gitgaterules}
+exec "$release/.venv/bin/python" -I -m git_gate rules "$@"

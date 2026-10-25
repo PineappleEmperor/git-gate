@@ -76,6 +76,7 @@ def test_instructions_carry_the_agent_steps():
         "gitgatepush <id>",
         "the user merges",
         "never use SSH",
+        "the user grants with gitgaterules",
     ):
         assert needed in INSTRUCTIONS, needed
 
