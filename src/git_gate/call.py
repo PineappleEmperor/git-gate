@@ -33,6 +33,7 @@ def main(tool: str) -> None:
         result = run(tool, json.loads(sys.stdin.read() or "{}"), Gate())
     except Exception:
         log = state_dir() / "errors.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "a") as f:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {tool}\n{traceback.format_exc()}\n")
         result = {"error": f"git-gate hit an internal error; the traceback is in {log}."}

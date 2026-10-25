@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import time
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -11,6 +12,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from git_gate import Refused
+from git_gate.config import state_dir
 from git_gate.gate import Gate
 
 RELAY_TIMEOUT = 4 * 3600  # a backstop only; each call enforces the timeouts in rules.toml
@@ -50,12 +52,42 @@ class Relay:
                 text=True,
                 timeout=RELAY_TIMEOUT,
             )
-            result = json.loads(proc.stdout)
-        except OSError, ValueError, subprocess.TimeoutExpired:
+        except OSError, subprocess.TimeoutExpired:
             raise Refused(f"git-gate release {target.name[:12]} gave no answer.") from None
+        result = self._answer(proc.stdout)
+        if result is None:
+            log = self._log_child_failure(tool, proc)
+            where = f"; its stderr and exit code are in {log}" if log else ""
+            raise Refused(f"git-gate release {target.name[:12]} gave no answer{where}.")
         if "ok" in result:
             return result["ok"]
         raise Refused(result.get("refused") or result.get("error") or "git-gate returned nothing.")
+
+    @staticmethod
+    def _answer(stdout: str) -> dict | None:
+        """The child's answer if it is a JSON object whose ok/refused/error values are strings."""
+        try:
+            result = json.loads(stdout)
+        except ValueError:
+            return None
+        if not isinstance(result, dict):
+            return None
+        if any(key in result and not isinstance(result[key], str) for key in ("ok", "refused", "error")):
+            return None
+        return result
+
+    @staticmethod
+    def _log_child_failure(tool: str, proc: subprocess.CompletedProcess) -> Path | None:
+        """Keep what a child printed on stderr and its exit code; never the token, which this process lacks."""
+        log = state_dir() / "errors.log"
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        try:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with open(log, "a") as f:
+                f.write(f"{stamp} {tool} relay child exited {proc.returncode} without a valid answer\n{proc.stderr}\n")
+        except OSError:
+            return None
+        return log
 
 
 INSTRUCTIONS = """\
