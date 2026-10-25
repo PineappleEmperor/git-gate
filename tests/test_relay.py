@@ -119,7 +119,7 @@ def test_relay_runs_in_process_for_a_release_from_before_the_relay(tmp_path, env
     _point(tmp_path, "old")
     relay = Relay(tmp_path, fallback=lambda: env.gate)
     with pytest.raises(Refused, match="allowlist"):
-        relay("fetch", {"repo": "nobody/x", "path": str(env.ws)})
+        relay("fetch", {"repo": "nobody/x", "bundle": str(env.ws / "f.bundle")})
 
 
 def test_server_uses_the_relay(tmp_path):
@@ -139,7 +139,7 @@ def test_dev_checkout_is_not_relayed():
 
 def test_call_run(env):
     assert "reset --hard" in run("clone", {"repo": "me/app", "path": str(env.ws / "c")}, env.gate)["ok"]
-    assert "allowlist" in run("fetch", {"repo": "nobody/x", "path": str(env.ws)}, env.gate)["refused"]
+    assert "allowlist" in run("fetch", {"repo": "nobody/x", "bundle": str(env.ws / "f.bundle")}, env.gate)["refused"]
     assert "no tool" in run("rm", {}, env.gate)["refused"]
 
 
@@ -147,7 +147,7 @@ def test_call_subprocess_end_to_end(env):
     """The real child: `python -m git_gate call <tool>` with JSON in, JSON out."""
     proc = subprocess.run(
         [sys.executable, "-m", "git_gate", "call", "fetch"],
-        input=json.dumps({"repo": "nobody/x", "path": str(env.ws)}),
+        input=json.dumps({"repo": "nobody/x", "bundle": str(env.ws / "f.bundle")}),
         capture_output=True,
         text=True,
         env=os.environ | {"PYTHONPATH": str(SRC), "GIT_GATE_CONFIG_DIR": str(env.cfg)},

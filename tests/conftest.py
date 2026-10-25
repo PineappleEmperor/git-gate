@@ -43,7 +43,9 @@ class FakeGitHub:
         self.protected: set[str] = set()
         self.rules: dict[str, set[str]] = {}
         self.pulls: dict[str, list[dict]] = {}
+        self.open_pulls: dict[str, str] = {}
         self.deleted: list[tuple[str, str]] = []
+        self.fail_branch: Exception | None = None
 
     def __call__(self, token: str) -> FakeGitHub:
         assert token == TOKEN
@@ -56,6 +58,8 @@ class FakeGitHub:
         return git("symbolic-ref", "--short", "HEAD", cwd=self._bare(repo))
 
     def branch(self, repo: str, branch: str):
+        if self.fail_branch is not None:
+            raise self.fail_branch
         try:
             sha = git("rev-parse", "--verify", f"refs/heads/{branch}", cwd=self._bare(repo))
         except subprocess.CalledProcessError:
@@ -67,6 +71,9 @@ class FakeGitHub:
 
     def pulls_from(self, repo: str, branch: str) -> list[dict]:
         return self.pulls.get(branch, [])
+
+    def open_pull(self, repo: str, branch: str) -> str | None:
+        return self.open_pulls.get(branch)
 
     def delete_branch(self, repo: str, branch: str) -> None:
         self.deleted.append((repo, branch))
@@ -122,3 +129,17 @@ def checkout(env):
 
 def call(env, tool: str, **kwargs) -> str:
     return env.gate.call(tool, getattr(env.gate, tool), **kwargs)
+
+
+def make_bundle(checkout: Path, out: Path, branch: str, *exclude: str) -> Path:
+    """What an agent runs in the sandbox before calling push."""
+    git("bundle", "create", "-q", str(out), branch, "--not", *(exclude or ("--remotes=origin",)), cwd=checkout)
+    return out
+
+
+def push(env, checkout: Path, branch: str, **kwargs) -> str:
+    """Bundle `branch` from the agent's checkout into the workspace and push it through the gate."""
+    out = env.ws / f"{branch.replace('/', '-')}.bundle"
+    out.unlink(missing_ok=True)
+    make_bundle(checkout, out, branch)
+    return call(env, "push", repo=kwargs.pop("repo", "me/app"), branch=branch, bundle=str(out), **kwargs)

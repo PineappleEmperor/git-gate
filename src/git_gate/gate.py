@@ -1,23 +1,39 @@
 """The gate's five operations. Each call re-reads rules and token."""
 
+import fcntl
 import fnmatch
+import hashlib
 import json
+import math
 import os
+import secrets
+import shlex
 import shutil
 import subprocess
 import tempfile
 import time
+import urllib.parse
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 
 from git_gate import Refused, ghpolicy
-from git_gate.config import Rules, config_dir, load_rules, load_token, state_dir
+from git_gate.config import Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import PROTECTING_RULES, GitHub
-from git_gate.gitops import EMPTY, Git
-from git_gate.paths import copy_tree_into, open_dir, read_workspace_file, require_absolute
+from git_gate.gitops import EMPTY, MAX_STDERR, Git
+from git_gate.handover import Handovers
+from git_gate.mirror import MAX_HAVE, Mirror
+from git_gate.paths import copy_in, copy_tree_into, open_dir, read_workspace_file, require_absolute, write_out
 
 MAX_OUTPUT = 200_000
-HANDOVER = "git -c core.hooksPath=/dev/null push git@github.com:{repo}.git {branch}"
+MAX_BUNDLE = 512 << 20
+RATE_LIMIT = 60
+RATE_WINDOW = 60
+FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
+
+
+class HandedOver(Refused):
+    """A refused push kept for the user: the message names `gitgatepush <id>`."""
 
 
 class Gate:
@@ -30,14 +46,19 @@ class Gate:
         git: str = "/usr/bin/git",
         gh: str = "/usr/bin/gh",
         github: Callable[[str], GitHub] = GitHub,
+        clock: Callable[[], float] = time.time,
     ):
         self.config = config or config_dir()
         self.state = state or state_dir()
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.git = Git(self.state, base_url, git)
+        self.mirror = Mirror(self.git, self.state)
+        self.handovers = Handovers(self.state, mirror=self.mirror)
         self.gh_bin = gh
         self.github = github
-        (self.state / "gh").mkdir(exist_ok=True, mode=0o700)
+        self.clock = clock
+        for d in ("gh", "rate"):
+            (self.state / d).mkdir(exist_ok=True, mode=0o700)
 
     # --- plumbing -----------------------------------------------------------------------
 
@@ -45,13 +66,21 @@ class Gate:
         return load_rules(self.config), load_token(self.config)
 
     def call(self, tool: str, fn: Callable[..., str], **kwargs) -> str:
-        """Run one tool, scrub the token from whatever comes back, and audit it."""
+        """Run one tool, scrub the token from whatever comes back, and audit it.
+
+        The off switch is checked first, then the per-repo rate limit, before anything is read.
+        """
         token = None
         outcome = "ok"
         try:
+            check_enabled(self.config)
+            self._rate_limit(kwargs.get("repo"))
             rules, token = self._load()
             result = fn(rules, token, **kwargs)
             return _scrub(result, token)
+        except HandedOver as e:
+            outcome = "handover"
+            raise Refused(_scrub(str(e), token)) from None
         except Refused as e:
             outcome = "refused"
             raise Refused(_scrub(str(e), token)) from None
@@ -68,18 +97,61 @@ class Gate:
         with open(self.state / "audit.log", "a") as f:
             f.write(_scrub(line, token) + "\n")
 
-    def _refuse_protected(self, rules: Rules, api: GitHub, repo: str, branch: str, default: str) -> None:
+    def _rate_limit(self, repo: object) -> None:
+        """At most RATE_LIMIT calls per RATE_WINDOW seconds per repo, counted in a file: each call may
+        be its own process (the relay), so the count cannot live in memory."""
+        key = hashlib.sha256(str(repo).lower().encode()).hexdigest()[:24]
+        fd = os.open(self.state / "rate" / key, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            now = self.clock()
+            stamps = []
+            for word in f.read().split():
+                try:
+                    t = float(word)
+                except ValueError:
+                    continue
+                if now - RATE_WINDOW < t <= now:
+                    stamps.append(t)
+            if len(stamps) >= RATE_LIMIT:
+                wait = max(1, math.ceil(min(stamps) + RATE_WINDOW - now))
+                raise Refused(
+                    f"{repo} has had {RATE_LIMIT} calls in the last {RATE_WINDOW} s, the gate's limit; "
+                    f"wait {wait} s and try again."
+                )
+            stamps.append(now)
+            f.seek(0)
+            f.truncate()
+            f.write("".join(f"{t!r}\n" for t in stamps))
+
+    def _protection(self, rules: Rules, api: GitHub, repo: str, branch: str, default: str) -> str | None:
+        """Why `branch` is the user's to push, or None. API failures raise: they are not answers."""
         if branch == default:
-            raise Refused(f"{branch} is the default branch of {repo}.")
+            return f"{branch} is the default branch of {repo}."
         for pattern in rules.protected_branches:
             if fnmatch.fnmatchcase(branch, pattern):
-                raise Refused(f"{branch} matches protected pattern {pattern!r} in rules.toml.")
+                return f"{branch} matches protected pattern {pattern!r} in rules.toml."
         info = api.branch(repo, branch)
         if info and info["protected"]:
-            raise Refused(f"{branch} is protected on GitHub.")
+            return f"{branch} is protected on GitHub."
         rules_on = api.rule_types(repo, branch) & PROTECTING_RULES
         if rules_on:
-            raise Refused(f"{branch} is covered by ruleset rules: {', '.join(sorted(rules_on))}.")
+            return f"{branch} is covered by ruleset rules: {', '.join(sorted(rules_on))}."
+        return None
+
+    def _refuse_protected(self, rules: Rules, api: GitHub, repo: str, branch: str, default: str) -> None:
+        reason = self._protection(rules, api, repo, branch, default)
+        if reason:
+            raise Refused(reason)
+
+    @contextmanager
+    def _staged(self, kind: str):
+        """A fresh, not yet existing path in gate storage, removed afterwards."""
+        path = self.state / "staging" / f"{kind}-{secrets.token_hex(12)}.bundle"
+        try:
+            yield path
+        finally:
+            path.unlink(missing_ok=True)
 
     # --- tools --------------------------------------------------------------------------
 
@@ -148,93 +220,103 @@ class Gate:
             f"git -C {dest} reset --hard"
         )
 
-    def fetch(self, rules: Rules, token: str, repo: str, path: str) -> str:
+    def fetch(self, rules: Rules, token: str, repo: str, bundle: str, have: list[str] = ()) -> str:
+        """Write every GitHub branch of `repo` to a bundle at `bundle`, leaving out what `have` covers."""
         rules.access(repo)
-        info = self.git.validate(rules, repo, path)
-        url = self.git.url(repo)
-        t = rules.git_timeout
-        with self.git.shadow(rules, info) as sd:
-            heads = self.git.remote_heads(url, token, rules, sd)
-            proc = self.git.run(
-                ["fetch", "--no-tags", "--no-write-fetch-head", url, "+refs/heads/*:refs/remotes/origin/*"],
-                timeout=t, token=token, git_dir=sd,
-            )  # fmt: skip
-            self.git.write_back(sd, "refs/remotes/origin/", rules)
-            tracking = self.git.run(
-                ["for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/"], timeout=t, git_dir=sd
-            ).stdout.split()
-        stale = sorted(b for b in tracking if b != "HEAD" and b not in heads)
-        out = proc.stderr.strip() or f"origin/* already up to date ({len(heads)} branches)."
-        if stale:
-            out += (
-                "\n\nThese remote-tracking branches no longer exist on GitHub (the gate does not prune). "
-                "Delete them in the sandbox with:\n\ngit -C "
-                + str(info.real)
-                + " branch -dr "
-                + " ".join(f"origin/{b}" for b in stale)
+        if not isinstance(have, list | tuple) or not all(isinstance(h, str) for h in have):
+            raise Refused("have must be a list of commit SHA strings.")
+        if len(have) > MAX_HAVE:
+            raise Refused(f"have lists {len(have)} SHAs; the gate takes at most {MAX_HAVE}.")
+        require_absolute(bundle, "Bundle output path")
+        with self._staged("fetch") as tmp:
+            with self.mirror.lock(repo):
+                heads = self.mirror.sync(repo, token, rules)
+                wrote = self.mirror.export_bundle(repo, tmp, list(have), rules)
+            if not heads:
+                return f"{repo} has no branches on GitHub yet; nothing to fetch, and no bundle was written."
+            listing = "GitHub's branches (what origin/* should be):\n" + "\n".join(
+                f"{name} {sha}" for name, sha in sorted(heads.items())
             )
-        return out
+            gone = (
+                "\n\nAn origin/* branch not listed here is gone from GitHub; delete it with "
+                "git branch -dr origin/<name>."
+            )
+            if not wrote:
+                return f"Up to date: origin/* already matches GitHub. No bundle was written.\n\n{listing}{gone}"
+            write_out(rules, bundle, tmp, "Bundle output")
+        return (
+            f"Wrote {len(heads)} branch(es) of {repo} to {bundle}. Inside the sandbox run:\n\n"
+            f"git fetch {shlex.quote(bundle)} '{FETCH_REFSPEC}'\n\n{listing}{gone}"
+        )
 
-    def push(self, rules: Rules, token: str, repo: str, path: str, branch: str) -> str:
+    def push(self, rules: Rules, token: str, repo: str, branch: str, bundle: str) -> str:
+        """Push the one commit in `bundle` to `branch`, or keep it as a handover for the user."""
         rules.require_write(repo)
+        repo_rules = rules.repo(repo)
         self.git.check_branch(branch, rules)
-        api = self.github(token)
-        default = api.default_branch(repo)
-        self._refuse_protected(rules, api, repo, branch, default)
-        info = self.git.validate(rules, repo, path)
-        url = self.git.url(repo)
-        t = rules.git_timeout
-        with self.git.shadow(rules, info) as sd:
-            local = self.git.run(
-                ["rev-parse", "--verify", "--quiet", "--end-of-options", f"refs/heads/{branch}^{{commit}}"],
-                timeout=t, git_dir=sd, check=False,
-            ).stdout.strip()  # fmt: skip
-            if not local:
-                raise Refused(f"No local branch {branch} in {info.real}.")
-            heads = self.git.remote_heads(url, token, rules, sd)
-            remote = heads.get(branch)
-            base = remote or heads.get(default)
-            wanted = [f"refs/heads/{b}" for b in {branch, default} if b in heads]
-            if wanted:
-                self.git.run(
-                    ["fetch", "--no-tags", "--no-write-fetch-head", url, *wanted], timeout=t, token=token, git_dir=sd
-                )
-            if remote == local:
-                return f"{branch} is already at {local[:12]} on {repo}."
-            if remote:
-                ff = self.git.run(["merge-base", "--is-ancestor", remote, local], timeout=t, git_dir=sd, check=False)
-                if ff.returncode != 0:
-                    raise Refused(
-                        f"{branch} on {repo} has commits yours does not ({remote[:12]}); fetch, then rebase or "
-                        "merge origin/" + branch + " and push again. The gate never force-pushes."
+        with self._staged("push") as staged:
+            copy_in(rules, bundle, staged, MAX_BUNDLE, "Bundle")
+            api = self.github(token)
+            default = api.default_branch(repo)
+            protected = self._protection(rules, api, repo, branch, default)
+            with self.mirror.lock(repo):
+                heads = self.mirror.sync(repo, token, rules)
+                sha = self.mirror.import_bundle(repo, staged, branch, rules)
+                remote = heads.get(branch)
+                if remote == sha:
+                    return f"{branch} is already at {sha[:12]} on {repo}."
+                reasons = [protected] if protected else []
+                advice = []
+                lease = None
+                if remote and not self.mirror.is_ancestor(repo, remote, sha, rules):
+                    lease = remote
+                    reasons.append(f"{branch} on {repo} is at {remote[:12]}, so this is not a fast-forward.")
+                    advice.append(
+                        f"If the rewrite was not meant, fetch, rebase or merge origin/{branch} and push again instead."
                     )
-            new = self.git.run(
-                ["rev-list", local, *(["--not", base] if base else [])], timeout=t, git_dir=sd
-            ).stdout.split()
-            touched = self.git.workflow_touches(new, sd, rules)
-            if not touched and base:
-                # Per-commit diffs miss a merge that takes an older workflow from one parent, so also
-                # compare the whole tree with the remote branch, or with where it forked from default.
-                fork = (
-                    remote
-                    or self.git.run(["merge-base", base, local], timeout=t, git_dir=sd, check=False).stdout.strip()
-                    or base
-                )
-                if self.git.workflows_differ(fork, local, sd, rules):
-                    touched = [local]
-            if touched:
-                raise Refused(
-                    f"Commits {', '.join(c[:12] for c in touched)} touch .github/workflows/, which the gate never "
-                    "pushes. Hand this to the user to push over SSH from their own terminal:\n\n"
-                    + HANDOVER.format(repo=repo, branch=branch)
-                )
-            proc = self.git.run(
-                ["push", "--porcelain", "--no-verify", "--no-follow-tags", url, f"{local}:refs/heads/{branch}"],
-                timeout=t, token=token, git_dir=sd, check=False,
-            )  # fmt: skip
+                against = remote or heads.get(default)
+                new = self.mirror.new_commits(repo, sha, against, rules)
+                patterns = repo_rules.handover_paths
+                touched = self.mirror.touched(repo, new, against, sha, patterns, rules)
+                if touched:
+                    reasons.append(
+                        f"Commit(s) {', '.join(c[:12] for c in touched)} touch a handover path ({', '.join(patterns)})."
+                    )
+                if reasons:
+                    base = remote or self._fork_point(repo, sha, heads, default, rules)
+                    h = self.handovers.create(repo, branch, sha, base, lease, " ".join(reasons))
+                    self.mirror.keep(repo, h.ref, sha, rules)
+                    raise HandedOver(
+                        f"Not pushed: {' '.join(reasons)} That push is the user's. The gate kept {sha[:12]} as "
+                        f"handover {h.id}; hand the user this command, which shows the commits and asks before "
+                        f"pushing from their own terminal:\n\ngitgatepush {h.id}" + "".join(f"\n\n{a}" for a in advice)
+                    )
+                proc = self.mirror.push(repo, sha, branch, token, rules)
         if proc.returncode != 0:
-            raise Refused(f"git push was rejected:\n{(proc.stdout + proc.stderr).strip()}")
-        return f"Pushed {len(new)} commit(s) to {repo} {branch} ({(remote or 'new')[:12]} -> {local[:12]})."
+            raise Refused(f"git push was rejected:\n{(proc.stdout + proc.stderr).strip()[-MAX_STDERR:]}")
+        lines = [f"Pushed {len(new)} commit(s) to {repo} {branch} ({(remote or 'new')[:12]} -> {sha[:12]})."]
+        try:
+            pull = api.open_pull(repo, branch)
+        except Refused:
+            pull = None
+        if pull:
+            lines.append(f"Pull request: {pull}")
+        else:
+            q = urllib.parse.quote
+            lines.append(f"Open a pull request: https://github.com/{repo}/compare/{q(default)}...{q(branch)}")
+        if repo_rules.push_deploys:
+            lines.append("This push deploys.")
+        return "\n".join(lines)
+
+    def _fork_point(self, repo: str, sha: str, heads: dict[str, str], default: str, rules: Rules) -> str | None:
+        """Where a new branch leaves GitHub's history: its merge-base with the default branch.
+
+        None only when GitHub has no branches. Without a common ancestor, the default branch's tip.
+        """
+        target = heads.get(default) or next(iter(sorted(heads.items())), (None, None))[1]
+        if target is None:
+            return None
+        return self.mirror.merge_base(repo, sha, target, rules) or target
 
     def prune(self, rules: Rules, token: str, repo: str, branch: str) -> str:
         rules.require_write(repo)

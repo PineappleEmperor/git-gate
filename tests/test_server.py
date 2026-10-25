@@ -14,7 +14,7 @@ def test_tools_registered(env):
 def test_refusal_becomes_tool_error(env):
     server = build(env.gate)
     with pytest.raises(ToolError, match="allowlist"):
-        anyio.run(server.call_tool, "fetch", {"repo": "nobody/x", "path": str(env.ws)})
+        anyio.run(server.call_tool, "fetch", {"repo": "nobody/x", "bundle": str(env.ws / "f.bundle")})
 
 
 def test_success_returns_text(env):

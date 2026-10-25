@@ -128,18 +128,23 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         return await run("clone", repo=repo, path=path)
 
     @server.tool()
-    async def fetch(repo: str, path: str) -> str:
-        """Fetch every branch of `repo` into refs/remotes/origin/* of the local repo at `path`."""
-        return await run("fetch", repo=repo, path=path)
+    async def fetch(repo: str, bundle: str, have: list[str] | None = None) -> str:
+        """Write every GitHub branch of `repo` to a bundle file at `bundle` (absolute, in a workspace).
+
+        Then, in the sandbox: git fetch <bundle> '+refs/heads/*:refs/remotes/origin/*'. Pass your
+        current origin/* SHAs as `have` to leave out history you already hold.
+        """
+        return await run("fetch", repo=repo, bundle=bundle, have=have or [])
 
     @server.tool()
-    async def push(repo: str, path: str, branch: str) -> str:
-        """Fast-forward push local `branch` from `path` to the same branch on GitHub.
+    async def push(repo: str, branch: str, bundle: str) -> str:
+        """Fast-forward push the one branch in `bundle` to the same branch on GitHub.
 
-        Refused for protected or default branches, non-fast-forward updates, and commits touching
-        .github/workflows/ (the refusal carries a command for the user to run instead).
+        Make the bundle in the sandbox: git bundle create <bundle> <branch> --not --remotes=origin.
+        Protected or default branches, non-fast-forward updates and handover paths are refused
+        and kept for the user, who runs the `gitgatepush <id>` the refusal names.
         """
-        return await run("push", repo=repo, path=path, branch=branch)
+        return await run("push", repo=repo, branch=branch, bundle=bundle)
 
     @server.tool()
     async def prune(repo: str, branch: str) -> str:
