@@ -4,3 +4,20 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
+.superpowers/
+
+# Claude Code's sandbox masks these in the project folder with empty placeholders; none belongs to the repo.
+/.bash_profile
+/.bashrc
+/.profile
+/.zprofile
+/.zshrc
+/.ripgreprc
+/.gitconfig
+/.gitmodules
+/.mcp.json
+/.claude/
+/.vscode/
+/.vscode
+/.idea/
+/.idea

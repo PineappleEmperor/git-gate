@@ -247,7 +247,8 @@ def _issue_list(ctx: Context, repo: str, state=None, labels=None, limit=None) ->
 
 def _pr_search(ctx: Context, repo: str, search, state=None, head=None, base=None, limit=None) -> str:
     text = _search_text(search)
-    state = _choice(state or "open", "state", PR_STATES)
+    # No state means none from the gate: an is:merged or is:closed in the text then decides.
+    state = _choice(state or "all", "state", PR_STATES)
     limit = _limit(limit, DEFAULT_LIST, MAX_LIST)
     terms = [*_state_terms(state)]
     if head is not None:
@@ -266,7 +267,7 @@ def _pr_search(ctx: Context, repo: str, search, state=None, head=None, base=None
 
 def _issue_search(ctx: Context, repo: str, search, state=None, labels=None, limit=None) -> str:
     text = _search_text(search)
-    state = _choice(state or "open", "state", ISSUE_STATES)
+    state = _choice(state or "all", "state", ISSUE_STATES)
     labels = _names(labels or [], "labels", MAX_LABEL)
     labels = [_search_label(name) for name in labels]
     limit = _limit(limit, DEFAULT_LIST, MAX_LIST)

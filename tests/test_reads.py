@@ -767,15 +767,26 @@ def hit(number, *, pull=False, merged=False, **extra):
 
 
 def test_pr_search(env, gh):
-    path = searched("repo:me/app is:pr is:open flaky test")
+    path = searched("repo:me/app is:pr flaky test")
     gh.replies[path] = {"total_count": 2, "items": [hit(12, pull=True), hit(9, pull=True, draft=True)]}
     out = call(env, "pr", repo="me/app", action="list", search="flaky test")
     assert requests(gh) == [path]
     lines = out.splitlines()
     assert lines[0] == UNTRUSTED
-    assert lines[1] == 'Pull requests of me/app matching "flaky test" (open, most recently updated first; 2 found):'
+    assert lines[1] == 'Pull requests of me/app matching "flaky test" (all, most recently updated first; 2 found):'
     assert lines[2] == "#12 It breaks 12 [open] labels: bug; updated 2026-10-26T10:00:00Z"
     assert lines[3].startswith("#9 It breaks 9 [open, draft]")
+
+
+@pytest.mark.parametrize("tool", ["pr", "issue"])
+def test_a_search_without_state_lets_its_own_is_filter_decide(env, gh, tool):
+    """No state means no is:open from the gate, so "is:merged" in the text is not turned into
+    "is:open is:merged", which matches nothing."""
+    path = searched(f"repo:me/app is:{tool} is:closed fix")
+    gh.replies[path] = {"total_count": 1, "items": [hit(4, pull=tool == "pr", merged=tool == "pr", state="closed")]}
+    out = call(env, tool, repo="me/app", action="list", search="is:closed fix")
+    assert requests(gh) == [path]
+    assert "#4 It breaks 4" in out
 
 
 def test_pr_search_with_every_filter(env, gh):
@@ -802,14 +813,14 @@ def test_search_with_no_hits(env, gh):
 
 
 def test_search_rate_limit_says_try_again_in_a_minute(env, gh):
-    gh.replies[searched("repo:me/app is:pr is:open x")] = (403, "API rate limit exceeded for search", {})
+    gh.replies[searched("repo:me/app is:pr x")] = (403, "API rate limit exceeded for search", {})
     with pytest.raises(Refused, match="try again in a minute"):
         call(env, "pr", repo="me/app", action="list", search="x")
     assert len(requests(gh)) == 1
 
 
 def test_search_needs_read_access(env, gh):
-    gh.replies[searched("repo:other/lib is:issue is:open x")] = {"items": []}
+    gh.replies[searched("repo:other/lib is:issue x")] = {"items": []}
     call(env, "issue", repo="other/lib", action="list", search="x")
     with pytest.raises(Refused, match="allowlist"):
         call(env, "issue", repo="nobody/x", action="list", search="x")
@@ -853,7 +864,7 @@ def test_search_refuses_what_could_widen_or_break_it(env, gh, tool, text):
 
 @pytest.mark.parametrize("text", ["or", "repository layout", "isn't public", "user-facing bug", "org chart", "x" * 256])
 def test_search_lets_plain_words_through(env, gh, text):
-    gh.replies[searched(f"repo:me/app is:issue is:open {text}")] = {"items": []}
+    gh.replies[searched(f"repo:me/app is:issue {text}")] = {"items": []}
     call(env, "issue", repo="me/app", action="list", search=text)
     assert len(requests(gh)) == 1
 
@@ -920,6 +931,6 @@ def test_search_text_refuses_backslashes_quotes_and_parentheses(env, gh, text):
 
 @pytest.mark.parametrize("label", ["good first issue", "help-wanted", "v1.2", "area/ci", "won't fix", "P1!"])
 def test_plain_labels_still_search(env, gh, label):
-    gh.replies[searched(f'repo:me/app is:issue is:open label:"{label}" crash')] = {"items": [hit(3)]}
+    gh.replies[searched(f'repo:me/app is:issue label:"{label}" crash')] = {"items": [hit(3)]}
     out = call(env, "issue", repo="me/app", action="list", search="crash", labels=[label])
     assert len(requests(gh)) == 1 and "#3 It breaks 3" in out

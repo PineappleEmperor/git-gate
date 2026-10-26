@@ -51,15 +51,20 @@ escapes and control characters.
   holds a `repo:`, `org:`, `user:` or `owner:` qualifier or `is:public`/`is:private` in any form
   (quoted, negated, spaced), since GitHub ORs repeated `repo:` qualifiers, or `OR`, `AND`, `NOT`,
   parentheses, backslashes or double quotes. Label names in a search get the same checks and may hold
-  no `x:` word at all. GitHub allows 30 searches a minute; a rate-limited search is refused, not
-  retried.
+  no `x:` word at all. Without `state`, a search adds no state of its own, so an `is:merged` or
+  `is:closed` in the text decides. GitHub allows 30 searches a minute; a rate-limited search is
+  refused, not retried.
 - `checks(repo, ref, wait=False, timeout_minutes=20)`: whether CI passed on a pull request (`12` or
   `"#12"`), branch or commit SHA. One line per check run and commit status (name, state,
   conclusion, duration, Actions run id, URL), then a verdict: `All N passed`, `N failing: <names>`,
-  `N still running` or `No checks reported`. Neutral and skipped count as not failing.
+  `N still running` or `No checks reported`. Neutral and skipped count as not failing. A private
+  repo hides check runs from the gate's token (a fine-grained token cannot hold a Checks
+  permission), and commit statuses unless the token has Commit statuses (read); then the commit's
+  Actions runs stand in for the check runs, and the answer says so.
 - `run(repo, run_id, wait=False, timeout_minutes=20)`: one Actions run, its jobs, the failed steps
   of failed jobs and, for a failed run, the last 80 lines of each failed job's log (at most 10 jobs;
-  each log download capped at 2 MiB, read from its end), then a verdict.
+  each log download capped at 2 MiB, read from its end), cut to the failed step's own lines where
+  the log's timestamps allow, then a verdict.
 - `runs(repo, branch, workflow, status, limit)`: the newest Actions runs, one line each.
 - `release(repo, action, tag, limit)`: `list`, or `view` of a tag or the latest release. Assets are
   listed, not downloaded.

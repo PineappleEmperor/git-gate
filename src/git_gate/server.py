@@ -196,6 +196,8 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         conclusion, duration, the Actions run id when there is one, URL), then a verdict line: "All N
         passed", "N failing: <names>", "N still running" or "No checks reported". Neutral and skipped
         checks count as not failing. For a failing Actions check, pass its run id to the run tool.
+        On a private repo GitHub refuses check runs to the gate's token (a fine-grained token cannot
+        hold a Checks permission), so the commit's Actions runs stand in for them, and the answer says so.
 
         With wait=true the gate itself polls (every 15 s, slowing to every 60 s, backing off when
         GitHub rate-limits) until nothing is queued or in progress, then answers once; after
@@ -283,7 +285,8 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         Reads (read access is enough):
         - view: number. Title, state, draft, author, branches, mergeable state, labels, requested
           reviewers, each reviewer's latest review, URL and body.
-        - list: optional state (open, closed, merged, all; default open), head (a branch, or
+        - list: optional state (open, closed, merged, all; default open, but all with search),
+          head (a branch, or
           owner:branch for a fork), base, limit (at most 100, default 30), search (text GitHub's
           search matches, at most 256 characters; the gate adds repo: and is:pr itself and refuses
           repo:, org:, user:, owner:, is:public, is:private, OR, AND, NOT, parentheses, backslashes
@@ -320,7 +323,8 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
 
         Reads (read access is enough):
         - view: number. Title, state, author, labels, assignees, URL, body and the last 20 comments.
-        - list: optional state (open, closed, all; default open), labels (issues with all of them),
+        - list: optional state (open, closed, all; default open, but all with search), labels
+          (issues with all of them),
           limit (at most 100, default 30), search (text to look for, as for pr list). Pull requests
           are left out. One line each.
         Writes, and what they take (anything else is refused):

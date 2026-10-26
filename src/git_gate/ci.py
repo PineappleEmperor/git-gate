@@ -20,6 +20,8 @@ from git_gate.gitops import Git
 SHA = re.compile(r"[0-9a-fA-F]{7,40}")
 PULL_REF = re.compile(r"#(\d+)")
 ACTIONS_JOB = re.compile(r"/actions/runs/(\d+)/job/\d+")
+LOG_STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z ")  # GitHub's prefix on each log line
+STEP_ERROR = "##[error]"  # the line GitHub writes when a step fails
 PASSING = {"success", "neutral", "skipped"}  # conclusions that are not failing
 QUIET = {"neutral", "skipped"}
 MAX_FIELD = 200  # characters of one field GitHub sent
@@ -73,21 +75,83 @@ def checks(ctx: Context, repo: str, ref: object, wait: object = False, timeout_m
     ref = _ref(ref)
     minutes, capped = _wait_args(wait, timeout_minutes)
     resolved: list[tuple[str, str]] = []
+    refused: list[str] = []  # what GitHub would not show the token, as notes
 
     def poll() -> list[Check]:
         if not resolved:
             resolved.append(_resolve(ctx, repo, ref))
         sha = resolved[0][1]
-        runs = needs(repo, "Checks", lambda: ctx.api.check_runs(repo, sha))
-        statuses = needs(repo, "Commit statuses", lambda: ctx.api.statuses(repo, sha))
-        return [_check_run(r) for r in runs if isinstance(r, dict)] + [
-            _status(s) for s in statuses if isinstance(s, dict)
-        ]
+        runs = needs(repo, "Checks", lambda: _unless_refused(lambda: ctx.api.check_runs(repo, sha)))
+        statuses = needs(repo, "Commit statuses", lambda: _unless_refused(lambda: ctx.api.statuses(repo, sha)))
+        refused.clear()
+        found = []
+        if runs is None:
+            actions = needs(repo, "Actions", lambda: ctx.api.commit_runs(repo, sha))
+            found += [_actions_run(r) for r in _latest_per_workflow(actions)]
+            refused.append(REFUSED_CHECKS)
+        else:
+            found += [_check_run(r) for r in runs if isinstance(r, dict)]
+        if statuses is None:
+            refused.append(REFUSED_STATUSES)
+        else:
+            found += [_status(s) for s in statuses if isinstance(s, dict)]
+        return found
 
     found, note = _poll(ctx, poll, lambda found: any(c.running for c in found), wait, minutes, capped)
     where, sha = resolved[0]
     head = [f"Checks of {repo} {where} at {field(sha)}:"]
-    return fit(head + [c.line for c in found], [_verdict(found), *note], ctx.max_output)
+    return fit(head + [c.line for c in found] + refused, [_verdict(found), *note], ctx.max_output)
+
+
+# A private repo hides check runs from the gate's fine-grained token, which cannot hold a "Checks"
+# permission, and commit statuses unless it holds "Commit statuses"; a public repo shows both to anyone.
+REFUSED_CHECKS = (
+    "GitHub refuses this commit's check runs to the gate's token (a fine-grained token cannot hold a "
+    '"Checks" permission), so these are the commit\'s Actions runs instead.'
+)
+REFUSED_STATUSES = (
+    "GitHub refuses this commit's commit statuses to the gate's token (it lacks the \"Commit statuses\" "
+    "permission, read), so any are left out."
+)
+
+
+def _unless_refused(read: Callable):
+    """`read()`, or None when GitHub refuses it to the token with a 403 that is not a rate limit."""
+    try:
+        return read()
+    except RateLimited:
+        raise
+    except GitHubError as e:
+        if e.status == 403:
+            return None
+        raise
+
+
+def _latest_per_workflow(runs: list[dict]) -> list[dict]:
+    """The newest run of each workflow; GitHub lists a commit's runs newest first."""
+    seen, latest = set(), []
+    for run in runs:
+        key = run.get("workflow_id") or run.get("name")
+        if key not in seen:
+            seen.add(key)
+            latest.append(run)
+    return latest
+
+
+def _actions_run(run: dict) -> Check:
+    status, conclusion = run.get("status"), run.get("conclusion")
+    running = status != "completed"
+    parts = [field(status), *([] if running else [field(conclusion)]), f"run {field(run.get('id'))}"]
+    if run.get("html_url"):
+        parts.append(field(run["html_url"]))
+    name = field(run.get("name"))
+    return Check(
+        name,
+        running,
+        not running and conclusion not in PASSING,
+        not running and conclusion in QUIET,
+        f"- {name} (Actions run): {', '.join(parts)}",
+    )
 
 
 def _ref(ref: object) -> int | str:
@@ -237,23 +301,46 @@ def _job_line(job: dict) -> str:
 
 
 def _log(ctx: Context, repo: str, job: dict) -> list[str]:
-    """The last LOG_LINES lines of a failed job's log, or why there are none."""
+    """The last LOG_LINES lines of a failed job's failed step, or of its whole log when the step's
+    part cannot be found, or why there are none."""
     name = field(job.get("name"))
     try:
         data, note = needs(repo, "Actions", lambda: ctx.api.job_log(repo, number(job.get("id"), "job id")))
     except Refused as e:
         return [f"The log of {name} is not available: {e}"]
-    tail = _log_lines(data)
-    head = f"Last {len(tail)} lines of the log of {name}" + (f" ({note})" if note else "") + ":"
-    return [head, *tail]
-
-
-def _log_lines(data: bytes) -> list[str]:
-    """The end of a log as printable lines (see `text`), each cut to MAX_LOG_LINE characters."""
     lines = text(data).split("\n")
     if lines and lines[-1] == "":
         lines.pop()
-    return [line if len(line) <= MAX_LOG_LINE else line[:MAX_LOG_LINE] + "..." for line in lines[-LOG_LINES:]]
+    step, part = _failed_step(job, lines)
+    tail = [line if len(line) <= MAX_LOG_LINE else line[:MAX_LOG_LINE] + "..." for line in part[-LOG_LINES:]]
+    where = f'the failed step "{step}" of {name}' if step else f"the log of {name}"
+    return [f"Last {len(tail)} lines of {where}" + (f" ({note})" if note else "") + ":", *tail]
+
+
+def _failed_step(job: dict, lines: list[str]) -> tuple[str | None, list[str]]:
+    """The first failed step's name and its part of the job's log, ending at its last error line.
+
+    Each log line starts with GitHub's timestamp and each step reports its start and end, to the
+    second; a line without a timestamp continues the one before. This leaves out the steps around
+    the failure, the job's cleanup above all. When the step or the timestamps are missing, or no
+    line falls in the step's time, the answer is (None, the whole log).
+    """
+    steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
+    step = next((s for s in steps if s.get("conclusion") not in (*PASSING, None)), None)
+    start, end = (step or {}).get("started_at"), (step or {}).get("completed_at")
+    if not (isinstance(start, str) and isinstance(end, str) and LOG_STAMP.fullmatch(start[:-1] + "Z ")):
+        return None, lines
+    start, end = start[:19], end[:19]
+    part, stamp = [], None
+    for line in lines:
+        if found := LOG_STAMP.match(line):
+            stamp = found.group(1)
+        if stamp is not None and start <= stamp <= end:
+            part.append(line)
+    if not part:
+        return None, lines
+    last_error = max((i for i, line in enumerate(part) if STEP_ERROR in line), default=None)
+    return field(step.get("name")), part if last_error is None else part[: last_error + 1]
 
 
 def _run_verdict(status: object, conclusion: object, jobs: list[dict], failing: list[dict]) -> str:
