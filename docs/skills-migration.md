@@ -107,6 +107,7 @@ Each read needs read access to the repo.
 |---|---|
 | `gh pr view N` | `pr(repo, "view", number=N)` |
 | `gh pr list [--state S] [--head H] [--base B] [-L N]` | `pr(repo, "list", state=S, head=H, base=B, limit=N)`; `state` is `open` (default), `closed`, `merged` or `all`; `limit` at most 100 |
+| `gh pr list --search "TEXT" [--state S] [-L N]` | `pr(repo, "list", search="TEXT", state=S, limit=N)` |
 | `gh pr diff N` | `pr(repo, "diff", number=N)` |
 | `gh pr checks N` | `checks(repo, N)`; `ref` may also be `"#N"`, a branch or a commit SHA |
 | `gh pr checks N --watch` | `checks(repo, N, wait=true)` |
@@ -115,6 +116,7 @@ Each read needs read access to the repo.
 | `gh run watch ID` | `run(repo, ID, wait=true)` |
 | `gh issue view N [--comments]` | `issue(repo, "view", number=N)`, with the last 20 comments |
 | `gh issue list [--state S] [--label L] [-L N]` | `issue(repo, "list", state=S, labels=[L], limit=N)` |
+| `gh issue list --search "TEXT" [--state S] [--label L] [-L N]` | `issue(repo, "list", search="TEXT", state=S, labels=[L], limit=N)` |
 | `gh release list` | `release(repo, "list", limit=N)`; `limit` at most 30 |
 | `gh release view [TAG]` | `release(repo, "view", tag=TAG)`; no tag means the latest release |
 | `gh repo view` | `api_get(repo, "")` |
@@ -161,8 +163,10 @@ a command.
 
 No tool merges or approves a pull request, or creates, edits or uploads to a release: those stay the
 user's. Use `clone`, or `fetch` and a local checkout, where a skill ran `gh repo clone` or
-`gh pr checkout`. Searching across repos (`gh search issues|prs`) has no replacement: GitHub's search
-cannot be held to one repo.
+`gh pr checkout`. Searching across repos (`gh search issues|prs`) has no replacement. Search inside
+one repo is `list` with `search`: the gate adds `repo:` itself and refuses text holding `repo:`,
+`org:`, `user:`, `owner:`, `is:public` or `is:private` (GitHub ORs repeated `repo:` qualifiers), or
+`OR`, `AND`, `NOT` or parentheses.
 
 ## Handovers
 

@@ -40,11 +40,17 @@ carries GitHub's text begins with a line marking it as GitHub content, and that 
 escapes and control characters.
 
 - `clone`, `fetch`, `push`, `prune`: git, through bundles (above).
-- `pr`: read with `view`, `list` (state open, closed, merged or all; head, base, limit) and `diff`;
+- `pr`: read with `view`, `list` (state open, closed, merged or all; head, base, limit, search) and
+  `diff`;
   write with `create`, `edit`, `comment`, `review_comment`, `request_changes`, `close`, `reopen`,
   `ready`.
-- `issue`: read with `view` (with the last 20 comments) and `list` (state, labels, limit); write with
-  `create`, `edit`, `comment`, `close`, `reopen`.
+- `issue`: read with `view` (with the last 20 comments) and `list` (state, labels, limit, search);
+  write with `create`, `edit`, `comment`, `close`, `reopen`.
+- `search` on `pr` and `issue` `list` runs GitHub's issue search, one page, with `repo:<repo>` and
+  `is:pr` or `is:issue` put first by the gate. Text of at most 256 printable characters; refused if it
+  holds a `repo:`, `org:`, `user:` or `owner:` qualifier or `is:public`/`is:private` in any form
+  (quoted, negated, spaced), since GitHub ORs repeated `repo:` qualifiers, or `OR`, `AND`, `NOT` or
+  parentheses. GitHub allows 30 searches a minute; a rate-limited search is refused, not retried.
 - `checks(repo, ref, wait=False, timeout_minutes=20)`: whether CI passed on a pull request (`12` or
   `"#12"`), branch or commit SHA. One line per check run and commit status (name, state,
   conclusion, duration, Actions run id, URL), then a verdict: `All N passed`, `N failing: <names>`,
