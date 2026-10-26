@@ -78,27 +78,27 @@ def checks(ctx: Context, repo: str, ref: object, wait: object = False, timeout_m
         if not resolved:
             resolved.append(_resolve(ctx, repo, ref))
         sha = resolved[0][1]
-        runs = _needs(repo, "Checks", lambda: ctx.api.check_runs(repo, sha))
-        statuses = _needs(repo, "Commit statuses", lambda: ctx.api.statuses(repo, sha))
+        runs = needs(repo, "Checks", lambda: ctx.api.check_runs(repo, sha))
+        statuses = needs(repo, "Commit statuses", lambda: ctx.api.statuses(repo, sha))
         return [_check_run(r) for r in runs if isinstance(r, dict)] + [
             _status(s) for s in statuses if isinstance(s, dict)
         ]
 
     found, note = _poll(ctx, poll, lambda found: any(c.running for c in found), wait, minutes, capped)
     where, sha = resolved[0]
-    head = [f"Checks of {repo} {where} at {_field(sha)}:"]
-    return _fit(head + [c.line for c in found], [_verdict(found), *note], ctx.max_output)
+    head = [f"Checks of {repo} {where} at {field(sha)}:"]
+    return fit(head + [c.line for c in found], [_verdict(found), *note], ctx.max_output)
 
 
 def _ref(ref: object) -> int | str:
     """A pull request number, or a branch name or commit SHA to look up; refused before GitHub is asked."""
     if type(ref) is int:
-        return _number(ref, "ref")
+        return number(ref, "ref")
     if not isinstance(ref, str) or not ref:
         raise Refused(f'ref must be a pull request number (12 or "#12"), a branch name or a commit SHA, not {ref!r}.')
     if ref.startswith("#"):
         m = PULL_REF.fullmatch(ref)
-        return _number(int(m.group(1)) if m else ref, "ref")
+        return number(int(m.group(1)) if m else ref, "ref")
     return ref
 
 
@@ -106,18 +106,18 @@ def _resolve(ctx: Context, repo: str, ref: int | str) -> tuple[str, str]:
     """(what `ref` named, as words; the commit SHA it names)."""
     api = ctx.api
     if isinstance(ref, int):
-        pull = _needs(repo, "Pull requests", lambda: api.pull(repo, ref))
+        pull = needs(repo, "Pull requests", lambda: api.pull(repo, ref))
         if pull is None:
             raise Refused(f"{repo} has no pull request #{ref}.")
-        return f"pull request #{ref} ({_field(pull['head'].get('ref'))})", pull["head"]["sha"]
+        return f"pull request #{ref} ({field(pull['head'].get('ref'))})", pull["head"]["sha"]
     if SHA.fullmatch(ref):
-        commit = _needs(repo, "Contents", lambda: api.commit(repo, ref))
+        commit = needs(repo, "Contents", lambda: api.commit(repo, ref))
         if commit is not None:
-            return f"commit {_field(ref)}", commit["sha"]
+            return f"commit {field(ref)}", commit["sha"]
     ctx.git.check_branch(ref, ctx.rules)  # a name check-ref-format refuses can hold "..": never in a URL
-    branch = _needs(repo, "Contents", lambda: api.branch(repo, ref))
+    branch = needs(repo, "Contents", lambda: api.branch(repo, ref))
     if branch is not None:
-        return f"branch {_field(ref)}", branch["sha"]
+        return f"branch {field(ref)}", branch["sha"]
     if SHA.fullmatch(ref):
         raise Refused(f"{repo} has no commit or branch {ref}.")
     hint = f' For pull request {ref}, pass {ref} or "#{ref}".' if ref.isdigit() else ""
@@ -127,7 +127,7 @@ def _resolve(ctx: Context, repo: str, ref: int | str) -> tuple[str, str]:
 def _check_run(run: dict) -> Check:
     status, conclusion = run.get("status"), run.get("conclusion")
     running = status != "completed"
-    parts = [_field(status), *([] if running else [_field(conclusion)])]
+    parts = [field(status), *([] if running else [field(conclusion)])]
     if not running and (took := _duration(run.get("started_at"), run.get("completed_at"))):
         parts.append(took)
     m = ACTIONS_JOB.search(run.get("details_url") or "")
@@ -135,8 +135,8 @@ def _check_run(run: dict) -> Check:
         parts.append(f"run {m.group(1)}")
     url = run.get("html_url") or run.get("details_url")
     if url:
-        parts.append(_field(url))
-    name = _field(run.get("name"))
+        parts.append(field(url))
+    name = field(run.get("name"))
     return Check(
         name,
         running,
@@ -148,12 +148,12 @@ def _check_run(run: dict) -> Check:
 
 def _status(status: dict) -> Check:
     state = status.get("state")
-    parts = [_field(state)]
+    parts = [field(state)]
     if status.get("description"):
-        parts.append(_field(status["description"]))
+        parts.append(field(status["description"]))
     if status.get("target_url"):
-        parts.append(_field(status["target_url"]))
-    name = _field(status.get("context"))
+        parts.append(field(status["target_url"]))
+    name = field(status.get("context"))
     return Check(
         name, state == "pending", state not in ("pending", "success"), False,
         f"- {name} (commit status): {', '.join(parts)}",
@@ -167,7 +167,7 @@ def _verdict(found: list[Check]) -> str:
     running = sum(c.running for c in found)
     if failing:
         still = f"; {running} still running" if running else ""
-        return f"{len(failing)} failing: {_names(failing)}{still}."
+        return f"{len(failing)} failing: {listing(failing)}{still}."
     if running:
         return f"{running} still running."
     quiet = sum(c.quiet for c in found)
@@ -185,24 +185,24 @@ def run(ctx: Context, repo: str, run_id: object, wait: object = False, timeout_m
     the logs are read once, at the end.
     """
     ctx.rules.access(repo)
-    n = _number(run_id, "run_id")
+    n = number(run_id, "run_id")
     minutes, capped = _wait_args(wait, timeout_minutes)
     api = ctx.api
 
     def poll() -> tuple[dict, list[dict]]:
-        found = _needs(repo, "Actions", lambda: api.find_run(repo, n))
+        found = needs(repo, "Actions", lambda: api.find_run(repo, n))
         if found is None:
             raise Refused(f"{repo} has no workflow run {n}.")
-        return found, [j for j in _needs(repo, "Actions", lambda: api.jobs(repo, n)) if isinstance(j, dict)]
+        return found, [j for j in needs(repo, "Actions", lambda: api.jobs(repo, n)) if isinstance(j, dict)]
 
     (found, jobs), note = _poll(ctx, poll, lambda state: state[0].get("status") != "completed", wait, minutes, capped)
     status, conclusion = found.get("status"), found.get("conclusion")
     done = status == "completed"
-    state = ", ".join([_field(status), *([_field(conclusion)] if done else [])])
+    state = ", ".join([field(status), *([field(conclusion)] if done else [])])
     lines = [
-        f"Run {n} of {repo}: {_field(found.get('name'))} ({_field(found.get('event'))} on "
-        f"{_field(found.get('head_branch'))}, commit {_field(found.get('head_sha'))}): {state}",
-        _field(found.get("html_url")),
+        f"Run {n} of {repo}: {field(found.get('name'))} ({field(found.get('event'))} on "
+        f"{field(found.get('head_branch'))}, commit {field(found.get('head_sha'))}): {state}",
+        field(found.get("html_url")),
         "Jobs:" if jobs else "No jobs reported.",
         *(_job_line(j) for j in jobs),
     ]
@@ -212,8 +212,8 @@ def run(ctx: Context, repo: str, run_id: object, wait: object = False, timeout_m
             lines += _log(ctx, repo, j)
         if len(failing) > MAX_LOGS:
             lines.append(f"Logs of {len(failing) - MAX_LOGS} more failed jobs left out: "
-                         f"{_names([_field(j.get('name')) for j in failing[MAX_LOGS:]])}.")  # fmt: skip
-    return _fit(lines, [_run_verdict(status, conclusion, jobs, failing), *note], ctx.max_output)
+                         f"{listing([field(j.get('name')) for j in failing[MAX_LOGS:]])}.")  # fmt: skip
+    return fit(lines, [_run_verdict(status, conclusion, jobs, failing), *note], ctx.max_output)
 
 
 def _job_failed(job: dict) -> bool:
@@ -222,25 +222,25 @@ def _job_failed(job: dict) -> bool:
 
 def _job_line(job: dict) -> str:
     status, conclusion = job.get("status"), job.get("conclusion")
-    parts = [_field(status)]
+    parts = [field(status)]
     if status == "completed":
-        parts.append(_field(conclusion))
+        parts.append(field(conclusion))
         if took := _duration(job.get("started_at"), job.get("completed_at")):
             parts.append(took)
-    line = f"- {_field(job.get('name'))}: {', '.join(parts)}"
+    line = f"- {field(job.get('name'))}: {', '.join(parts)}"
     if _job_failed(job):
         steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
-        bad = [_field(s.get("name")) for s in steps if s.get("conclusion") not in (*PASSING, None)]
+        bad = [field(s.get("name")) for s in steps if s.get("conclusion") not in (*PASSING, None)]
         if bad:
-            line += f"; failed steps: {_names(bad)}"
+            line += f"; failed steps: {listing(bad)}"
     return line
 
 
 def _log(ctx: Context, repo: str, job: dict) -> list[str]:
     """The last LOG_LINES lines of a failed job's log, or why there are none."""
-    name = _field(job.get("name"))
+    name = field(job.get("name"))
     try:
-        data, note = _needs(repo, "Actions", lambda: ctx.api.job_log(repo, _number(job.get("id"), "job id")))
+        data, note = needs(repo, "Actions", lambda: ctx.api.job_log(repo, number(job.get("id"), "job id")))
     except Refused as e:
         return [f"The log of {name} is not available: {e}"]
     tail = _log_lines(data)
@@ -249,23 +249,17 @@ def _log(ctx: Context, repo: str, job: dict) -> list[str]:
 
 
 def _log_lines(data: bytes) -> list[str]:
-    """The end of a log as printable lines: bytes decoded losslessly, escapes removed, anything
-    unprintable shown as "?" (bytes that are not UTF-8 among them), each line cut to MAX_LOG_LINE."""
-    text = ANSI.sub("", data.decode("utf-8", "surrogateescape")).removeprefix("\ufeff")
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    """The end of a log as printable lines (see `text`), each cut to MAX_LOG_LINE characters."""
+    lines = text(data).split("\n")
     if lines and lines[-1] == "":
         lines.pop()
-    out = []
-    for line in lines[-LOG_LINES:]:
-        line = "".join(c if c.isprintable() or c == "\t" else "?" for c in line)
-        out.append(line if len(line) <= MAX_LOG_LINE else line[:MAX_LOG_LINE] + "...")
-    return out
+    return [line if len(line) <= MAX_LOG_LINE else line[:MAX_LOG_LINE] + "..." for line in lines[-LOG_LINES:]]
 
 
 def _run_verdict(status: object, conclusion: object, jobs: list[dict], failing: list[dict]) -> str:
     if status != "completed":
         waiting = sum(j.get("status") != "completed" for j in jobs)
-        return f"Still running ({_field(status)}): {waiting} of {len(jobs)} jobs not finished."
+        return f"Still running ({field(status)}): {waiting} of {len(jobs)} jobs not finished."
     if conclusion in QUIET:
         return f"Finished {conclusion}, which counts as not failing."
     if conclusion == "success":
@@ -273,9 +267,9 @@ def _run_verdict(status: object, conclusion: object, jobs: list[dict], failing: 
         note = f" ({quiet} neutral or skipped, which count as not failing)" if quiet else ""
         return f"Passed: {len(jobs)} jobs, none failing{note}."
     if failing:
-        names = _names([_field(j.get("name")) for j in failing])
-        return f"Failed ({_field(conclusion)}): {len(failing)} of {len(jobs)} jobs failed: {names}."
-    return f"Failed ({_field(conclusion)}): no job failed; see the run's page."
+        failed = listing([field(j.get("name")) for j in failing])
+        return f"Failed ({field(conclusion)}): {len(failing)} of {len(jobs)} jobs failed: {failed}."
+    return f"Failed ({field(conclusion)}): no job failed; see the run's page."
 
 
 # --- shared --------------------------------------------------------------------------------------
@@ -285,7 +279,7 @@ def _wait_args(wait: object, timeout_minutes: object) -> tuple[int, bool]:
     """(minutes to wait at most, whether the agent asked for more than MAX_WAIT_MINUTES)."""
     if type(wait) is not bool:
         raise Refused(f"wait must be true or false, not {wait!r}.")
-    minutes = _number(timeout_minutes, "timeout_minutes")
+    minutes = number(timeout_minutes, "timeout_minutes")
     return min(minutes, MAX_WAIT_MINUTES), minutes > MAX_WAIT_MINUTES
 
 
@@ -348,7 +342,7 @@ def _minutes(n: int) -> str:
     return f"{n} minute" if n == 1 else f"{n} minutes"
 
 
-def _needs(repo: str, permission: str, read: Callable):
+def needs(repo: str, permission: str, read: Callable):
     """`read()`, with a 403 or 404 explained as the token lacking `permission` (read) on `repo`.
 
     Lookups that may find nothing (a pull request, branch or commit) take their 404 as an answer
@@ -367,22 +361,33 @@ def _needs(repo: str, permission: str, read: Callable):
         ) from None
 
 
-def _number(value: object, what: str) -> int:
+def number(value: object, what: str) -> int:
     if type(value) is not int or value <= 0:
         raise Refused(f"{what} must be a positive whole number, not {value!r}.")
     return value
 
 
-def _field(value: object) -> str:
+def field(value: object) -> str:
     """One field GitHub sent, as one printable line of at most MAX_FIELD characters."""
     text = "-" if value is None else str(value)
     text = "".join(c if c.isprintable() else " " for c in text).strip() or "-"
     return text if len(text) <= MAX_FIELD else text[: MAX_FIELD - 3] + "..."
 
 
-def _names(names: list[str]) -> str:
-    more = f" and {len(names) - MAX_NAMES} more" if len(names) > MAX_NAMES else ""
-    return ", ".join(names[:MAX_NAMES]) + more
+def text(value: bytes | str) -> str:
+    """Multi-line text GitHub sent (a log, a body, a diff, a file) as printable lines: bytes decoded
+    losslessly, a leading byte-order mark and ANSI escapes removed, line ends made "\\n", and
+    anything else unprintable but a tab shown as "?" (bytes that are not UTF-8 among them)."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "surrogateescape")
+    value = ANSI.sub("", value).removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(c if c.isprintable() or c in "\n\t" else "?" for c in value)
+
+
+def listing(items: list[str]) -> str:
+    """Names joined by commas, at most MAX_NAMES of them and a count of the rest."""
+    more = f" and {len(items) - MAX_NAMES} more" if len(items) > MAX_NAMES else ""
+    return ", ".join(items[:MAX_NAMES]) + more
 
 
 def _duration(start: object, end: object) -> str | None:
@@ -397,7 +402,7 @@ def _duration(start: object, end: object) -> str | None:
     return " ".join(f"{n}{unit}" for n, unit in ((h, "h"), (m, "m"), (s, "s")) if n) or "0s"
 
 
-def _fit(body: list[str], end: list[str], limit: int) -> str:
+def fit(body: list[str], end: list[str], limit: int) -> str:
     """The lines, cut in the middle when too long, so the verdict at the end always shows."""
     text, tail = "\n".join(body), "\n".join(end)
     room = limit - len(tail) - 40
