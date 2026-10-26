@@ -18,7 +18,21 @@ from git_gate.server import INSTRUCTIONS, Relay, build
 SRC = Path(__file__).resolve().parents[1] / "src"
 
 
-TOOLS = {"clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label", "checks", "run"}
+TOOLS = {
+    "clone",
+    "fetch",
+    "push",
+    "prune",
+    "gh",
+    "pr",
+    "issue",
+    "triage",
+    "workflow_run",
+    "label",
+    "checks",
+    "run",
+    "runs",
+}
 
 
 def test_tools_registered(env):

@@ -545,6 +545,21 @@ class Gate:
     ) -> str:
         return ci.run(self._ci(rules, token, repo), repo, run_id, wait, timeout_minutes)
 
+    # --- typed reads (the reading lives in reads.py) ----------------------------------------
+
+    @_untrusted
+    def runs(
+        self,
+        rules: Rules,
+        token: str,
+        repo: str,
+        branch: str | None = None,
+        workflow: str | None = None,
+        status: str | None = None,
+        limit: int = 10,
+    ) -> str:
+        return reads.runs(self._ci(rules, token, repo), repo, branch, workflow, status, limit)
+
     # --- read-only gh -------------------------------------------------------------------
 
     @_untrusted

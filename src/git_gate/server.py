@@ -228,6 +228,19 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         return await run("run", repo=repo, run_id=run_id, wait=wait, timeout_minutes=timeout_minutes)
 
     @server.tool()
+    async def runs(
+        repo: str, branch: str | None = None, workflow: str | None = None, status: str | None = None, limit: int = 10
+    ) -> str:
+        """The newest GitHub Actions runs of `repo`, one line each: use this, not `gh run list`.
+
+        Each line: run id, workflow name, event, branch, status, conclusion, created time, URL.
+        Optional filters: branch; workflow (its id or file name, such as ci.yml); status (completed,
+        success, failure, cancelled, in_progress, queued, ... as GitHub names them); limit (at most
+        50, default 10). Pass a run id to the run tool for its jobs and logs.
+        """
+        return await run("runs", repo=repo, branch=branch, workflow=workflow, status=status, limit=limit)
+
+    @server.tool()
     async def pr(
         repo: str,
         action: str,

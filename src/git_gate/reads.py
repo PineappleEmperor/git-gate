@@ -29,6 +29,12 @@ ISSUE_READS = {
 ISSUE_STATES = ("open", "closed", "all")
 COMMENTS = 20  # the latest comments an issue view shows
 ISSUE_PAGES = 3  # pages of 100 issues read to fill a list, pull requests left out
+RUN_STATUSES = (
+    "completed", "action_required", "cancelled", "failure", "neutral", "skipped", "stale", "success", "timed_out",
+    "in_progress", "queued", "requested", "waiting", "pending",
+)  # fmt: skip
+WORKFLOW = re.compile(r"\d+|[A-Za-z0-9_.-]+\.ya?ml")  # an id, or a file name under .github/workflows
+MAX_RUNS = 50
 REVIEW_STATES = {
     "APPROVED": "approved",
     "CHANGES_REQUESTED": "requested changes",
@@ -210,6 +216,38 @@ def _issue_list(ctx: Context, repo: str, state=None, labels=None, limit=None) ->
         for i in found
     ]
     return fit([f"Issues of {repo} ({state}, most recently updated first):", *lines], [], ctx.max_output)
+
+
+# --- runs ------------------------------------------------------------------------------------------
+
+
+def runs(
+    ctx: Context, repo: str, branch: object = None, workflow: object = None, status: object = None, limit: object = 10
+) -> str:
+    """The newest workflow runs, one line each, filtered by branch, workflow and status."""
+    ctx.rules.access(repo)
+    if branch is not None:
+        _branch(ctx, branch, "branch")
+    if workflow is not None and not (isinstance(workflow, str) and WORKFLOW.fullmatch(workflow) and workflow != ".yml"):
+        raise Refused(f"workflow must be a workflow id or file name such as ci.yml, not {_show(workflow)}.")
+    if status is not None:
+        _choice(status, "status", RUN_STATUSES)
+    n = _limit(limit, 10, MAX_RUNS)
+    got = needs(repo, "Actions", lambda: ctx.api.runs(repo, n, workflow=workflow, branch=branch, status=status))
+    if got is None:
+        raise Refused(f"{repo} has no workflow {workflow}.")
+    found = [r for r in got.get("workflow_runs") or [] if isinstance(r, dict)] if isinstance(got, dict) else []
+    if not found:
+        return f"No workflow runs of {repo} match."
+    lines = []
+    for r in found:
+        state = [field(r.get("status"))] + ([field(r.get("conclusion"))] if r.get("status") == "completed" else [])
+        what = f"{field(r.get('name'))}, {field(r.get('event'))} on {field(r.get('head_branch'))}"
+        lines.append(
+            f"- {field(r.get('id'))}: {what}, {', '.join(state)}, created {field(r.get('created_at'))}, "
+            f"{field(r.get('html_url'))}"
+        )
+    return fit([f"Workflow runs of {repo}, newest first:", *lines], [], ctx.max_output)
 
 
 # --- shared ----------------------------------------------------------------------------------------

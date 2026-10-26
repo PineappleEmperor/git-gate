@@ -358,3 +358,91 @@ def test_issue_actions_refuse_what_they_do_not_take(env, gh, kwargs, extra):
     with pytest.raises(Refused, match=f"does not take {extra}"):
         call(env, "issue", repo="me/app", **kwargs)
     assert requests(gh) == []
+
+
+# --- runs -----------------------------------------------------------------------------------------
+
+RUNS = "repos/me/app/actions/runs?per_page={}"
+
+
+def wrun(i, **extra):
+    return {
+        "id": i,
+        "name": "CI",
+        "event": "push",
+        "head_branch": "feat",
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": "2026-10-26T10:00:00Z",
+        "html_url": f"https://github.com/me/app/actions/runs/{i}",
+        **extra,
+    }
+
+
+def test_runs(env, gh):
+    gh.replies[("GET", RUNS.format(10))] = {
+        "total_count": 2,
+        "workflow_runs": [wrun(7), wrun(6, status="in_progress", conclusion=None)],
+    }
+    out = call(env, "runs", repo="me/app")
+    assert requests(gh) == [("GET", RUNS.format(10))]
+    lines = out.splitlines()
+    assert lines[0] == UNTRUSTED
+    assert lines[1] == "Workflow runs of me/app, newest first:"
+    assert (
+        lines[2]
+        == "- 7: CI, push on feat, completed, success, created 2026-10-26T10:00:00Z, https://github.com/me/app/actions/runs/7"
+    )
+    assert lines[3].startswith("- 6: CI, push on feat, in_progress, created")
+
+
+def test_runs_filters(env, gh):
+    path = "repos/me/app/actions/workflows/ci.yml/runs?per_page=50&branch=feat%2Fx&status=failure"
+    gh.replies[("GET", path)] = {"workflow_runs": []}
+    out = call(env, "runs", repo="me/app", branch="feat/x", workflow="ci.yml", status="failure", limit=50)
+    assert requests(gh) == [("GET", path)]
+    assert "No workflow runs" in out
+
+
+def test_runs_of_a_workflow_by_id(env, gh):
+    path = "repos/me/app/actions/workflows/123/runs?per_page=10"
+    gh.replies[("GET", path)] = {"workflow_runs": [wrun(1)]}
+    call(env, "runs", repo="me/app", workflow="123")
+    assert requests(gh) == [("GET", path)]
+
+
+def test_runs_of_a_missing_workflow(env, gh):
+    gh.replies[("GET", "repos/me/app/actions/workflows/gone.yml/runs?per_page=10")] = (404, "Not Found", {})
+    with pytest.raises(Refused, match="has no workflow gone.yml"):
+        call(env, "runs", repo="me/app", workflow="gone.yml")
+
+
+def test_runs_without_actions_read(env, gh):
+    gh.replies[("GET", RUNS.format(10))] = (403, "Resource not accessible by personal access token", {})
+    with pytest.raises(Refused, match='"Actions"'):
+        call(env, "runs", repo="me/app")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"limit": 51},
+        {"limit": 0},
+        {"status": "broken"},
+        {"workflow": "../x.yml"},
+        {"workflow": "ci"},
+        {"workflow": "a/b.yml"},
+        {"branch": "a..b"},
+    ],
+)
+def test_runs_refuses_bad_arguments(env, gh, kwargs):
+    with pytest.raises(Refused):
+        call(env, "runs", repo="me/app", **kwargs)
+    assert requests(gh) == []
+
+
+def test_runs_needs_read_access(env, gh):
+    gh.replies[("GET", RUNS.format(10).replace("me/app", "other/lib"))] = {"workflow_runs": []}
+    call(env, "runs", repo="other/lib")
+    with pytest.raises(Refused, match="allowlist"):
+        call(env, "runs", repo="nobody/x")

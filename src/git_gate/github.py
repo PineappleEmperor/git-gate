@@ -416,6 +416,21 @@ class GitHub:
         """The jobs of a workflow run's latest attempt."""
         return self._pages(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=latest", "jobs")
 
+    def runs(
+        self, repo: str, per_page: int, *, workflow: str | None = None, branch: str | None = None,
+        status: str | None = None,
+    ) -> dict | None:  # fmt: skip
+        """The newest workflow runs, of one workflow (an id or file name) when given; None when it has none such."""
+        if workflow is not None and (not workflow or set(workflow) == {"."}):
+            raise Refused(f"Refusing workflow {workflow!r}.")
+        # A file name keeps its dots, which GitHub matches as written; quoting keeps "/" out.
+        name = urllib.parse.quote(workflow or "", safe="")
+        base = f"repos/{repo}/actions/workflows/{name}/runs" if workflow else f"repos/{repo}/actions/runs"
+        query = f"per_page={per_page}"
+        query += f"&branch={urllib.parse.quote(branch, safe='')}" if branch else ""
+        query += f"&status={urllib.parse.quote(status, safe='')}" if status else ""
+        return self._request("GET", f"{base}?{query}", absent=(404,) if workflow else ())
+
     def run(self, repo: str, run_id: int) -> dict:
         """A workflow run, which says among other things which branch it ran on (`head_branch`)."""
         return self._request("GET", f"repos/{repo}/actions/runs/{run_id}")

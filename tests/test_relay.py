@@ -214,9 +214,10 @@ def test_call_main_writes_a_private_log(tmp_path, monkeypatch):
 
 def test_call_tools_are_the_gates_tools():
     assert set(TOOLS) == {
-        "clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label", "checks", "run",
+        "clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label",
+        "checks", "run", "runs",
     }  # fmt: skip
-    assert len(TOOLS) == 12
+    assert len(TOOLS) == 13
 
 
 def test_call_run(env):
