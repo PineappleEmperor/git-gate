@@ -21,6 +21,7 @@ PROTECTING_RULES = {
 
 MAX_MESSAGE = 500
 MAX_LOG = 2 << 20  # bytes of a job log the gate downloads
+MAX_API = 4 << 20  # bytes of an api_get answer the gate reads
 PER_PAGE = 100
 MAX_PAGES = 10  # pages of one list the gate reads: at most PER_PAGE * MAX_PAGES entries
 
@@ -449,6 +450,13 @@ class GitHub:
         quoted = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/")) if path else ""
         query = f"?ref={urllib.parse.quote(ref, safe='')}" if ref else ""
         return self._request("GET", f"repos/{repo}/contents/{quoted}{query}", absent=(404,))
+
+    def get(self, repo: str, path: str, query: dict[str, str]) -> bytes:
+        """The raw answer to a GET of repos/{repo}/{path}, at most MAX_API + 1 bytes of it. `path` must
+        already be checked: its segments are quoted but keep their dots."""
+        quoted = "".join("/" + urllib.parse.quote(part, safe="") for part in path.split("/")) if path else ""
+        qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+        return self._request("GET", f"repos/{repo}{quoted}{qs}", raw=MAX_API)
 
     def run(self, repo: str, run_id: int) -> dict:
         """A workflow run, which says among other things which branch it ran on (`head_branch`)."""

@@ -263,6 +263,17 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         return await run("file", repo=repo, path=path, ref=ref)
 
     @server.tool()
+    async def api_get(repo: str, path: str, query: dict[str, str | int | bool] | None = None) -> str:
+        """A GET of one GitHub REST endpoint under repos/{owner}/{name}/, for what no other tool reads.
+
+        `path` is relative to the repo, such as "labels", "actions/workflows" or "" for the repo
+        itself; `query` holds its parameters, such as {"per_page": 30}. The JSON answer comes back
+        pretty-printed and cut at the gate's output limit. Nothing but GET, nothing outside the repo:
+        no "..", no absolute URL, no other host, no GraphQL, no jq.
+        """
+        return await run("api_get", repo=repo, path=path, query=query)
+
+    @server.tool()
     async def pr(
         repo: str,
         action: str,

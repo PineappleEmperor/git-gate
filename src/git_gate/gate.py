@@ -570,6 +570,10 @@ class Gate:
     def file(self, rules: Rules, token: str, repo: str, path: str, ref: str | None = None) -> str:
         return reads.file(self._ci(rules, token, repo), repo, path, ref)
 
+    @_untrusted
+    def api_get(self, rules: Rules, token: str, repo: str, path: str, query: dict | None = None) -> str:
+        return reads.api_get(self._ci(rules, token, repo), repo, path, query)
+
     # --- read-only gh -------------------------------------------------------------------
 
     @_untrusted

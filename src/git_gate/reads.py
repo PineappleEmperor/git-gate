@@ -7,10 +7,12 @@ its escapes removed. The gate marks every reply as GitHub content.
 
 import base64
 import binascii
+import json
 import re
 
 from git_gate import Refused
 from git_gate.ci import Context, field, fit, listing, needs, number, text
+from git_gate.github import MAX_API, GitHubError, RateLimited, Redirected
 from git_gate.writes import MAX_LABEL, _action, _given, _names, _show
 
 # action -> (required, optional, at least one of), as in writes
@@ -44,6 +46,7 @@ RELEASE_ACTIONS = {
 MAX_RELEASES = 30
 MAX_FILE = 1 << 20  # bytes of a file the file tool shows
 REF = re.compile(r"[^\s~^:?*\[\\-][^\s~^:?*\[\\]{0,254}")  # a branch, tag or SHA, as git allows them
+MAX_QUERY = 20  # parameters an api_get query may hold
 REVIEW_STATES = {
     "APPROVED": "approved",
     "CHANGES_REQUESTED": "requested changes",
@@ -388,6 +391,72 @@ def _repo_path(value: object, what: str, *, empty: bool = False) -> str:
     if bad:
         raise Refused(f"{what} must be a relative path inside the repo, such as docs/x.md, not {_show(value)}.")
     return value
+
+
+# --- api_get ---------------------------------------------------------------------------------------
+
+
+def api_get(ctx: Context, repo: str, path: object, query: object = None) -> str:
+    """A GET of one endpoint under repos/{repo}/, its JSON answer pretty-printed.
+
+    The path is relative and checked segment by segment, so no request can leave the repo's own
+    endpoints or reach another host; the query is a flat map of plain values.
+    """
+    ctx.rules.access(repo)
+    path = _repo_path(path, "path", empty=True)
+    first = path.split("/")[0].lower()
+    if first in ("graphql", "repos"):
+        raise Refused(
+            f"path is relative to repos/{repo}/, such as releases/latest or actions/workflows; not {_show(path)}."
+        )
+    params = _query(query)
+    try:
+        data = ctx.api.get(repo, path, params)
+    except Redirected:
+        raise Refused(
+            f"GitHub answers {path} with a download from another host, which api_get does not follow."
+        ) from None
+    except RateLimited:
+        raise
+    except GitHubError as e:
+        if e.status not in (403, 404):
+            raise
+        raise type(e)(
+            f"{e} A {e.status} can also mean the gate's token lacks the permission this endpoint needs on {repo}; "
+            "granting it is the user's.", e.status, e.headers,
+        ) from None  # fmt: skip
+    if len(data) > MAX_API:
+        raise Refused(
+            f"GitHub's answer to {path or repo} is over {MAX_API >> 20} MiB; narrow it with query, such as "
+            '{"per_page": 30}.'
+        )
+    try:
+        shown = text(json.dumps(json.loads(data), indent=2, ensure_ascii=False))
+    except ValueError:
+        shown = text(data)
+    room = ctx.max_output - 200
+    if len(shown) > room:
+        cut = len(shown) - room
+        return f"{shown[:room]}\n[... {cut} characters cut: narrow the answer with query, such as per_page.]"
+    return shown or "(empty answer)"
+
+
+def _query(query: object) -> dict[str, str]:
+    if query is None:
+        return {}
+    if not isinstance(query, dict) or len(query) > MAX_QUERY:
+        raise Refused(f"query must be a map of at most {MAX_QUERY} parameters to values, not {_show(query)}.")
+    out = {}
+    for key, value in query.items():
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        elif type(value) is int:
+            value = str(value)
+        ok = isinstance(key, str) and key and key.isprintable() and isinstance(value, str) and value.isprintable()
+        if not ok or len(key) > 100 or len(value) > 1000:
+            raise Refused(f"query takes plain text, number and true/false values; not {_show({key: value})}.")
+        out[key] = value
+    return out
 
 
 # --- shared ----------------------------------------------------------------------------------------

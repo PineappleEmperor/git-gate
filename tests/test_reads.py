@@ -650,3 +650,100 @@ def test_file_refuses_bad_paths_and_refs(env, gh, kwargs):
 def test_file_needs_read_access(env, gh):
     with pytest.raises(Refused, match="allowlist"):
         call(env, "file", repo="nobody/x", path="a")
+
+
+# --- api_get --------------------------------------------------------------------------------------
+
+
+def test_api_get(env, gh):
+    path = ("GET", "repos/me/app/releases/latest")
+    gh.replies[path] = {"tag_name": "v1", "body": "a\x1b[2Jb ‮"}
+    out = call(env, "api_get", repo="me/app", path="releases/latest")
+    assert requests(gh) == [path]
+    assert out.startswith(UNTRUSTED + "\n{\n")
+    assert '"tag_name": "v1"' in out and "\x1b" not in out and "‮" not in out
+
+
+def test_api_get_of_the_repo_itself(env, gh):
+    gh.replies[("GET", "repos/me/app")] = {"full_name": "me/app", "default_branch": "main"}
+    assert '"default_branch": "main"' in call(env, "api_get", repo="me/app", path="")
+
+
+def test_api_get_with_a_query(env, gh):
+    path = ("GET", "repos/me/app/actions/workflows?per_page=5&page=2&flag=true&q=a+b%26c")
+    gh.replies[path] = {"workflows": []}
+    call(
+        env,
+        "api_get",
+        repo="me/app",
+        path="actions/workflows",
+        query={"per_page": 5, "page": "2", "flag": True, "q": "a b&c"},
+    )
+    assert requests(gh) == [path]
+
+
+def test_api_get_keeps_dots_inside_segments(env, gh):
+    path = ("GET", "repos/me/app/contents/docs/x.md")
+    gh.replies[path] = {"name": "x.md"}
+    call(env, "api_get", repo="me/app", path="contents/docs/x.md")
+    assert requests(gh) == [path]
+
+
+def test_api_get_cuts_a_long_answer(env, gh):
+    gh.replies[("GET", "repos/me/app/labels")] = [{"name": f"label {i}", "description": "d" * 100} for i in range(5000)]
+    out = call(env, "api_get", repo="me/app", path="labels")
+    assert len(out) < MAX_OUTPUT + 500 and "characters cut" in out
+
+
+def test_api_get_refuses_a_huge_answer(env, gh):
+    from git_gate.github import MAX_API
+
+    gh.replies[("GET", "repos/me/app/labels")] = b"[" + b'"x",' * (MAX_API // 4) + b'"x"]'
+    with pytest.raises(Refused, match="query"):
+        call(env, "api_get", repo="me/app", path="labels")
+
+
+def test_api_get_does_not_follow_a_download(env, gh):
+    from git_gate.github import Redirected
+
+    gh.replies[("GET", "repos/me/app/zipball/main")] = Redirected("redirected", "https://codeload.example/sig=SECRET")
+    with pytest.raises(Refused, match="download") as e:
+        call(env, "api_get", repo="me/app", path="zipball/main")
+    assert "SECRET" not in str(e.value)
+
+
+def test_api_get_explains_a_404(env, gh):
+    gh.replies[("GET", "repos/me/app/environments")] = (404, "Not Found", {})
+    with pytest.raises(Refused, match="Not Found.*permission") as e:
+        call(env, "api_get", repo="me/app", path="environments")
+    assert str(e.value).startswith(UNTRUSTED)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"path": "../other"},
+        {"path": "issues/../../../other/x/issues"},
+        {"path": "/repos/me/app"},
+        {"path": "https://api.github.com/repos/other/x"},
+        {"path": "//evil.example/x"},
+        {"path": "graphql"},
+        {"path": "repos/me/app/issues"},
+        {"path": "issues?state=all"},
+        {"path": "issues#x"},
+        {"path": "issues\\x"},
+        {"path": "issues", "query": "state=all"},
+        {"path": "issues", "query": {"state": ["all"]}},
+        {"path": "issues", "query": {"a\n": "b"}},
+        {"path": "issues", "query": {"a": "b\x1b"}},
+    ],
+)
+def test_api_get_refuses(env, gh, kwargs):
+    with pytest.raises(Refused):
+        call(env, "api_get", repo="me/app", **kwargs)
+    assert requests(gh) == []
+
+
+def test_api_get_needs_read_access(env, gh):
+    with pytest.raises(Refused, match="allowlist"):
+        call(env, "api_get", repo="nobody/x", path="")
