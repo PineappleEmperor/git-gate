@@ -294,9 +294,11 @@ def _poll[T](
 
     The interval starts at FIRST_INTERVAL seconds and doubles up to MAX_INTERVAL; an answer
     saying the quota is spent puts the next poll after its reset. A rate limit while waiting is
-    waited out (Retry-After, else the quota's reset, else FIRST_BACKOFF seconds doubling up to
-    MAX_BACKOFF) rather than failing; any other error fails. No sleep runs past the deadline: at
-    the deadline the state so far comes back with a line saying so.
+    waited out rather than failing: for Retry-After, else until the quota's reset, when that is a
+    finite time ahead (and never less than FIRST_INTERVAL), else for a back-off of FIRST_BACKOFF
+    seconds that doubles with every rate limit in a row, up to MAX_BACKOFF. So no sleep is shorter
+    than FIRST_INTERVAL. Any other error fails. No sleep runs past the deadline, and with less
+    than FIRST_INTERVAL left the waiting stops: the state so far comes back with a line saying so.
     """
     deadline = ctx.monotonic() + minutes * 60
     interval, backoff = FIRST_INTERVAL, FIRST_BACKOFF
@@ -308,7 +310,7 @@ def _poll[T](
             polls += 1
             try:
                 state[:] = [fetch()]
-                limited = None
+                limited, backoff = None, FIRST_BACKOFF
                 if not wait or not running(state[0]):
                     return state[0], []
                 delay = max(interval, ctx.api.rate_wait(ctx.clock()))
@@ -317,11 +319,12 @@ def _poll[T](
                 if not wait:
                     raise
                 limited = e
-                delay = e.wait(ctx.clock())
-                if delay is None:
-                    delay, backoff = backoff, min(backoff * 2, MAX_BACKOFF)
+                asked = e.wait(ctx.clock())
+                # Only a wait GitHub names and that lies ahead counts; zero or a reset already past would poll at once.
+                delay = max(asked, FIRST_INTERVAL) if asked is not None and asked > 0 else backoff
+                backoff = min(backoff * 2, MAX_BACKOFF)
             left = deadline - ctx.monotonic()
-            if left <= 0:
+            if left < FIRST_INTERVAL:  # a shorter sleep would poll sooner than any other
                 break
             ctx.sleep(min(delay, left))
             waited += min(delay, left)

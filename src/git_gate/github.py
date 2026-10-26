@@ -1,6 +1,7 @@
 """The few GitHub REST calls the gate makes itself."""
 
 import json
+import math
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -61,10 +62,12 @@ def _header(headers, name: str) -> str | None:
 
 
 def _number(text: str | None) -> float | None:
+    """A header's number; None for none, or for NaN or infinity, which no wait can be."""
     try:
-        return float(text) if text is not None else None
+        value = float(text) if text is not None else None
     except ValueError:
         return None
+    return value if value is not None and math.isfinite(value) else None
 
 
 def _reset_wait(headers, now: float) -> float | None:

@@ -485,9 +485,43 @@ def test_a_rate_limit_backs_off_and_doubles(env, gh, clock):
 
 
 def test_a_rate_limit_honours_retry_after(env, gh, clock):
-    gh.replies[RUNS] = Turns([(403, "secondary rate limit", {"Retry-After": "7"}), DONE])
+    gh.replies[RUNS] = Turns([(403, "secondary rate limit", {"Retry-After": "70"}), DONE])
     call(env, "checks", repo="me/app", ref=12, wait=True)
-    assert clock.sleeps == [7]
+    assert clock.sleeps == [70]
+
+
+def test_a_short_retry_after_still_waits_the_first_interval(env, gh, clock):
+    gh.replies[RUNS] = Turns([(403, "secondary rate limit", {"Retry-After": "3"}), DONE])
+    call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert clock.sleeps == [15]
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Retry-After": "0"},
+        {"Retry-After": "-5"},
+        {"Retry-After": "nan"},
+        {"Retry-After": "inf"},
+        {"Retry-After": "soon"},
+        {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "5"},  # long past
+        {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "nan"},
+        {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "-inf"},
+    ],
+)
+def test_a_wait_github_cannot_mean_falls_back_to_backing_off(env, gh, clock, headers):
+    gh.replies[RUNS] = Turns([(403, "API rate limit exceeded", headers)] * 4 + [DONE])
+    call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert clock.sleeps == [60, 120, 240, 300]
+
+
+def test_repeated_rate_limits_never_poll_faster_than_the_first_interval(env, gh, clock):
+    gh.replies[RUNS] = Turns(
+        [(429, "secondary rate limit", {"Retry-After": v}) for v in ("0", "1", "nan", "2", "0")] + [DONE]
+    )
+    call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert all(s >= 15 for s in clock.sleeps) and len(clock.sleeps) == 5
+    assert clock.sleeps == [60, 15, 240, 15, 300]  # the backoff doubles on every rate limit in a row
 
 
 def test_a_spent_quota_waits_for_its_reset(env, gh, clock):
@@ -604,3 +638,10 @@ def test_other_tools_audit_no_polls(env, gh, clock):
     assert "polls" not in last_audit(env)
     call(env, "clone", repo="me/app", path=str(env.ws / "c"))
     assert "polls" not in last_audit(env) and "waited_s" not in last_audit(env)
+
+
+def test_no_sleep_near_the_deadline_is_shorter_than_the_first_interval(env, gh, clock):
+    gh.replies[RUNS] = Turns([(403, "secondary rate limit", {"Retry-After": "50"}), RUNNING])
+    out = call(env, "checks", repo="me/app", ref=12, wait=True, timeout_minutes=1)
+    assert clock.sleeps == [50]
+    assert "Still running after 1 minute" in out

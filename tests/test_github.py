@@ -363,6 +363,29 @@ def test_rate_limit_is_its_own_refusal(status, message, headers, wait):
     assert e.value.wait(now=1000.0) == wait
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Retry-After": "nan"},
+        {"Retry-After": "inf"},
+        {"Retry-After": "-inf"},
+        {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "nan"},
+        {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "inf"},
+    ],
+)
+def test_a_wait_that_is_no_number_names_none(headers):
+    gh = make({RUN5: (403, "API rate limit exceeded", headers)})
+    with pytest.raises(RateLimited) as e:
+        gh.run("me/app", 5)
+    assert e.value.wait(now=1000.0) is None
+
+
+def test_a_spent_quota_with_a_reset_that_is_no_number_is_not_remembered():
+    gh = make({RUN5: FakeResponse(b"{}", {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "inf"})})
+    gh.run("me/app", 5)
+    assert gh.rate_wait(now=1000.0) == 0
+
+
 def test_a_429_without_a_body_is_a_rate_limit():
     gh = make({RUN5: 429})
     with pytest.raises(RateLimited, match="429"):
