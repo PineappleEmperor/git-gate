@@ -1,6 +1,5 @@
 import io
 import json
-import stat
 import subprocess
 import urllib.error
 from pathlib import Path
@@ -154,11 +153,20 @@ URL = "https://github.com/me/app/pull/7"
 
 
 class FakeResponse(io.BytesIO):
+    def __init__(self, data: bytes = b"", headers: dict | None = None, status: int = 200):
+        super().__init__(data)
+        self.headers = headers or {}
+        self.status = status
+
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         return False
+
+
+class Turns(list):
+    """Replies FakeOpener gives in turn, one per request; the last one repeats."""
 
 
 class FakeOpener:
@@ -167,12 +175,23 @@ class FakeOpener:
     def __init__(self, replies=None):
         self.replies = replies or {}
         self.calls = []
+        self.headers = []  # each request's headers, names lower-cased
 
     def open(self, req, timeout=None):
         path = req.full_url.removeprefix(API)
         body = json.loads(req.data) if req.data else None
         self.calls.append((req.get_method(), path, body))
+        self.headers.append({k.lower(): v for k, v in req.header_items()})
         reply = self.replies.get((req.get_method(), path), {"html_url": URL})
+        if isinstance(reply, Turns):
+            reply = reply.pop(0) if len(reply) > 1 else reply[0]
+        if isinstance(reply, BaseException):
+            raise reply
+        if isinstance(reply, bytes):  # an answer that is not JSON, such as a diff
+            return FakeResponse(reply)
+        if isinstance(reply, FakeResponse):
+            reply.seek(0)
+            return reply
         if isinstance(reply, int):
             raise urllib.error.HTTPError(req.full_url, reply, "status", {}, None)
         if isinstance(reply, tuple):  # (status, message, headers): an error with a GitHub-style body
@@ -182,33 +201,16 @@ class FakeOpener:
         return FakeResponse(json.dumps(reply).encode())
 
 
-@pytest.fixture
-def fake_gh(env):
-    """A stand-in gh that records its call; `999` among its arguments makes it fail."""
-    record = env.tmp / "gh-call.json"
-    script = env.tmp / "gh"
-    script.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, os, sys, pathlib\n"
-        f"rec = pathlib.Path({str(record)!r})\n"
-        "args = sys.argv[1:]\n"
-        "files = {a: pathlib.Path(a).read_text() for a in args if a.startswith('/') and pathlib.Path(a).is_file()}\n"
-        "cfg = pathlib.Path(os.environ.get('GH_CONFIG_DIR', '/nonexistent'))\n"
-        "hosts = cfg / 'hosts.yml'\n"
-        "seen = {'text': hosts.read_text(), 'mode': oct(hosts.stat().st_mode & 0o777),\n"
-        "        'dir_mode': oct(cfg.stat().st_mode & 0o777)} if hosts.is_file() else {}\n"
-        "rec.write_text(json.dumps({'args': args, 'cwd': os.getcwd(), 'env': dict(os.environ), 'files': files,\n"
-        "                           'hosts': seen}))\n"
-        "if '999' in args:\n"
-        "    print('GraphQL: Could not resolve to a PullRequest with the number of 999.', file=sys.stderr)\n"
-        "    sys.exit(1)\n"
-        "if '-D' in args:\n"
-        "    d = pathlib.Path(args[args.index('-D') + 1]); (d / 'art').mkdir(); (d / 'art/log.txt').write_text('L')\n"
-        "    (d / '.claude').mkdir(); (d / '.claude/settings.json').write_text('{}')\n"
-        "if '-O' in args:\n"
-        "    pathlib.Path(args[args.index('-O') + 1]).write_text('asset')\n"
-        "print('ok', os.environ.get('GH_TOKEN') or seen.get('text'))\n"
-    )
-    script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    env.gate.gh_bin = str(script)
-    return lambda: json.loads(record.read_text())
+class FakeDownloads:
+    """Stands in for the opener of token-less downloads: answers in turn, records each request."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls = []
+
+    def open(self, req, timeout=None):
+        self.calls.append((req.full_url, {k.lower(): v for k, v in req.header_items()}))
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer

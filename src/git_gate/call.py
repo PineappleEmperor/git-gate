@@ -18,7 +18,13 @@ from git_gate import Refused
 from git_gate.config import state_dir
 
 # The only list of tool names: the server registers exactly these, and Gate.dispatch accepts only these.
-TOOLS = ("clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label")
+TOOLS = (
+    "clone", "fetch", "push", "prune", "pr", "issue", "triage", "workflow_run", "label",
+    "checks", "run", "runs", "release", "file", "api_get",
+)  # fmt: skip
+# Tools older releases registered. Their conversations call them through this release's relay until
+# they end, so the gate still answers each call: with a refusal naming what replaces it.
+RETIRED = ("gh",)
 MAX_LOG = 1 << 20  # errors.log rolls over to errors.log.1 at this size
 MAX_AUDIT = 8 << 20  # audit.log is moved aside to audit.log.<time> at this size; nothing deletes those
 

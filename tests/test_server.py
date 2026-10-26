@@ -18,20 +18,23 @@ from git_gate.server import INSTRUCTIONS, Relay, build
 SRC = Path(__file__).resolve().parents[1] / "src"
 
 
-TEN = {"clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label"}
+TOOLS = {
+    "clone", "fetch", "push", "prune", "pr", "issue", "triage", "workflow_run", "label",
+    "checks", "run", "runs", "release", "file", "api_get",
+}  # fmt: skip
 
 
 def test_tools_registered(env):
     server = build(env.gate)
     names = {t.name for t in anyio.run(server.list_tools)}
-    assert names == TEN
+    assert names == TOOLS
 
 
 def test_server_tools_equal_call_tools(env):
     """D13: call.TOOLS is the only list of tool names, and the server registers exactly it."""
     registered = [t.name for t in anyio.run(build(env.gate).list_tools)]
     assert len(registered) == len(set(registered))
-    assert set(registered) == set(call.TOOLS) == TEN
+    assert set(registered) == set(call.TOOLS) == TOOLS
 
 
 def test_tool_parameters_match_the_gate_methods(env):

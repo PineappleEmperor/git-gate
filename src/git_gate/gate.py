@@ -10,31 +10,23 @@ import os
 import secrets
 import shlex
 import shutil
-import subprocess
 import tempfile
 import time
 import urllib.parse
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import NoReturn
 
-from git_gate import Refused, ghpolicy, writes
-from git_gate.call import TOOLS, audit, log_error
+from git_gate import Refused, ci, ghpolicy, reads, writes
+from git_gate.call import RETIRED, TOOLS, audit, log_error
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import FromGitHub, GitHub
-from git_gate.gitops import EMPTY, MAX_STDERR, Git
+from git_gate.gitops import MAX_STDERR, Git
 from git_gate.handover import Handovers
 from git_gate.mirror import MAX_HAVE, Mirror, Protected, comparison
-from git_gate.paths import (
-    check_new_target,
-    copy_in,
-    copy_tree_into,
-    open_dir,
-    place_new_file,
-    require_absolute,
-    write_out,
-)
+from git_gate.paths import copy_in, open_dir, require_absolute, write_out
 
 MAX_OUTPUT = 200_000
 MAX_BUNDLE = 512 << 20
@@ -50,6 +42,11 @@ MAX_ARG = 1000  # characters of one string argument kept in audit.log
 MAX_ARGS = 8 << 10  # characters of all the arguments, as JSON, kept in audit.log
 # (entries kept, characters kept of each string in them) for list arguments, tried in turn until all fit
 LIST_STEPS = ((20, MAX_ARG), (20, 100), (5, 100), (0, 0))
+
+
+# Fields a tool adds to its own audit line (the CI tools' polls and waited_s). Per call and per
+# thread: the fallback server runs calls in worker threads of one process.
+_AUDIT_EXTRA: ContextVar[dict] = ContextVar("audit_extra")
 
 
 class InternalError(Exception):
@@ -78,9 +75,10 @@ class Gate:
         *,
         base_url: str = "https://github.com",
         git: str = "/usr/bin/git",
-        gh: str = "/usr/bin/gh",
         github: Callable[[str], GitHub] = GitHub,
         clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ):
         self.config = config or config_dir()
         self.state = state or state_dir()
@@ -88,9 +86,10 @@ class Gate:
         self.git = Git(self.state, base_url, git)
         self.mirror = Mirror(self.git, self.state)
         self.handovers = Handovers(self.state, mirror=self.mirror)
-        self.gh_bin = gh
         self.github = github
         self.clock = clock
+        self.sleep = sleep
+        self.monotonic = monotonic
         (self.state / "rate").mkdir(exist_ok=True, mode=0o700)
 
     # --- plumbing -----------------------------------------------------------------------
@@ -100,7 +99,7 @@ class Gate:
 
     def dispatch(self, tool: str, kwargs: dict) -> str:
         """Run the named tool with `kwargs` through `call`: the one place a tool name becomes a method."""
-        if tool not in TOOLS:
+        if tool not in TOOLS + RETIRED:
             raise Refused(f"git-gate has no tool {tool!r}.")
         if not isinstance(kwargs, dict):
             raise Refused(f"{tool}: the arguments must be a JSON object.")
@@ -121,6 +120,8 @@ class Gate:
         access = None  # the session's access to the repo, for audit.log
         outcome = "ok"
         message = None  # what the agent is told when the outcome is not ok, scrubbed
+        extra: dict = {}
+        reset = _AUDIT_EXTRA.set(extra)
         try:
             check_enabled(self.config)
             self._rate_limit(kwargs.get("repo"))
@@ -149,23 +150,25 @@ class Gate:
             message = utf8_safe(_scrub(f"{type(e).__name__}: {e}", token))
             raise InternalError(message) from e
         finally:
+            _AUDIT_EXTRA.reset(reset)
             ms = int((time.monotonic() - started) * 1000)
-            self._audit(tool, kwargs, outcome, token, message, ms, cwd, access)
+            self._audit(tool, kwargs, outcome, token, message, ms, cwd, access, extra)
 
     def _audit(
         self, tool: str, kwargs: dict, outcome: str, token: str | None, message: str | None, ms: int,
-        cwd: str | None, access: str | None,
+        cwd: str | None, access: str | None, extra: dict | None = None,
     ) -> None:  # fmt: skip
         """One line per call. `reason` is the first line of what the agent was told, without the
         untrusted-content marker a refusal carrying GitHub's text starts with. `access` is the
         calling session's access to the repo under v2 rules ("write", "read", "none", or
-        "no-session" when the folder is no session's), and null under v1 or before rules are read."""
+        "no-session" when the folder is no session's), and null under v1 or before rules are read.
+        `extra` holds the fields the tool added, after the common ones."""
         reason = message.strip().partition("\n")[0][:MAX_REASON] if message is not None else None
         try:
             line = json.dumps({
                 "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "args": _logged_args(kwargs, token),
                 "outcome": outcome, "reason": reason, "ms": ms, "session": _session(), "cwd": cwd,
-                "access": access,
+                "access": access, **(extra or {}),
             })  # fmt: skip
             audit(self.state, _scrub(line, token))
         except Exception as e:
@@ -356,7 +359,7 @@ class Gate:
                 new = self.mirror.new_commits(repo, sha, remote or default_tip, rules)
                 proc = self.mirror.push(repo, sha, branch, token, rules)
                 if proc.returncode != 0 and WORKFLOW_SCOPE in proc.stdout + proc.stderr:
-                    # The PAT has no Workflows permission; the user's own push is not bound by it (I1).
+                    # The token lacks the Workflows permission; the user's own push is not bound by it (I1).
                     hand_over(["GitHub refuses workflow changes from the gate's token."], [])
         if proc.returncode != 0:
             raise Refused(f"git push was rejected:\n{(proc.stdout + proc.stderr).strip()[-MAX_STDERR:]}")
@@ -436,8 +439,15 @@ class Gate:
         base: str | None = None,
         head: str | None = None,
         draft: bool = False,
+        state: str | None = None,
+        limit: int | None = None,
+        search: str | None = None,
     ) -> str:
-        return writes.pr(self._writes(rules, token), repo, action, number, title, body_file, base, head, draft)
+        fields = dict(number=number, title=title, body_file=body_file, base=base, head=head, draft=draft, state=state,
+                      limit=limit, search=search)  # fmt: skip
+        if isinstance(action, str) and action in reads.PR_READS:
+            return reads.pr(self._ci(rules, token, repo), repo, action, **fields)
+        return writes.pr(self._writes(rules, token), repo, action, **fields, reads=tuple(reads.PR_READS))
 
     @_untrusted
     def issue(
@@ -449,8 +459,17 @@ class Gate:
         number: int | None = None,
         title: str | None = None,
         body_file: str | None = None,
+        state: str | None = None,
+        labels: list[str] | None = None,
+        limit: int | None = None,
+        search: str | None = None,
     ) -> str:
-        return writes.issue(self._writes(rules, token), repo, action, number, title, body_file)
+        fields = dict(
+            number=number, title=title, body_file=body_file, state=state, labels=labels, limit=limit, search=search
+        )
+        if isinstance(action, str) and action in reads.ISSUE_READS:
+            return reads.issue(self._ci(rules, token, repo), repo, action, **fields)
+        return writes.issue(self._writes(rules, token), repo, action, **fields, reads=tuple(reads.ISSUE_READS))
 
     @_untrusted
     def triage(
@@ -489,95 +508,78 @@ class Gate:
     ) -> str:
         return writes.label(self._writes(rules, token), repo, action, name, color, description, new_name)
 
-    # --- read-only gh -------------------------------------------------------------------
+    # --- CI status (the reading lives in ci.py) -----------------------------------------
+
+    def _ci(self, rules: Rules, token: str, repo: str) -> ci.Context:
+        return ci.Context(
+            rules, self.github(token), self.git, MAX_OUTPUT, self.sleep, self.monotonic, self.clock, _note_polls,
+            functools.partial(self._recheck, token, repo),
+        )  # fmt: skip
+
+    def _recheck(self, token: str, repo: str) -> None:
+        """The checks `call` made before the tool ran, made again: a wait outlasts them. The off
+        switch, the session's read access to `repo` under the rules as they are now, and the token,
+        which must still be the one this call holds (its replies are scrubbed of that one)."""
+        check_enabled(self.config)
+        rules, now = self._load()
+        rules.scoped(_cwd()).access(repo)
+        if now != token:
+            raise Refused("The gate's token changed while waiting; call again to wait with the new one.")
 
     @_untrusted
+    def checks(
+        self, rules: Rules, token: str, repo: str, ref: int | str, wait: bool = False, timeout_minutes: int = 20
+    ) -> str:
+        return ci.checks(self._ci(rules, token, repo), repo, ref, wait, timeout_minutes)
+
+    @_untrusted
+    def run(
+        self, rules: Rules, token: str, repo: str, run_id: int, wait: bool = False, timeout_minutes: int = 20
+    ) -> str:
+        return ci.run(self._ci(rules, token, repo), repo, run_id, wait, timeout_minutes)
+
+    # --- typed reads (the reading lives in reads.py) ----------------------------------------
+
+    @_untrusted
+    def runs(
+        self,
+        rules: Rules,
+        token: str,
+        repo: str,
+        branch: str | None = None,
+        workflow: str | None = None,
+        status: str | None = None,
+        limit: int = 10,
+    ) -> str:
+        return reads.runs(self._ci(rules, token, repo), repo, branch, workflow, status, limit)
+
+    @_untrusted
+    def release(
+        self, rules: Rules, token: str, repo: str, action: str, tag: str | None = None, limit: int | None = None
+    ) -> str:
+        return reads.release(self._ci(rules, token, repo), repo, action, tag, limit)
+
+    @_untrusted
+    def file(self, rules: Rules, token: str, repo: str, path: str, ref: str | None = None) -> str:
+        return reads.file(self._ci(rules, token, repo), repo, path, ref)
+
+    @_untrusted
+    def api_get(self, rules: Rules, token: str, repo: str, path: str, query: dict | None = None) -> str:
+        return reads.api_get(self._ci(rules, token, repo), repo, path, query)
+
+    # --- retired ------------------------------------------------------------------------
+
     def gh(self, rules: Rules, token: str, repo: str, args: list[str]) -> str:
-        rules.access(repo)
-        p = ghpolicy.plan(repo, args)
-        work = Path(tempfile.mkdtemp(dir=self.state / "tmp"))
-        try:
-            if p.download:
-                index, target, is_dir = p.download
-                check_new_target(rules, target, "Download target")
-                dl = work / "download"
-                dl.mkdir()
-                p.argv[index] = str(dl if is_dir else dl / Path(p.download[1]).name)
-            try:
-                proc = subprocess.run(
-                    [self.gh_bin, *p.argv],
-                    env=self._gh_env(_gh_config(work, token)) | p.env,
-                    cwd=self.state / EMPTY,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    timeout=rules.gh_timeout,
-                )
-            except subprocess.TimeoutExpired:
-                raise Refused(f"gh timed out after {rules.gh_timeout}s.") from None
-            out = proc.stdout + (("\n" + proc.stderr) if proc.stderr.strip() else "")
-            if proc.returncode != 0:
-                raise FromGitHub(f"gh exited {proc.returncode}:\n{_tail(out)}")
-            if p.download:
-                out += self._deliver(rules, p, dl)
-            return _tail(out) or "(no output)"
-        finally:
-            shutil.rmtree(work, ignore_errors=True)
-
-    def _deliver(self, rules: Rules, p: ghpolicy.GhPlan, dl: Path) -> str:
-        _, target, is_dir = p.download
-        if is_dir:
-            real, written, skipped = copy_tree_into(rules, dl, target, "Download target")
-        else:
-            got = dl / Path(target).name
-            if not got.is_file() or got.is_symlink():
-                return "\nNothing was downloaded."
-            real, written, skipped = place_new_file(rules, got, target, "Download target"), [Path(target).name], []
-        note = f"; skipped symlinks and dot-named entries: {', '.join(skipped)}" if skipped else ""
-        return f"\nSaved to {real}: {', '.join(written) or 'nothing'}{note}"
-
-    def _gh_env(self, config: Path) -> dict[str, str]:
-        """gh's whole environment. It never holds the token: `--jq` filters can read it (`$ENV`, `env`)."""
-        return self.git.env() | {
-            "GH_HOST": "github.com",
-            "GH_CONFIG_DIR": str(config),
-            "GH_PROMPT_DISABLED": "1",
-            "GH_NO_UPDATE_NOTIFIER": "1",
-            "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
-            "GH_SPINNER_DISABLED": "1",
-            "GH_PAGER": "cat",
-            "PAGER": "cat",
-            "GH_EDITOR": "false",
-            "EDITOR": "false",
-            "VISUAL": "false",
-            "GH_BROWSER": "false",
-            "BROWSER": "false",
-            "NO_COLOR": "1",
-        }
+        """Retired: conversations started on an older release may still call it, and are told what
+        replaces the command. Nothing runs and GitHub is not asked."""
+        raise Refused(ghpolicy.retired(args))
 
 
-def _gh_config(work: Path, token: str) -> Path:
-    """A fresh gh config directory for one call, its token in hosts.yml (0600) rather than the environment.
-
-    Written in gh's multi-account layout with `version: "1"`, so gh migrates nothing and asks
-    GitHub for no user name. The directory goes when `work` does, at the end of the call.
-    """
-    config = work / "gh"
-    config.mkdir(mode=0o700)
-    quoted = json.dumps(token)  # a JSON string is a valid YAML scalar
-    files = {
-        "config.yml": 'version: "1"\n',
-        "hosts.yml": (
-            "github.com:\n"
-            f"    users:\n        git-gate:\n            oauth_token: {quoted}\n"
-            f"    git_protocol: https\n    user: git-gate\n    oauth_token: {quoted}\n"
-        ),
-    }
-    for name, text in files.items():
-        fd = os.open(config / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-    return config
+def _note_polls(polls: int, waited: float) -> None:
+    """A CI tool's GitHub polls and seconds slept between them, for its audit line."""
+    extra = _AUDIT_EXTRA.get(None)
+    if extra is not None:
+        extra.update(polls=polls, waited_s=round(waited))
 
 
 def _stale_refusal(branch: str, default: str, stale: tuple[str, ...]) -> str:
@@ -673,7 +675,3 @@ def utf8_safe(text: str) -> str:
 
 def _scrub(text: str, token: str | None) -> str:
     return text.replace(token, "[token]") if token else text
-
-
-def _tail(text: str) -> str:
-    return text if len(text) <= MAX_OUTPUT else "[... truncated ...]\n" + text[-MAX_OUTPUT:]

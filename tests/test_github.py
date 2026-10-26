@@ -1,12 +1,13 @@
 import io
 import json
 import urllib.error
+import urllib.request
 
 import pytest
 
-from conftest import URL, FakeOpener
+from conftest import URL, FakeDownloads, FakeOpener, FakeResponse
 from git_gate import Refused
-from git_gate.github import FromGitHub, GitHub
+from git_gate.github import MAX_LOG, FromGitHub, GitHub, GitHubError, RateLimited, Redirected, _SameHostRedirects
 
 
 def make(replies=None):
@@ -327,3 +328,179 @@ def test_tag_lookup_refuses_dot_segments(name):
     with pytest.raises(Refused, match="segment"):
         gh.tag_exists("me/app", name)
     assert gh._opener.calls == []
+
+
+# --- rate limits ---------------------------------------------------------------------------------
+
+RUN5 = ("GET", "repos/me/app/actions/runs/5")
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "headers", "wait"),
+    [
+        (
+            403,
+            "API rate limit exceeded for user ID 1.",
+            {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1100"},
+            100,
+        ),
+        (403, "You have exceeded a secondary rate limit. Please wait.", {"Retry-After": "30"}, 30),
+        (429, "You have exceeded a secondary rate limit.", {}, None),
+        (
+            403,
+            "API rate limit exceeded",
+            {"retry-after": "7", "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1100"},
+            7,
+        ),
+    ],
+)
+def test_rate_limit_is_its_own_refusal(status, message, headers, wait):
+    gh = make({RUN5: (status, message, headers)})
+    with pytest.raises(RateLimited) as e:
+        gh.run("me/app", 5)
+    assert isinstance(e.value, FromGitHub) and e.value.status == status
+    assert f"returned {status}: {message}" in str(e.value)
+    assert e.value.wait(now=1000.0) == wait
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Retry-After": "nan"},
+        {"Retry-After": "inf"},
+        {"Retry-After": "-inf"},
+        {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "nan"},
+        {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "inf"},
+    ],
+)
+def test_a_wait_that_is_no_number_names_none(headers):
+    gh = make({RUN5: (403, "API rate limit exceeded", headers)})
+    with pytest.raises(RateLimited) as e:
+        gh.run("me/app", 5)
+    assert e.value.wait(now=1000.0) is None
+
+
+def test_a_spent_quota_with_a_reset_that_is_no_number_is_not_remembered():
+    gh = make({RUN5: FakeResponse(b"{}", {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "inf"})})
+    gh.run("me/app", 5)
+    assert gh.rate_wait(now=1000.0) == 0
+
+
+def test_a_429_without_a_body_is_a_rate_limit():
+    gh = make({RUN5: 429})
+    with pytest.raises(RateLimited, match="429"):
+        gh.run("me/app", 5)
+
+
+@pytest.mark.parametrize(
+    ("message", "headers"),
+    [
+        ("Resource not accessible by personal access token", {}),
+        ("Resource protected by organization SAML enforcement.", {"x-ratelimit-remaining": "4000"}),
+    ],
+)
+def test_other_403s_are_not_rate_limits(message, headers):
+    gh = make({RUN5: (403, message, headers)})
+    with pytest.raises(GitHubError) as e:
+        gh.run("me/app", 5)
+    assert not isinstance(e.value, RateLimited)
+    assert e.value.status == 403 and isinstance(e.value, FromGitHub)
+
+
+def test_an_exhausted_quota_on_a_good_answer_is_remembered():
+    reply = FakeResponse(b'{"id": 5}', {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1200"})
+    gh = make({RUN5: reply})
+    assert gh.rate_wait(now=1000.0) == 0
+    gh.run("me/app", 5)
+    assert gh.rate_wait(now=1000.0) == 200
+    assert gh.rate_wait(now=1300.0) == 0
+    gh._opener.replies[RUN5] = FakeResponse(
+        b'{"id": 5}', {"X-RateLimit-Remaining": "4999", "X-RateLimit-Reset": "1200"}
+    )
+    gh.run("me/app", 5)
+    assert gh.rate_wait(now=1000.0) == 0
+
+
+# --- job logs ------------------------------------------------------------------------------------
+
+LOGS = ("GET", "repos/me/app/actions/jobs/9/logs")
+BLOB = "https://results.example.net/logs/9.txt?sig=abc"
+
+
+def logs(*answers, api=None):
+    gh = make({LOGS: api if api is not None else Redirected("redirected", BLOB)})
+    gh._downloads = FakeDownloads(*answers)
+    return gh
+
+
+def test_cross_host_redirect_names_its_target():
+    req = urllib.request.Request("https://api.github.com/repos/me/app/actions/jobs/9/logs")
+    with pytest.raises(Redirected) as e:
+        _SameHostRedirects().redirect_request(req, None, 302, "Found", {}, BLOB)
+    assert e.value.url == BLOB and isinstance(e.value, FromGitHub)
+    assert "not following" in str(e.value)
+
+
+def test_job_log_follows_the_redirect_without_the_token():
+    gh = logs(FakeResponse(b"line 1\nline 2\n", {"Content-Length": "14"}))
+    assert gh.job_log("me/app", 9) == (b"line 1\nline 2\n", None)
+    assert gh._opener.calls == [("GET", "repos/me/app/actions/jobs/9/logs", None)]
+    ((url, headers),) = gh._downloads.calls
+    assert url == BLOB
+    assert "authorization" not in headers and "tok" not in str(headers)
+
+
+def test_a_long_log_is_read_from_its_end():
+    size = MAX_LOG + 1000
+    tail = b"x" * (MAX_LOG - 4) + b"end\n"
+    gh = logs(FakeResponse(b"", {"Content-Length": str(size)}), FakeResponse(tail, {}, status=206))
+    data, note = gh.job_log("me/app", 9)
+    assert data == tail and "last 2 MiB" in note
+    first, second = gh._downloads.calls
+    assert "range" not in first[1]
+    assert second == (BLOB, second[1]) and second[1]["range"] == f"bytes={size - MAX_LOG}-"
+
+
+def test_a_long_log_whose_host_ignores_ranges_gives_its_start():
+    size = MAX_LOG * 3
+    gh = logs(FakeResponse(b"", {"Content-Length": str(size)}), FakeResponse(b"y" * size, {}, status=200))
+    data, note = gh.job_log("me/app", 9)
+    assert len(data) == MAX_LOG and "start" in note
+
+
+def test_a_log_without_a_length_is_capped():
+    gh = logs(FakeResponse(b"z" * (MAX_LOG + 5), {}))
+    data, note = gh.job_log("me/app", 9)
+    assert len(data) == MAX_LOG and "start" in note
+    assert len(gh._downloads.calls) == 1
+
+
+def test_a_log_github_answers_itself_is_capped():
+    gh = logs(api=FakeResponse(b"w" * (MAX_LOG + 1)))
+    data, note = gh.job_log("me/app", 9)
+    assert len(data) == MAX_LOG and "start" in note
+    gh = logs(api=FakeResponse(b"short\n"))
+    assert gh.job_log("me/app", 9) == (b"short\n", None)
+
+
+def test_a_log_redirect_to_plain_http_is_refused():
+    gh = logs(api=Redirected("redirected", "http://results.example.net/9.txt"))
+    with pytest.raises(Refused, match="https"):
+        gh.job_log("me/app", 9)
+    assert gh._downloads.calls == []
+
+
+@pytest.mark.parametrize(
+    "error", [urllib.error.HTTPError(BLOB, 403, "Forbidden", {}, None), urllib.error.URLError("down")]
+)
+def test_a_failed_log_download_refuses(error):
+    gh = logs(error)
+    with pytest.raises(Refused, match="log"):
+        gh.job_log("me/app", 9)
+
+
+def test_a_missing_log_is_githubs_answer():
+    gh = logs(api=(410, "Gone", {}))
+    with pytest.raises(GitHubError) as e:
+        gh.job_log("me/app", 9)
+    assert e.value.status == 410

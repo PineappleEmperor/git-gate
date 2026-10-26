@@ -1,6 +1,7 @@
 """The few GitHub REST calls the gate makes itself."""
 
 import json
+import math
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,10 +20,70 @@ PROTECTING_RULES = {
 
 
 MAX_MESSAGE = 500
+MAX_LOG = 2 << 20  # bytes of a job log the gate downloads
+MAX_API = 4 << 20  # bytes of an api_get answer the gate reads
+PER_PAGE = 100
+MAX_PAGES = 10  # pages of one list the gate reads: at most PER_PAGE * MAX_PAGES entries
 
 
 class FromGitHub(Refused):
     """A refusal whose message carries text GitHub sent, which the agent must treat as data."""
+
+
+class GitHubError(FromGitHub):
+    """GitHub answered an error `status`; `headers` are the answer's, for callers that act on them."""
+
+    def __init__(self, text: str, status: int, headers):
+        super().__init__(text)
+        self.status = status
+        self.headers = headers
+
+
+class RateLimited(GitHubError):
+    """GitHub refused the call under its primary or secondary rate limit."""
+
+    def wait(self, now: float) -> float | None:
+        """Seconds GitHub asks the caller to wait: Retry-After, else until x-ratelimit-reset when the
+        quota is spent; None when it names neither."""
+        after = _number(_header(self.headers, "retry-after"))
+        if after is not None:
+            return max(0.0, after)
+        return _reset_wait(self.headers, now)
+
+
+_START = "the log is longer than {} MiB and its end could not be read; this is its start"
+
+
+def _header(headers, name: str) -> str | None:
+    """A header by its name in any case; `headers` is an HTTPMessage, a dict or None."""
+    for key, value in (headers or {}).items():
+        if key.lower() == name:
+            return value
+    return None
+
+
+def _number(text: str | None) -> float | None:
+    """A header's number; None for none, or for NaN or infinity, which no wait can be."""
+    try:
+        value = float(text) if text is not None else None
+    except ValueError:
+        return None
+    return value if value is not None and math.isfinite(value) else None
+
+
+def _reset_wait(headers, now: float) -> float | None:
+    """Seconds until x-ratelimit-reset when x-ratelimit-remaining is 0; None otherwise."""
+    if _header(headers, "x-ratelimit-remaining") != "0":
+        return None
+    reset = _number(_header(headers, "x-ratelimit-reset"))
+    return None if reset is None else max(0.0, reset - now)
+
+
+def _rate_limited(status: int, message: str, headers) -> bool:
+    """A 429, or a 403 whose message or spent quota says it is GitHub's primary or secondary rate limit."""
+    return status == 429 or (
+        status == 403 and ("rate limit" in message.lower() or _header(headers, "x-ratelimit-remaining") == "0")
+    )
 
 
 def _plan_limit(message: str) -> bool:
@@ -30,12 +91,29 @@ def _plan_limit(message: str) -> bool:
     return "Upgrade to GitHub Pro" in message or "make this repository public" in message.lower()
 
 
+class Redirected(FromGitHub):
+    """GitHub redirected to another host, `url`, which the gate does not follow with the token."""
+
+    def __init__(self, text: str, url: str):
+        super().__init__(text)
+        self.url = url
+
+
 class _SameHostRedirects(urllib.request.HTTPRedirectHandler):
     """urllib keeps the Authorization header across redirects, so refuse any that change host."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
-            raise FromGitHub(f"GitHub redirected to another host ({newurl}); not following.")
+            raise Redirected(f"GitHub redirected to another host ({newurl}); not following.", newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class _HttpsRedirects(urllib.request.HTTPRedirectHandler):
+    """For downloads, which carry no token: follow redirects, but only to https."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            raise Refused("The log download redirected to an address that is not https; not following.")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -45,6 +123,16 @@ class GitHub:
         self.api = api.rstrip("/")
         self.timeout = timeout
         self._opener = urllib.request.build_opener(_SameHostRedirects)
+        self._downloads = urllib.request.build_opener(_HttpsRedirects)  # never sent the token
+        self._reset: float | None = None  # x-ratelimit-reset of the last answer that spent the quota
+
+    def rate_wait(self, now: float) -> float:
+        """Seconds until the quota resets when the last answer said it is spent; else 0."""
+        return max(0.0, self._reset - now) if self._reset is not None else 0.0
+
+    def _saw(self, headers) -> None:
+        spent = _header(headers, "x-ratelimit-remaining") == "0"
+        self._reset = _number(_header(headers, "x-ratelimit-reset")) if spent else None
 
     def _request(
         self,
@@ -53,8 +141,12 @@ class GitHub:
         data: dict | None = None,
         absent: tuple[int, ...] = (),
         absent_if: Callable[[int, str], bool] | None = None,
+        raw: int | None = None,
+        accept: str = "application/vnd.github+json",
     ):
         """JSON in and out. Statuses in `absent`, or an error `absent_if(status, message)` accepts, give None.
+        With `raw`, the answer is returned as bytes, at most `raw` + 1 of them, and not parsed;
+        `accept` asks for another media type, such as a diff.
 
         Every POST sends a JSON body, `{}` when there is nothing to say. A refusal names GitHub's
         error message, cleaned and cut to MAX_MESSAGE characters.
@@ -67,7 +159,7 @@ class GitHub:
             method=method,
             headers={
                 "Authorization": f"Bearer {self.token}",
-                "Accept": "application/vnd.github+json",
+                "Accept": accept,
                 "X-GitHub-Api-Version": "2022-11-28",
                 "User-Agent": "git-gate",
                 **({"Content-Type": "application/json"} if data is not None else {}),
@@ -75,17 +167,24 @@ class GitHub:
         )
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                body = resp.read()
+                self._saw(getattr(resp, "headers", None))
+                body = resp.read() if raw is None else resp.read(raw + 1)
         except urllib.error.HTTPError as e:
+            self._saw(e.headers)
             message, detail = self._message(e)
             if e.code in absent or (absent_if and absent_if(e.code, message)):
                 return None
             said = self._clean("; ".join(m for m in (message, *detail) if m))
+            if _rate_limited(e.code, message, e.headers):
+                text = f"GitHub {method} {path} returned {e.code}" + (f": {said}" if said else ".")
+                raise RateLimited(text, e.code, e.headers) from None
             if said:
-                raise FromGitHub(f"GitHub {method} {path} returned {e.code}: {said}") from None
+                raise GitHubError(f"GitHub {method} {path} returned {e.code}: {said}", e.code, e.headers) from None
             raise Refused(f"GitHub {method} {path} returned {e.code}.") from None
         except urllib.error.URLError as e:
             raise Refused(f"GitHub {method} {path} failed: {e.reason}.") from None
+        if raw is not None:
+            return body
         return json.loads(body) if body else {}
 
     @staticmethod
@@ -244,9 +343,172 @@ class GitHub:
         path = "/".join(self._segment(part) for part in name.split("/"))
         return self._request("GET", f"repos/{repo}/git/ref/tags/{path}", absent=(404,)) is not None
 
+    def _pages(self, path: str, key: str) -> list:
+        """The `key` list of a paged answer such as {"total_count": n, key: [...]}, page by page,
+        at most MAX_PAGES of them."""
+        items: list = []
+        sep = "&" if "?" in path else "?"
+        for page in range(1, MAX_PAGES + 1):
+            data = self._request("GET", f"{path}{sep}per_page={PER_PAGE}&page={page}")
+            data = data if isinstance(data, dict) else {}
+            got = data.get(key) if isinstance(data.get(key), list) else []
+            items += got
+            total = data.get("total_count")
+            if len(got) < PER_PAGE or (isinstance(total, int) and len(items) >= total):
+                break
+        return items
+
+    def pull(self, repo: str, number: int) -> dict | None:
+        """A pull request, or None when `repo` has none numbered `number`."""
+        return self._request("GET", f"repos/{repo}/pulls/{number}", absent=(404,))
+
+    def reviews(self, repo: str, number: int) -> list[dict]:
+        """The first 100 reviews of a pull request, oldest first."""
+        return self._request("GET", f"repos/{repo}/pulls/{number}/reviews?per_page={PER_PAGE}")
+
+    def pulls(
+        self, repo: str, state: str, per_page: int, *, page: int | None = None, head: str | None = None,
+        base: str | None = None,
+    ) -> list[dict]:  # fmt: skip
+        """One page of pull requests, most recently updated first. `head` is "owner:branch"."""
+        query = f"state={state}&sort=updated&direction=desc&per_page={per_page}"
+        query += f"&page={page}" if page else ""
+        query += f"&head={urllib.parse.quote(head, safe='')}" if head else ""
+        query += f"&base={urllib.parse.quote(base, safe='')}" if base else ""
+        return self._request("GET", f"repos/{repo}/pulls?{query}")
+
+    def pull_diff(self, repo: str, number: int, cap: int) -> bytes | None:
+        """A pull request's unified diff, at most `cap` + 1 bytes of it; None when there is no such pull request."""
+        return self._request(
+            "GET", f"repos/{repo}/pulls/{number}", absent=(404,), raw=cap, accept="application/vnd.github.diff"
+        )
+
+    def issue(self, repo: str, number: int) -> dict | None:
+        """An issue (or pull request, which GitHub counts as issues too), or None when there is none."""
+        return self._request("GET", f"repos/{repo}/issues/{number}", absent=(404,))
+
+    def issue_comments(self, repo: str, number: int, page: int) -> list[dict]:
+        """One page of an issue's comments, oldest first, 100 to a page."""
+        return self._request("GET", f"repos/{repo}/issues/{number}/comments?per_page={PER_PAGE}&page={page}")
+
+    def issues(self, repo: str, state: str, page: int, labels: list[str]) -> list[dict]:
+        """One page of 100 issues, pull requests among them, most recently updated first."""
+        query = f"state={state}&sort=updated&direction=desc&per_page={PER_PAGE}&page={page}"
+        query += f"&labels={urllib.parse.quote(','.join(labels), safe='')}" if labels else ""
+        return self._request("GET", f"repos/{repo}/issues?{query}")
+
+    def search_issues(self, repo: str, kind: str, terms: str, per_page: int) -> dict:
+        """One page of GET search/issues, most recently updated first, always held to `repo` and to
+        pull requests or issues (`kind` "pr" or "issue"): this method puts both qualifiers first
+        itself. `terms` must already be checked: GitHub ORs repeated repo: qualifiers, so text that
+        names another repo, owner or visibility would widen the search past `repo`."""
+        if kind not in ("pr", "issue"):
+            raise Refused(f"Searches are of pull requests or issues, not {kind!r}.")
+        q = urllib.parse.quote(f"repo:{repo} is:{kind} {terms}".strip(), safe="")
+        return self._request("GET", f"search/issues?q={q}&sort=updated&order=desc&per_page={per_page}")
+
+    def commit(self, repo: str, sha: str) -> dict | None:
+        """A commit, or None when GitHub knows no commit by that (abbreviated) SHA."""
+        return self._request("GET", f"repos/{repo}/commits/{self._segment(sha)}", absent=(404, 422))
+
+    def check_runs(self, repo: str, sha: str) -> list[dict]:
+        """Every check run of commit `sha`, the latest of each name."""
+        return self._pages(f"repos/{repo}/commits/{self._segment(sha)}/check-runs?filter=latest", "check_runs")
+
+    def statuses(self, repo: str, sha: str) -> list[dict]:
+        """The latest commit status of each context on commit `sha`."""
+        return self._pages(f"repos/{repo}/commits/{self._segment(sha)}/status", "statuses")
+
+    def find_run(self, repo: str, run_id: int) -> dict | None:
+        """A workflow run, or None when `repo` has none with that id."""
+        return self._request("GET", f"repos/{repo}/actions/runs/{run_id}", absent=(404,))
+
+    def jobs(self, repo: str, run_id: int) -> list[dict]:
+        """The jobs of a workflow run's latest attempt."""
+        return self._pages(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=latest", "jobs")
+
+    def runs(
+        self, repo: str, per_page: int, *, workflow: str | None = None, branch: str | None = None,
+        status: str | None = None,
+    ) -> dict | None:  # fmt: skip
+        """The newest workflow runs, of one workflow (an id or file name) when given; None when it has none such."""
+        if workflow is not None and (not workflow or set(workflow) == {"."}):
+            raise Refused(f"Refusing workflow {workflow!r}.")
+        # A file name keeps its dots, which GitHub matches as written; quoting keeps "/" out.
+        name = urllib.parse.quote(workflow or "", safe="")
+        base = f"repos/{repo}/actions/workflows/{name}/runs" if workflow else f"repos/{repo}/actions/runs"
+        query = f"per_page={per_page}"
+        query += f"&branch={urllib.parse.quote(branch, safe='')}" if branch else ""
+        query += f"&status={urllib.parse.quote(status, safe='')}" if status else ""
+        return self._request("GET", f"{base}?{query}", absent=(404,) if workflow else ())
+
+    def releases(self, repo: str, per_page: int) -> list[dict]:
+        """The newest releases, drafts among them when the token may see drafts."""
+        return self._request("GET", f"repos/{repo}/releases?per_page={per_page}")
+
+    def release(self, repo: str, tag: str | None) -> dict | None:
+        """The release of tag `tag`, or the latest published one for None; None when there is none.
+        Each `/`-separated part of the tag is a segment of its own, as in tag_exists."""
+        if tag is None:
+            return self._request("GET", f"repos/{repo}/releases/latest", absent=(404,))
+        path = "/".join(self._segment(part) for part in tag.split("/"))
+        return self._request("GET", f"repos/{repo}/releases/tags/{path}", absent=(404,))
+
+    def contents(self, repo: str, path: str, ref: str | None) -> dict | list | None:
+        """A file's (or symlink's) contents entry, or a directory's entries; None when there is none.
+        `path` must already be checked: its segments are quoted but keep their dots."""
+        quoted = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/")) if path else ""
+        query = f"?ref={urllib.parse.quote(ref, safe='')}" if ref else ""
+        return self._request("GET", f"repos/{repo}/contents/{quoted}{query}", absent=(404,))
+
+    def get(self, repo: str, path: str, query: dict[str, str]) -> bytes:
+        """The raw answer to a GET of repos/{repo}/{path}, at most MAX_API + 1 bytes of it. `path` must
+        already be checked: its segments are quoted but keep their dots."""
+        quoted = "".join("/" + urllib.parse.quote(part, safe="") for part in path.split("/")) if path else ""
+        qs = f"?{urllib.parse.urlencode(query)}" if query else ""
+        return self._request("GET", f"repos/{repo}{quoted}{qs}", raw=MAX_API)
+
     def run(self, repo: str, run_id: int) -> dict:
         """A workflow run, which says among other things which branch it ran on (`head_branch`)."""
         return self._request("GET", f"repos/{repo}/actions/runs/{run_id}")
+
+    def job_log(self, repo: str, job_id: int, cap: int = MAX_LOG) -> tuple[bytes, str | None]:
+        """A job's log as bytes, at most `cap` of them, and a note when that is not the whole log.
+
+        GitHub answers with a redirect to a signed download address on another host. That address
+        is fetched without the token. A log longer than `cap` is fetched again from `cap` bytes
+        before its end, since its end is where a failure shows; a host that ignores the range
+        leaves only its start.
+        """
+        try:
+            data = self._request("GET", f"repos/{repo}/actions/jobs/{job_id}/logs", raw=cap)
+        except Redirected as e:
+            return self._download(e.url, cap)
+        return data[:cap], _START.format(cap >> 20) if len(data) > cap else None
+
+    def _download(self, url: str, cap: int) -> tuple[bytes, str | None]:
+        if urllib.parse.urlsplit(url).scheme != "https":
+            raise Refused("GitHub sent the log to an address that is not https; not following.")
+
+        def get(span: str | None = None):
+            headers = {"User-Agent": "git-gate", **({"Range": span} if span else {})}
+            return self._downloads.open(urllib.request.Request(url, headers=headers), timeout=self.timeout)
+
+        try:
+            with get() as resp:
+                size = _number(_header(resp.headers, "content-length"))
+                if size is None or size <= cap:
+                    data = resp.read(cap + 1)
+                    return data[:cap], _START.format(cap >> 20) if len(data) > cap else None
+            with get(f"bytes={int(size) - cap}-") as resp:
+                data = resp.read(cap)
+                if getattr(resp, "status", 200) == 206:
+                    return data, f"the log is {size / (1 << 20):.1f} MiB; the gate read its last {cap >> 20} MiB"
+                return data, _START.format(cap >> 20)
+        except urllib.error.HTTPError as e:
+            raise Refused(f"Downloading the log failed with status {e.code}.") from None
+        except OSError as e:
+            raise Refused(f"Downloading the log failed: {getattr(e, 'reason', None) or e}.") from None
 
     def run_action(self, repo: str, run_id: int, action: str) -> None:
         endpoints = {"rerun": "rerun", "rerun_failed": "rerun-failed-jobs", "cancel": "cancel"}

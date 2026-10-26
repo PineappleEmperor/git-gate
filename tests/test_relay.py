@@ -212,9 +212,12 @@ def test_call_main_writes_a_private_log(tmp_path, monkeypatch):
     assert oct((state / "errors.log").stat().st_mode & 0o777) == "0o600"
 
 
-def test_call_tools_are_the_ten_tools():
-    assert set(TOOLS) == {"clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label"}
-    assert len(TOOLS) == 10
+def test_call_tools_are_the_gates_tools():
+    assert set(TOOLS) == {
+        "clone", "fetch", "push", "prune", "pr", "issue", "triage", "workflow_run", "label",
+        "checks", "run", "runs", "release", "file", "api_get",
+    }  # fmt: skip
+    assert len(TOOLS) == 15
 
 
 def test_call_run(env):
