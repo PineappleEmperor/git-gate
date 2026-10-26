@@ -51,8 +51,9 @@ escapes and control characters.
   holds a `repo:`, `org:`, `user:` or `owner:` qualifier or `is:public`/`is:private` in any form
   (quoted, negated, spaced), since GitHub ORs repeated `repo:` qualifiers, or `OR`, `AND`, `NOT`,
   parentheses, backslashes or double quotes. Label names in a search get the same checks and may hold
-  no `x:` word at all. GitHub allows 30 searches a minute; a rate-limited search is refused, not
-  retried.
+  no `x:` word at all. Without `state`, a search adds no state of its own, so an `is:merged` or
+  `is:closed` in the text decides. GitHub allows 30 searches a minute; a rate-limited search is
+  refused, not retried.
 - `checks(repo, ref, wait=False, timeout_minutes=20)`: whether CI passed on a pull request (`12` or
   `"#12"`), branch or commit SHA. One line per check run and commit status (name, state,
   conclusion, duration, Actions run id, URL), then a verdict: `All N passed`, `N failing: <names>`,
