@@ -47,6 +47,8 @@ class Context:
     monotonic: Callable[[], float] = time.monotonic  # for the wait's deadline
     clock: Callable[[], float] = time.time  # for GitHub's x-ratelimit-reset, a Unix time
     report: Callable[[int, float], None] = lambda polls, waited: None  # for audit.log, once per call
+    # Raises Refused when the call would now be refused: run before every poll that follows a sleep.
+    recheck: Callable[[], None] = lambda: None
 
 
 @dataclass(frozen=True)
@@ -299,6 +301,7 @@ def _poll[T](
     seconds that doubles with every rate limit in a row, up to MAX_BACKOFF. So no sleep is shorter
     than FIRST_INTERVAL. Any other error fails. No sleep runs past the deadline, and with less
     than FIRST_INTERVAL left the waiting stops: the state so far comes back with a line saying so.
+    Before each poll after a sleep, `ctx.recheck()` refuses if the call would now be refused.
     """
     deadline = ctx.monotonic() + minutes * 60
     interval, backoff = FIRST_INTERVAL, FIRST_BACKOFF
@@ -307,6 +310,8 @@ def _poll[T](
     polls, waited = 0, 0.0
     try:
         while True:
+            if polls:
+                ctx.recheck()  # the off switch, the rules and the token may have changed while it slept
             polls += 1
             try:
                 state[:] = [fetch()]

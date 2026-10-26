@@ -505,22 +505,33 @@ class Gate:
 
     # --- CI status (the reading lives in ci.py) -----------------------------------------
 
-    def _ci(self, rules: Rules, token: str) -> ci.Context:
+    def _ci(self, rules: Rules, token: str, repo: str) -> ci.Context:
         return ci.Context(
-            rules, self.github(token), self.git, MAX_OUTPUT, self.sleep, self.monotonic, self.clock, _note_polls
-        )
+            rules, self.github(token), self.git, MAX_OUTPUT, self.sleep, self.monotonic, self.clock, _note_polls,
+            functools.partial(self._recheck, token, repo),
+        )  # fmt: skip
+
+    def _recheck(self, token: str, repo: str) -> None:
+        """The checks `call` made before the tool ran, made again: a wait outlasts them. The off
+        switch, the session's read access to `repo` under the rules as they are now, and the token,
+        which must still be the one this call holds (its replies are scrubbed of that one)."""
+        check_enabled(self.config)
+        rules, now = self._load()
+        rules.scoped(_cwd()).access(repo)
+        if now != token:
+            raise Refused("The gate's token changed while waiting; call again to wait with the new one.")
 
     @_untrusted
     def checks(
         self, rules: Rules, token: str, repo: str, ref: int | str, wait: bool = False, timeout_minutes: int = 20
     ) -> str:
-        return ci.checks(self._ci(rules, token), repo, ref, wait, timeout_minutes)
+        return ci.checks(self._ci(rules, token, repo), repo, ref, wait, timeout_minutes)
 
     @_untrusted
     def run(
         self, rules: Rules, token: str, repo: str, run_id: int, wait: bool = False, timeout_minutes: int = 20
     ) -> str:
-        return ci.run(self._ci(rules, token), repo, run_id, wait, timeout_minutes)
+        return ci.run(self._ci(rules, token, repo), repo, run_id, wait, timeout_minutes)
 
     # --- read-only gh -------------------------------------------------------------------
 

@@ -1,6 +1,7 @@
 """The read-only CI tools: checks and run."""
 
 import json
+from collections.abc import Callable
 
 import pytest
 
@@ -417,11 +418,13 @@ class FakeTime:
     def __init__(self):
         self.now = 1_000_000.0
         self.sleeps: list[float] = []
+        self.during: Callable[[], None] = lambda: None  # what happens while the gate sleeps
 
     def sleep(self, seconds: float) -> None:
         assert seconds > 0
         self.sleeps.append(seconds)
         self.now += seconds
+        self.during()
 
     def clock(self) -> float:
         return self.now
@@ -645,3 +648,64 @@ def test_no_sleep_near_the_deadline_is_shorter_than_the_first_interval(env, gh, 
     out = call(env, "checks", repo="me/app", ref=12, wait=True, timeout_minutes=1)
     assert clock.sleeps == [50]
     assert "Still running after 1 minute" in out
+
+
+# --- enforcement while waiting --------------------------------------------------------------------
+
+
+def polls_of(gh) -> int:
+    return requests(gh).count(RUNS)
+
+
+def test_the_off_switch_ends_a_wait(env, gh, clock):
+    gh.replies[RUNS] = RUNNING
+    clock.during = lambda: (env.cfg / "disabled").touch()
+    with pytest.raises(Refused, match="switched off"):
+        call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert polls_of(gh) == 1 and clock.sleeps == [15]
+    line = last_audit(env)
+    assert (line["outcome"], line["polls"], line["waited_s"]) == ("refused", 1, 15)
+
+
+def test_revoked_access_ends_a_wait(env, gh, clock):
+    gh.replies[RUN] = workflow_run(status="in_progress", conclusion=None)
+    rules = env.cfg / "rules.toml"
+    clock.during = lambda: rules.write_text(rules.read_text().replace('"me/app" = "write"\n', ""))
+    with pytest.raises(Refused, match="allowlist"):
+        call(env, "run", repo="me/app", run_id=5, wait=True)
+    assert requests(gh) == [RUN, JOBS]
+
+
+def test_rules_that_no_longer_load_end_a_wait(env, gh, clock):
+    gh.replies[RUNS] = RUNNING
+    clock.during = lambda: (env.cfg / "rules.toml").write_text("nonsense = [")
+    with pytest.raises(Refused):
+        call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert polls_of(gh) == 1
+
+
+def test_a_changed_token_ends_a_wait(env, gh, clock):
+    gh.replies[RUNS] = RUNNING
+    clock.during = lambda: (env.cfg / "token").write_text("github_pat_OTHER\n")
+    with pytest.raises(Refused, match="token changed"):
+        call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert polls_of(gh) == 1
+
+
+def test_a_removed_token_ends_a_wait(env, gh, clock):
+    gh.replies[RUNS] = RUNNING
+    clock.during = lambda: (env.cfg / "token").unlink()
+    with pytest.raises(Refused):
+        call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert polls_of(gh) == 1
+
+
+def test_a_session_revoked_mid_wait_ends_it(env, gh, clock, monkeypatch):
+    """With v2 rules the session's grant is what is re-read."""
+    (env.cfg / "rules.toml").write_text(f'[sessions."{env.ws}"]\nrepo = "me/app"\n')
+    monkeypatch.chdir(env.ws)
+    gh.replies[RUNS] = RUNNING
+    clock.during = lambda: (env.cfg / "rules.toml").write_text(f'[sessions."{env.ws}"]\nread = ["other/lib"]\n')
+    with pytest.raises(Refused, match="has no access to me/app"):
+        call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert polls_of(gh) == 1
