@@ -141,9 +141,11 @@ class GitHub:
         absent: tuple[int, ...] = (),
         absent_if: Callable[[int, str], bool] | None = None,
         raw: int | None = None,
+        accept: str = "application/vnd.github+json",
     ):
         """JSON in and out. Statuses in `absent`, or an error `absent_if(status, message)` accepts, give None.
-        With `raw`, the answer is returned as bytes, at most `raw` + 1 of them, and not parsed.
+        With `raw`, the answer is returned as bytes, at most `raw` + 1 of them, and not parsed;
+        `accept` asks for another media type, such as a diff.
 
         Every POST sends a JSON body, `{}` when there is nothing to say. A refusal names GitHub's
         error message, cleaned and cut to MAX_MESSAGE characters.
@@ -156,7 +158,7 @@ class GitHub:
             method=method,
             headers={
                 "Authorization": f"Bearer {self.token}",
-                "Accept": "application/vnd.github+json",
+                "Accept": accept,
                 "X-GitHub-Api-Version": "2022-11-28",
                 "User-Agent": "git-gate",
                 **({"Content-Type": "application/json"} if data is not None else {}),
@@ -358,6 +360,27 @@ class GitHub:
     def pull(self, repo: str, number: int) -> dict | None:
         """A pull request, or None when `repo` has none numbered `number`."""
         return self._request("GET", f"repos/{repo}/pulls/{number}", absent=(404,))
+
+    def reviews(self, repo: str, number: int) -> list[dict]:
+        """The first 100 reviews of a pull request, oldest first."""
+        return self._request("GET", f"repos/{repo}/pulls/{number}/reviews?per_page={PER_PAGE}")
+
+    def pulls(
+        self, repo: str, state: str, per_page: int, *, page: int | None = None, head: str | None = None,
+        base: str | None = None,
+    ) -> list[dict]:  # fmt: skip
+        """One page of pull requests, most recently updated first. `head` is "owner:branch"."""
+        query = f"state={state}&sort=updated&direction=desc&per_page={per_page}"
+        query += f"&page={page}" if page else ""
+        query += f"&head={urllib.parse.quote(head, safe='')}" if head else ""
+        query += f"&base={urllib.parse.quote(base, safe='')}" if base else ""
+        return self._request("GET", f"repos/{repo}/pulls?{query}")
+
+    def pull_diff(self, repo: str, number: int, cap: int) -> bytes | None:
+        """A pull request's unified diff, at most `cap` + 1 bytes of it; None when there is no such pull request."""
+        return self._request(
+            "GET", f"repos/{repo}/pulls/{number}", absent=(404,), raw=cap, accept="application/vnd.github.diff"
+        )
 
     def commit(self, repo: str, sha: str) -> dict | None:
         """A commit, or None when GitHub knows no commit by that (abbreviated) SHA."""

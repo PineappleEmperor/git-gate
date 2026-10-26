@@ -20,7 +20,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import NoReturn
 
-from git_gate import Refused, ci, ghpolicy, writes
+from git_gate import Refused, ci, ghpolicy, reads, writes
 from git_gate.call import TOOLS, audit, log_error
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import FromGitHub, GitHub
@@ -450,8 +450,14 @@ class Gate:
         base: str | None = None,
         head: str | None = None,
         draft: bool = False,
+        state: str | None = None,
+        limit: int | None = None,
     ) -> str:
-        return writes.pr(self._writes(rules, token), repo, action, number, title, body_file, base, head, draft)
+        fields = dict(number=number, title=title, body_file=body_file, base=base, head=head, draft=draft, state=state,
+                      limit=limit)  # fmt: skip
+        if isinstance(action, str) and action in reads.PR_READS:
+            return reads.pr(self._ci(rules, token, repo), repo, action, **fields)
+        return writes.pr(self._writes(rules, token), repo, action, **fields, reads=tuple(reads.PR_READS))
 
     @_untrusted
     def issue(

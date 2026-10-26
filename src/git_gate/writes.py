@@ -104,12 +104,13 @@ def _show(value: object) -> str:
     return text if len(text) <= 60 else text[:57] + "..."
 
 
-def _action(tool: str, action: object, actions: dict, given: dict) -> None:
-    """`action` is one of `actions`, with its required arguments and nothing it does not take."""
+def _action(tool: str, action: object, actions: dict, given: dict, reads: Sequence[str] = ()) -> None:
+    """`action` is one of `actions`, with its required arguments and nothing it does not take.
+    `reads` are the tool's read actions, named in the refusal of an unknown action."""
     if isinstance(action, str) and action.lower() in NOT_ACTIONS:
         raise Refused(NOT_ACTIONS[action.lower()])
     if not isinstance(action, str) or action not in actions:
-        raise Refused(f"{tool} has no action {_show(action)}; use one of {', '.join(actions)}.")
+        raise Refused(f"{tool} has no action {_show(action)}; use one of {', '.join([*reads, *actions])}.")
     required, optional, one_of = actions[action]
     missing = sorted(required - given.keys())
     if missing:
@@ -191,10 +192,15 @@ def pr(
     base: str | None = None,
     head: str | None = None,
     draft: bool = False,
+    state: str | None = None,
+    limit: int | None = None,
+    reads: Sequence[str] = (),
 ) -> str:
     ctx.rules.require_write(repo)
-    given = _given(number=number, title=title, body_file=body_file, base=base, head=head, draft=draft)
-    _action("pr", action, PR_ACTIONS, given)
+    given = _given(
+        number=number, title=title, body_file=body_file, base=base, head=head, draft=draft, state=state, limit=limit
+    )
+    _action("pr", action, PR_ACTIONS, given, reads)
     n = _number(number, "number") if "number" in given else None
     if title is not None:
         _line(title, "title", MAX_TITLE)

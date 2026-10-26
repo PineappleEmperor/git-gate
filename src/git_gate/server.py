@@ -237,10 +237,18 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         base: str | None = None,
         head: str | None = None,
         draft: bool = False,
+        state: str | None = None,
+        limit: int | None = None,
     ) -> str:
-        """Open or change a pull request. Push the branch first. Merging and approving are the user's.
+        """Read, open or change pull requests. Push the branch first. Merging and approving are the user's.
 
-        action and what it takes (anything else is refused):
+        Reads (read access is enough):
+        - view: number. Title, state, draft, author, branches, mergeable state, labels, requested
+          reviewers, each reviewer's latest review, URL and body.
+        - list: optional state (open, closed, merged, all; default open), head (a branch, or
+          owner:branch for a fork), base, limit (at most 100, default 30). One line each.
+        - diff: number. The unified diff, cut when longer than the gate shows.
+        Writes, and what they take (anything else is refused):
         - create: title, head (a pushed branch); optional body_file, base (default branch), draft
         - edit: number, and at least one of title, body_file, base
         - comment: number, body_file
@@ -252,7 +260,7 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         """
         return await run(
             "pr", repo=repo, action=action, number=number, title=title, body_file=body_file, base=base, head=head,
-            draft=draft,
+            draft=draft, state=state, limit=limit,
         )  # fmt: skip
 
     @server.tool()

@@ -403,9 +403,9 @@ def _duration(start: object, end: object) -> str | None:
 
 
 def fit(body: list[str], end: list[str], limit: int) -> str:
-    """The lines, cut in the middle when too long, so the verdict at the end always shows."""
+    """The lines, cut in the middle when too long, so the `end` lines (a verdict) always show."""
     text, tail = "\n".join(body), "\n".join(end)
     room = limit - len(tail) - 40
     if len(text) > room:
         text = text[:room] + f"\n[... {len(text) - room} characters cut ...]"
-    return f"{text}\n{tail}"
+    return f"{text}\n{tail}" if end else text

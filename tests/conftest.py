@@ -176,16 +176,20 @@ class FakeOpener:
     def __init__(self, replies=None):
         self.replies = replies or {}
         self.calls = []
+        self.headers = []  # each request's headers, names lower-cased
 
     def open(self, req, timeout=None):
         path = req.full_url.removeprefix(API)
         body = json.loads(req.data) if req.data else None
         self.calls.append((req.get_method(), path, body))
+        self.headers.append({k.lower(): v for k, v in req.header_items()})
         reply = self.replies.get((req.get_method(), path), {"html_url": URL})
         if isinstance(reply, Turns):
             reply = reply.pop(0) if len(reply) > 1 else reply[0]
         if isinstance(reply, BaseException):
             raise reply
+        if isinstance(reply, bytes):  # an answer that is not JSON, such as a diff
+            return FakeResponse(reply)
         if isinstance(reply, FakeResponse):
             reply.seek(0)
             return reply
