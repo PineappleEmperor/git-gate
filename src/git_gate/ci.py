@@ -103,10 +103,11 @@ def checks(ctx: Context, repo: str, ref: object, wait: object = False, timeout_m
     return fit(head + [c.line for c in found] + refused, [_verdict(found), *note], ctx.max_output)
 
 
-# A private repo hides these from a token without the permission; a public one shows them to anyone.
+# A private repo hides check runs from the gate's fine-grained token, which cannot hold a "Checks"
+# permission, and commit statuses unless it holds "Commit statuses"; a public repo shows both to anyone.
 REFUSED_CHECKS = (
-    "GitHub refuses this commit's check runs to the gate's token (it lacks the \"Checks\" permission, "
-    "read), so these are the commit's Actions runs instead."
+    "GitHub refuses this commit's check runs to the gate's token (a fine-grained token cannot hold a "
+    '"Checks" permission), so these are the commit\'s Actions runs instead.'
 )
 REFUSED_STATUSES = (
     "GitHub refuses this commit's commit statuses to the gate's token (it lacks the \"Commit statuses\" "
