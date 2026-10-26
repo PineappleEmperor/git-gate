@@ -20,7 +20,7 @@ from git_gate.config import state_dir
 # The only list of tool names: the server registers exactly these, and Gate.dispatch accepts only these.
 TOOLS = (
     "clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label",
-    "checks", "run", "runs", "release",
+    "checks", "run", "runs", "release", "file",
 )  # fmt: skip
 MAX_LOG = 1 << 20  # errors.log rolls over to errors.log.1 at this size
 MAX_AUDIT = 8 << 20  # audit.log is moved aside to audit.log.<time> at this size; nothing deletes those

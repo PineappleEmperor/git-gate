@@ -566,6 +566,10 @@ class Gate:
     ) -> str:
         return reads.release(self._ci(rules, token, repo), repo, action, tag, limit)
 
+    @_untrusted
+    def file(self, rules: Rules, token: str, repo: str, path: str, ref: str | None = None) -> str:
+        return reads.file(self._ci(rules, token, repo), repo, path, ref)
+
     # --- read-only gh -------------------------------------------------------------------
 
     @_untrusted

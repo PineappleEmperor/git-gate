@@ -1,5 +1,7 @@
 """Typed GitHub reads: what agents used gh's read commands for."""
 
+import base64
+
 import pytest
 
 from conftest import TOKEN, FakeOpener, call
@@ -539,3 +541,112 @@ def test_release_refuses(env, gh, kwargs):
 def test_release_download_says_it_is_not_supported(env, gh):
     with pytest.raises(Refused, match="not supported"):
         call(env, "release", repo="me/app", action="download", tag="v1")
+
+
+# --- file -----------------------------------------------------------------------------------------
+
+
+def blob(content: bytes, path="docs/READ ME.md", **extra):
+    encoded = base64.encodebytes(content).decode()  # GitHub wraps its base64 at 60 characters
+    return {"type": "file", "path": path, "size": len(content), "sha": "b" * 40, "encoding": "base64",
+            "content": encoded, **extra}  # fmt: skip
+
+
+def test_file(env, gh):
+    path = ("GET", "repos/me/app/contents/docs/READ%20ME.md")
+    content = b"# Title\r\n\x1b[1mbold\x1b[0m\tand tab\n" * 3
+    gh.replies[path] = blob(content)
+    out = call(env, "file", repo="me/app", path="docs/READ ME.md")
+    assert requests(gh) == [path]
+    lines = out.splitlines()
+    assert lines[0] == UNTRUSTED
+    assert lines[1] == f"docs/READ ME.md at the default branch ({len(content)} bytes):"
+    assert lines[2:4] == ["# Title", "bold\tand tab"]
+
+
+def test_file_at_a_ref(env, gh):
+    path = ("GET", "repos/me/app/contents/a/b.txt?ref=feat%2Fx")
+    gh.replies[path] = blob(b"hi\n", path="a/b.txt")
+    out = call(env, "file", repo="me/app", path="a/b.txt", ref="feat/x")
+    assert requests(gh) == [path]
+    assert "a/b.txt at feat/x (3 bytes):\nhi" in out
+
+
+def test_a_directory_is_listed(env, gh):
+    path = ("GET", "repos/me/app/contents/src")
+    gh.replies[path] = [
+        {"type": "dir", "name": "git_gate", "path": "src/git_gate"},
+        {"type": "file", "name": "x.py", "path": "src/x.py", "size": 12},
+        {"type": "symlink", "name": "l", "path": "src/l", "size": 3},
+    ]
+    out = call(env, "file", repo="me/app", path="src")
+    assert out.splitlines()[1:] == [
+        "src at the default branch is a directory:",
+        "git_gate/",
+        "x.py (12 B)",
+        "l (symlink)",
+    ]
+
+
+def test_the_root_is_listed(env, gh):
+    gh.replies[("GET", "repos/me/app/contents/")] = [{"type": "file", "name": "README.md", "size": 5}]
+    assert "README.md (5 B)" in call(env, "file", repo="me/app", path="")
+
+
+def test_a_binary_file_is_refused_with_its_size(env, gh):
+    gh.replies[("GET", "repos/me/app/contents/logo.png")] = blob(b"\x89PNG\r\n\x1a\n\0\0\0", path="logo.png")
+    with pytest.raises(Refused, match=r"logo.png is binary \(11 B\)"):
+        call(env, "file", repo="me/app", path="logo.png")
+
+
+def test_a_file_over_a_mebibyte_is_refused(env, gh):
+    gh.replies[("GET", "repos/me/app/contents/big.txt")] = blob(b"", path="big.txt", size=(1 << 20) + 1)
+    with pytest.raises(Refused, match="big.txt is 1.0 MiB"):
+        call(env, "file", repo="me/app", path="big.txt")
+
+
+def test_a_long_text_file_is_cut(env, gh):
+    gh.replies[("GET", "repos/me/app/contents/long.txt")] = blob(b"x" * (MAX_OUTPUT + 10_000) + b"\n", path="long.txt")
+    out = call(env, "file", repo="me/app", path="long.txt")
+    assert len(out) < MAX_OUTPUT + 500 and "clone or fetch" in out
+
+
+def test_a_missing_file(env, gh):
+    gh.replies[("GET", "repos/me/app/contents/nope.md?ref=v1")] = (404, "Not Found", {})
+    with pytest.raises(Refused, match="has no nope.md at v1") as e:
+        call(env, "file", repo="me/app", path="nope.md", ref="v1")
+    assert UNTRUSTED not in str(e.value)
+
+
+def test_file_without_contents_read(env, gh):
+    gh.replies[("GET", "repos/me/app/contents/x")] = (403, "Resource not accessible by personal access token", {})
+    with pytest.raises(Refused, match='"Contents"'):
+        call(env, "file", repo="me/app", path="x")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"path": "../other/x"},
+        {"path": "a/../../b"},
+        {"path": "./a"},
+        {"path": "/etc/passwd"},
+        {"path": "a//b"},
+        {"path": "a?ref=x"},
+        {"path": "a#b"},
+        {"path": "a\nb"},
+        {"path": None},
+        {"path": "a", "ref": "-x"},
+        {"path": "a", "ref": "a b"},
+        {"path": "a", "ref": ""},
+    ],
+)
+def test_file_refuses_bad_paths_and_refs(env, gh, kwargs):
+    with pytest.raises(Refused):
+        call(env, "file", repo="me/app", **kwargs)
+    assert requests(gh) == []
+
+
+def test_file_needs_read_access(env, gh):
+    with pytest.raises(Refused, match="allowlist"):
+        call(env, "file", repo="nobody/x", path="a")

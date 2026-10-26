@@ -443,6 +443,13 @@ class GitHub:
         path = "/".join(self._segment(part) for part in tag.split("/"))
         return self._request("GET", f"repos/{repo}/releases/tags/{path}", absent=(404,))
 
+    def contents(self, repo: str, path: str, ref: str | None) -> dict | list | None:
+        """A file's (or symlink's) contents entry, or a directory's entries; None when there is none.
+        `path` must already be checked: its segments are quoted but keep their dots."""
+        quoted = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/")) if path else ""
+        query = f"?ref={urllib.parse.quote(ref, safe='')}" if ref else ""
+        return self._request("GET", f"repos/{repo}/contents/{quoted}{query}", absent=(404,))
+
     def run(self, repo: str, run_id: int) -> dict:
         """A workflow run, which says among other things which branch it ran on (`head_branch`)."""
         return self._request("GET", f"repos/{repo}/actions/runs/{run_id}")

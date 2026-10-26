@@ -5,6 +5,8 @@ what GitHub sends through ci's cleaners: one printable line per field, and multi
 its escapes removed. The gate marks every reply as GitHub content.
 """
 
+import base64
+import binascii
 import re
 
 from git_gate import Refused
@@ -40,6 +42,8 @@ RELEASE_ACTIONS = {
     "view": (set(), {"tag"}, set()),
 }
 MAX_RELEASES = 30
+MAX_FILE = 1 << 20  # bytes of a file the file tool shows
+REF = re.compile(r"[^\s~^:?*\[\\-][^\s~^:?*\[\\]{0,254}")  # a branch, tag or SHA, as git allows them
 REVIEW_STATES = {
     "APPROVED": "approved",
     "CHANGES_REQUESTED": "requested changes",
@@ -314,6 +318,76 @@ def _size(value: object) -> str:
         if value < 1024 or unit == "GiB":
             return f"{value:.1f} {unit}"
     return ""
+
+
+# --- file ------------------------------------------------------------------------------------------
+
+
+def file(ctx: Context, repo: str, path: object, ref: object = None) -> str:
+    """One file's text, or a directory's entries, at `ref` or the default branch."""
+    ctx.rules.access(repo)
+    path = _repo_path(path, "path", empty=True)
+    if ref is not None and not (isinstance(ref, str) and REF.fullmatch(ref) and ref.isprintable()):
+        raise Refused(f"ref must be a branch, tag or commit SHA, not {_show(ref)}.")
+    where = f"{path or 'the root'} at {ref or 'the default branch'}"
+    found = needs(repo, "Contents", lambda: ctx.api.contents(repo, path, ref))
+    if found is None:
+        raise Refused(f"{repo} has no {path or 'root'} at {ref or 'the default branch'}.")
+    if isinstance(found, list):
+        lines = [f"{where} is a directory:"]
+        for e in found:
+            if not isinstance(e, dict):
+                continue
+            kind, name = e.get("type"), field(e.get("name"))
+            if kind == "dir":
+                lines.append(f"{name}/")
+            elif kind == "file":
+                lines.append(f"{name} ({_size(e.get('size'))})")
+            else:
+                lines.append(f"{name} ({field(kind)})")
+        return fit(lines, [], ctx.max_output)
+    kind = found.get("type")
+    if kind == "symlink":
+        return f"{where} is a symlink to {field(found.get('target'))}."
+    if kind == "submodule":
+        return f"{where} is a submodule: {field(found.get('submodule_git_url'))} at {field(found.get('sha'))}."
+    size = found.get("size")
+    if type(size) is int and size > MAX_FILE:
+        raise Refused(f"{path} is {_size(size)}; the file tool shows files up to {_size(MAX_FILE)}. Clone or fetch.")
+    try:
+        data = base64.b64decode(found.get("content") or "", validate=False)
+    except binascii.Error, ValueError:
+        raise Refused(f"GitHub sent {path} in a form the gate cannot read.") from None
+    if b"\0" in data:
+        raise Refused(f"{path} is binary ({_size(len(data))}); the file tool shows text only.")
+    try:
+        content = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused(f"{path} is binary ({_size(len(data))}): it is not UTF-8 text.") from None
+    head = f"{where} ({len(data)} bytes):"
+    shown = ctx.max_output - len(head) - 200
+    body = text(content)
+    if len(body) > shown:
+        cut = len(body) - shown
+        return f"{head}\n{body[:shown]}\n[... {cut} characters cut: clone or fetch the repo for the whole file.]"
+    return f"{head}\n{body}"
+
+
+def _repo_path(value: object, what: str, *, empty: bool = False) -> str:
+    """A path inside the repo: relative, "/"-separated, no "." or ".." or empty segment, printable,
+    and none of "?" or "#", which would end the URL's path."""
+    if not isinstance(value, str):
+        raise Refused(f"{what} must be a path inside the repo, not {_show(value)}.")
+    if value == "" and empty:
+        return value
+    parts = value.split("/")
+    bad = (
+        not value.isprintable() or len(value) > 4096 or any(c in value for c in "?#\\")
+        or any(p in ("", ".", "..") for p in parts)
+    )  # fmt: skip
+    if bad:
+        raise Refused(f"{what} must be a relative path inside the repo, such as docs/x.md, not {_show(value)}.")
+    return value
 
 
 # --- shared ----------------------------------------------------------------------------------------

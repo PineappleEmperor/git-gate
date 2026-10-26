@@ -253,6 +253,16 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         return await run("release", repo=repo, action=action, tag=tag, limit=limit)
 
     @server.tool()
+    async def file(repo: str, path: str, ref: str | None = None) -> str:
+        """One file's text from GitHub, at `ref` (a branch, tag or SHA) or the default branch.
+
+        `path` is relative to the repo root, such as docs/x.md; "" or a directory lists its entries.
+        Text files up to 1 MiB; a binary file is refused with its size. A long file is cut at the
+        gate's output limit: clone or fetch the repo for the whole of it.
+        """
+        return await run("file", repo=repo, path=path, ref=ref)
+
+    @server.tool()
     async def pr(
         repo: str,
         action: str,
