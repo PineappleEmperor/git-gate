@@ -1,8 +1,9 @@
 # git-gate
 
 An MCP server that gives sandboxed Claude Code agents GitHub access while the token stays outside
-the sandbox. Agents get `clone`, `fetch`, `push` and `prune`, a read-only `gh`, and typed writes
-(`pr`, `issue`, `triage`, `workflow_run`, `label`). Anything the gate will not do for an agent
+the sandbox. Agents get `clone`, `fetch`, `push` and `prune`, typed reads (`pr` and `issue` views
+and lists, `checks`, `run`, `runs`, `release`, `file`, `api_get`) and typed writes (`pr`, `issue`,
+`triage`, `workflow_run`, `label`). There is no `gh`. Anything the gate will not do for an agent
 becomes a handover the user runs with `gitgatepush <id>`.
 
 - Design: [docs/superpowers/specs/2026-10-25-gate-rework-design.md](docs/superpowers/specs/2026-10-25-gate-rework-design.md)
@@ -13,8 +14,8 @@ becomes a handover the user runs with `gitgatepush <id>`.
 
 ## What agents do
 
-Agents never run `git push`, `git fetch` against GitHub, `gh` writes or SSH. Files cross the sandbox
-boundary as bundles and body files:
+Agents never run `git push`, `git fetch` against GitHub, `gh` (reads included) or SSH. Files cross
+the sandbox boundary as bundles and body files:
 
 - Bundles end `.bundle`; body files end `.md` or `.txt`. No folder in the path may be dot-named
   except `.tmp`, so `<repo>/.tmp/` is the place for both.
@@ -30,6 +31,44 @@ When the gate refuses a push the user should make, the refusal says why and name
 `gitgatepush <id>`. The user runs it in their own terminal: it shows the repo, branch, commits and
 files under handover paths, asks, and pushes with the user's own git config and SSH key, hooks off.
 `gitgatepush` with no id lists open handovers. Handovers expire after 14 days.
+
+## Tools
+
+Every tool takes `repo` as owner/name, needs the session's access to it (read for reads, write for
+writes), counts once against the per-repo rate limit and writes one audit line. Every reply that
+carries GitHub's text begins with a line marking it as GitHub content, and that text is cleaned of
+escapes and control characters.
+
+- `clone`, `fetch`, `push`, `prune`: git, through bundles (above).
+- `pr`: read with `view`, `list` (state open, closed, merged or all; head, base, limit) and `diff`;
+  write with `create`, `edit`, `comment`, `review_comment`, `request_changes`, `close`, `reopen`,
+  `ready`.
+- `issue`: read with `view` (with the last 20 comments) and `list` (state, labels, limit); write with
+  `create`, `edit`, `comment`, `close`, `reopen`.
+- `checks(repo, ref, wait=False, timeout_minutes=20)`: whether CI passed on a pull request (`12` or
+  `"#12"`), branch or commit SHA. One line per check run and commit status (name, state,
+  conclusion, duration, Actions run id, URL), then a verdict: `All N passed`, `N failing: <names>`,
+  `N still running` or `No checks reported`. Neutral and skipped count as not failing.
+- `run(repo, run_id, wait=False, timeout_minutes=20)`: one Actions run, its jobs, the failed steps
+  of failed jobs and, for a failed run, the last 80 lines of each failed job's log (at most 10 jobs;
+  each log download capped at 2 MiB, read from its end), then a verdict.
+- `runs(repo, branch, workflow, status, limit)`: the newest Actions runs, one line each.
+- `release(repo, action, tag, limit)`: `list`, or `view` of a tag or the latest release. Assets are
+  listed, not downloaded.
+- `file(repo, path, ref)`: one text file (up to 1 MiB) or a directory listing, at a ref.
+- `api_get(repo, path, query)`: a GET of one endpoint under `repos/{owner}/{name}/`, JSON
+  pretty-printed. No other host, no `..`, no GraphQL, no jq.
+- `triage`, `label`, `workflow_run`: labels, assignees and reviewers; label definitions; rerun or
+  cancel a run off the default and protected branches.
+
+With `wait=true`, `checks` and `run` poll GitHub inside the one call: every 15 s, then 30 s, then
+every 60 s, until nothing is queued or in progress. A rate limit is waited out rather than failing:
+for GitHub's `Retry-After`, or until its quota resets, when that lies ahead, otherwise 60 s doubling
+to 5 minutes; no wait is shorter than 15 s. Before each poll after the first the gate checks again
+that it is switched on, that the session still has access, and that the token is unchanged, and
+refuses if not. After `timeout_minutes` (at most 20, well inside the 30 minutes after which Claude
+Code drops a silent stdio tool call) the call answers with the state so far and says it is still
+running. Merging stays the user's.
 
 ## Develop
 
@@ -70,7 +109,10 @@ it does not. The launchers refuse to run from anywhere but `/opt/git-gate/releas
 
 A new install applies to the next call in every open conversation: the registered server is a
 relay that hands each call to the current release. Conversations opened before the first
-relay release need one restart, to replace their old server.
+relay release need one restart, to replace their old server. The tool list is the one exception:
+a conversation keeps the tools of the release it started on, so **new tools appear only in
+conversations started after the install**. A conversation started before `gh` was retired still
+lists it; each call refuses and names the tool that replaces the command.
 
 ## Configure
 
@@ -196,6 +238,8 @@ call's line:
 - `access`: with session rules, the calling session's access to the call's repo: `write`, `read`,
   `none`, or `no-session` when the project folder is no session's. Null with v1 rules, and for a
   call refused before the rules were read.
+- `polls` and `waited_s`, only on `checks` and `run` lines that reached GitHub: how many times the call asked GitHub
+  for the state, and the seconds it slept between those polls.
 
 A `gitgatepush` line has `time`, `tool` (`gitgatepush`), `id`, `repo`, `branch`, `sha` and `outcome`
 (`pushed` or `failed`). Lines from older releases lack the newer fields.
