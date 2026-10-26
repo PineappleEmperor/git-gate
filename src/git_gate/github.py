@@ -19,6 +19,7 @@ PROTECTING_RULES = {
 
 
 MAX_MESSAGE = 500
+MAX_LOG = 2 << 20  # bytes of a job log the gate downloads
 
 
 class FromGitHub(Refused):
@@ -44,6 +45,9 @@ class RateLimited(GitHubError):
         if after is not None:
             return max(0.0, after)
         return _reset_wait(self.headers, now)
+
+
+_START = "the log is longer than {} MiB and its end could not be read; this is its start"
 
 
 def _header(headers, name: str) -> str | None:
@@ -81,12 +85,29 @@ def _plan_limit(message: str) -> bool:
     return "Upgrade to GitHub Pro" in message or "make this repository public" in message.lower()
 
 
+class Redirected(FromGitHub):
+    """GitHub redirected to another host, `url`, which the gate does not follow with the token."""
+
+    def __init__(self, text: str, url: str):
+        super().__init__(text)
+        self.url = url
+
+
 class _SameHostRedirects(urllib.request.HTTPRedirectHandler):
     """urllib keeps the Authorization header across redirects, so refuse any that change host."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
-            raise FromGitHub(f"GitHub redirected to another host ({newurl}); not following.")
+            raise Redirected(f"GitHub redirected to another host ({newurl}); not following.", newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class _HttpsRedirects(urllib.request.HTTPRedirectHandler):
+    """For downloads, which carry no token: follow redirects, but only to https."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            raise Refused("The log download redirected to an address that is not https; not following.")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -96,6 +117,7 @@ class GitHub:
         self.api = api.rstrip("/")
         self.timeout = timeout
         self._opener = urllib.request.build_opener(_SameHostRedirects)
+        self._downloads = urllib.request.build_opener(_HttpsRedirects)  # never sent the token
         self._reset: float | None = None  # x-ratelimit-reset of the last answer that spent the quota
 
     def rate_wait(self, now: float) -> float:
@@ -113,8 +135,10 @@ class GitHub:
         data: dict | None = None,
         absent: tuple[int, ...] = (),
         absent_if: Callable[[int, str], bool] | None = None,
+        raw: int | None = None,
     ):
         """JSON in and out. Statuses in `absent`, or an error `absent_if(status, message)` accepts, give None.
+        With `raw`, the answer is returned as bytes, at most `raw` + 1 of them, and not parsed.
 
         Every POST sends a JSON body, `{}` when there is nothing to say. A refusal names GitHub's
         error message, cleaned and cut to MAX_MESSAGE characters.
@@ -136,7 +160,7 @@ class GitHub:
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 self._saw(getattr(resp, "headers", None))
-                body = resp.read()
+                body = resp.read() if raw is None else resp.read(raw + 1)
         except urllib.error.HTTPError as e:
             self._saw(e.headers)
             message, detail = self._message(e)
@@ -151,6 +175,8 @@ class GitHub:
             raise Refused(f"GitHub {method} {path} returned {e.code}.") from None
         except urllib.error.URLError as e:
             raise Refused(f"GitHub {method} {path} failed: {e.reason}.") from None
+        if raw is not None:
+            return body
         return json.loads(body) if body else {}
 
     @staticmethod
@@ -312,6 +338,44 @@ class GitHub:
     def run(self, repo: str, run_id: int) -> dict:
         """A workflow run, which says among other things which branch it ran on (`head_branch`)."""
         return self._request("GET", f"repos/{repo}/actions/runs/{run_id}")
+
+    def job_log(self, repo: str, job_id: int, cap: int = MAX_LOG) -> tuple[bytes, str | None]:
+        """A job's log as bytes, at most `cap` of them, and a note when that is not the whole log.
+
+        GitHub answers with a redirect to a signed download address on another host. That address
+        is fetched without the token. A log longer than `cap` is fetched again from `cap` bytes
+        before its end, since its end is where a failure shows; a host that ignores the range
+        leaves only its start.
+        """
+        try:
+            data = self._request("GET", f"repos/{repo}/actions/jobs/{job_id}/logs", raw=cap)
+        except Redirected as e:
+            return self._download(e.url, cap)
+        return data[:cap], _START.format(cap >> 20) if len(data) > cap else None
+
+    def _download(self, url: str, cap: int) -> tuple[bytes, str | None]:
+        if urllib.parse.urlsplit(url).scheme != "https":
+            raise Refused("GitHub sent the log to an address that is not https; not following.")
+
+        def get(span: str | None = None):
+            headers = {"User-Agent": "git-gate", **({"Range": span} if span else {})}
+            return self._downloads.open(urllib.request.Request(url, headers=headers), timeout=self.timeout)
+
+        try:
+            with get() as resp:
+                size = _number(_header(resp.headers, "content-length"))
+                if size is None or size <= cap:
+                    data = resp.read(cap + 1)
+                    return data[:cap], _START.format(cap >> 20) if len(data) > cap else None
+            with get(f"bytes={int(size) - cap}-") as resp:
+                data = resp.read(cap)
+                if getattr(resp, "status", 200) == 206:
+                    return data, f"the log is {size / (1 << 20):.1f} MiB; the gate read its last {cap >> 20} MiB"
+                return data, _START.format(cap >> 20)
+        except urllib.error.HTTPError as e:
+            raise Refused(f"Downloading the log failed with status {e.code}.") from None
+        except OSError as e:
+            raise Refused(f"Downloading the log failed: {getattr(e, 'reason', None) or e}.") from None
 
     def run_action(self, repo: str, run_id: int, action: str) -> None:
         endpoints = {"rerun": "rerun", "rerun_failed": "rerun-failed-jobs", "cancel": "cancel"}
