@@ -286,8 +286,8 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         - list: optional state (open, closed, merged, all; default open), head (a branch, or
           owner:branch for a fork), base, limit (at most 100, default 30), search (text GitHub's
           search matches, at most 256 characters; the gate adds repo: and is:pr itself and refuses
-          repo:, org:, user:, owner:, is:public, is:private, OR, AND, NOT and parentheses; with
-          search, head is a plain branch). One line each.
+          repo:, org:, user:, owner:, is:public, is:private, OR, AND, NOT, parentheses, backslashes
+          and double quotes; with search, head is a plain branch). One line each.
         - diff: number. The unified diff, cut when longer than the gate shows.
         Writes, and what they take (anything else is refused):
         - create: title, head (a pushed branch); optional body_file, base (default branch), draft

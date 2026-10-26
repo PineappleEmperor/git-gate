@@ -779,11 +779,9 @@ def test_pr_search(env, gh):
 
 
 def test_pr_search_with_every_filter(env, gh):
-    path = searched('repo:me/app is:pr is:merged head:feat base:main "a b"', 5)
+    path = searched("repo:me/app is:pr is:merged head:feat base:main a b", 5)
     gh.replies[path] = {"items": [hit(4, pull=True, merged=True, state="closed")]}
-    out = call(
-        env, "pr", repo="me/app", action="list", search='"a b"', state="merged", head="feat", base="main", limit=5
-    )
+    out = call(env, "pr", repo="me/app", action="list", search="a b", state="merged", head="feat", base="main", limit=5)
     assert requests(gh) == [path]
     assert "#4 It breaks 4 [merged]" in out
 
@@ -888,3 +886,40 @@ def test_the_client_scopes_every_search_itself():
     assert [p for _, p, _ in client._opener.calls] == [searched("repo:me/app is:pr x", 3)[1]]
     with pytest.raises(Refused):
         client.search_issues("me/app", "discussion", "x", 3)
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        'bug\\" repo:x/y',
+        'bug" repo:x/y "',
+        "a OR b",
+        "a AND b",
+        "NOT a",
+        "fix repo:x/y",
+        "x org:github",
+        "is:public",
+        "status:done",
+        "a\\b",
+        "a(b)",
+    ],
+)
+def test_a_label_cannot_smuggle_a_qualifier_into_a_search(env, gh, label):
+    with pytest.raises(Refused) as e:
+        call(env, "issue", repo="me/app", action="list", search="crash", labels=[label])
+    assert requests(gh) == []
+    assert UNTRUSTED not in str(e.value)
+
+
+@pytest.mark.parametrize("text", ["a\\b", 'say "hi"', "fix\\", "a(b"])
+def test_search_text_refuses_backslashes_quotes_and_parentheses(env, gh, text):
+    with pytest.raises(Refused):
+        call(env, "issue", repo="me/app", action="list", search=text)
+    assert requests(gh) == []
+
+
+@pytest.mark.parametrize("label", ["good first issue", "help-wanted", "v1.2", "area/ci", "won't fix", "P1!"])
+def test_plain_labels_still_search(env, gh, label):
+    gh.replies[searched(f'repo:me/app is:issue is:open label:"{label}" crash')] = {"items": [hit(3)]}
+    out = call(env, "issue", repo="me/app", action="list", search="crash", labels=[label])
+    assert len(requests(gh)) == 1 and "#3 It breaks 3" in out

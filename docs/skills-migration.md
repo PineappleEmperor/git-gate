@@ -166,7 +166,8 @@ user's. Use `clone`, or `fetch` and a local checkout, where a skill ran `gh repo
 `gh pr checkout`. Searching across repos (`gh search issues|prs`) has no replacement. Search inside
 one repo is `list` with `search`: the gate adds `repo:` itself and refuses text holding `repo:`,
 `org:`, `user:`, `owner:`, `is:public` or `is:private` (GitHub ORs repeated `repo:` qualifiers), or
-`OR`, `AND`, `NOT` or parentheses.
+`OR`, `AND`, `NOT`, parentheses, backslashes or double quotes. Label names in a search get the same
+checks and may hold no `x:` word.
 
 ## Handovers
 

@@ -52,6 +52,7 @@ MAX_SEARCH = 256  # characters of an agent's search text
 # start, so quoted ("repo:x"), negated (-repo:x) and spaced (repo :x) forms are caught too.
 WIDENING = re.compile(r"(?i)(?<!\w)(?:(?:repo|org|user|owner)\s*:|is\s*:\s*[\"']?\s*(?:public|private)\b)")
 # Boolean operators and grouping would let text escape the qualifiers the gate puts before it.
+QUALIFIER = re.compile(r"\w+\s*:")  # any qualifier-shaped word, refused in a searched label name
 OPERATORS = re.compile(r"(?<!\w)(?:OR|AND|NOT)(?!\w)|[()]")
 MAX_QUERY = 20  # parameters an api_get query may hold
 REVIEW_STATES = {
@@ -267,8 +268,7 @@ def _issue_search(ctx: Context, repo: str, search, state=None, labels=None, limi
     text = _search_text(search)
     state = _choice(state or "open", "state", ISSUE_STATES)
     labels = _names(labels or [], "labels", MAX_LABEL)
-    if any('"' in name for name in labels):
-        raise Refused('labels: a label name with " cannot be searched for.')
+    labels = [_search_label(name) for name in labels]
     limit = _limit(limit, DEFAULT_LIST, MAX_LIST)
     terms = [*_state_terms(state), *(f'label:"{name}"' for name in labels), text]
     found, total = _search(ctx, repo, "issue", "Issues", terms, limit)
@@ -287,16 +287,32 @@ def _search_text(value: object) -> str:
         raise Refused(f"search must be text to look for, not {_show(value)}.")
     if not value.isprintable() or len(value) > MAX_SEARCH:
         raise Refused(f"search must be one line of at most {MAX_SEARCH} printable characters.")
+    _check_search_part(value, "search")
+    return value.strip()
+
+
+def _search_label(name: str) -> str:
+    """A label name as it goes into a search, inside label:"...": the search text's checks, and no
+    qualifier-shaped word at all, since the name sits among the gate's own qualifiers."""
+    _check_search_part(name, "labels")
+    if QUALIFIER.search(name):
+        raise Refused(f"labels: a label name searched for may not hold a qualifier such as x:, not {_show(name)}.")
+    return name
+
+
+def _check_search_part(value: str, what: str) -> None:
+    """Refuse what could widen a search or break out of its quoting: repo:, org:, user:, owner:,
+    is:public and is:private in any form, OR, AND, NOT, parentheses, backslashes and double quotes."""
     if WIDENING.search(value):
         raise Refused(
-            "search may not hold repo:, org:, user:, owner:, is:public or is:private, in any form: GitHub ORs "
+            f"{what} may not hold repo:, org:, user:, owner:, is:public or is:private, in any form: GitHub ORs "
             "repeated repo: qualifiers, so they would widen the search past this repo. The gate adds repo: itself."
         )
-    if OPERATORS.search(value):
+    if OPERATORS.search(value) or any(c in value for c in '\\"'):
         raise Refused(
-            "search may not hold OR, AND, NOT or parentheses: they could reach past the gate's own qualifiers."
+            f"{what} may not hold OR, AND, NOT, parentheses, backslashes or double quotes in a search: they could "
+            "reach past the gate's own qualifiers."
         )
-    return value.strip()
 
 
 def _state_terms(state: str) -> list[str]:

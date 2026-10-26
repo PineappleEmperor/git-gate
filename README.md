@@ -49,8 +49,10 @@ escapes and control characters.
 - `search` on `pr` and `issue` `list` runs GitHub's issue search, one page, with `repo:<repo>` and
   `is:pr` or `is:issue` put first by the gate. Text of at most 256 printable characters; refused if it
   holds a `repo:`, `org:`, `user:` or `owner:` qualifier or `is:public`/`is:private` in any form
-  (quoted, negated, spaced), since GitHub ORs repeated `repo:` qualifiers, or `OR`, `AND`, `NOT` or
-  parentheses. GitHub allows 30 searches a minute; a rate-limited search is refused, not retried.
+  (quoted, negated, spaced), since GitHub ORs repeated `repo:` qualifiers, or `OR`, `AND`, `NOT`,
+  parentheses, backslashes or double quotes. Label names in a search get the same checks and may hold
+  no `x:` word at all. GitHub allows 30 searches a minute; a rate-limited search is refused, not
+  retried.
 - `checks(repo, ref, wait=False, timeout_minutes=20)`: whether CI passed on a pull request (`12` or
   `"#12"`), branch or commit SHA. One line per check run and commit status (name, state,
   conclusion, duration, Actions run id, URL), then a verdict: `All N passed`, `N failing: <names>`,
