@@ -270,10 +270,17 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         number: int | None = None,
         title: str | None = None,
         body_file: str | None = None,
+        state: str | None = None,
+        labels: list[str] | None = None,
+        limit: int | None = None,
     ) -> str:
-        """Open or change an issue.
+        """Read, open or change issues.
 
-        action and what it takes (anything else is refused):
+        Reads (read access is enough):
+        - view: number. Title, state, author, labels, assignees, URL, body and the last 20 comments.
+        - list: optional state (open, closed, all; default open), labels (issues with all of them),
+          limit (at most 100, default 30). Pull requests are left out. One line each.
+        Writes, and what they take (anything else is refused):
         - create: title; optional body_file
         - edit: number, and at least one of title, body_file
         - comment: number, body_file
@@ -281,7 +288,10 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         body_file is the absolute path of a *.md or *.txt file you wrote, in a workspace and outside dot
         directories (except .tmp), e.g. <dir>/.tmp/body.md. Labels and assignees: use triage.
         """
-        return await run("issue", repo=repo, action=action, number=number, title=title, body_file=body_file)
+        return await run(
+            "issue", repo=repo, action=action, number=number, title=title, body_file=body_file, state=state,
+            labels=labels, limit=limit,
+        )  # fmt: skip
 
     @server.tool()
     async def triage(

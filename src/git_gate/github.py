@@ -382,6 +382,20 @@ class GitHub:
             "GET", f"repos/{repo}/pulls/{number}", absent=(404,), raw=cap, accept="application/vnd.github.diff"
         )
 
+    def issue(self, repo: str, number: int) -> dict | None:
+        """An issue (or pull request, which GitHub counts as issues too), or None when there is none."""
+        return self._request("GET", f"repos/{repo}/issues/{number}", absent=(404,))
+
+    def issue_comments(self, repo: str, number: int, page: int) -> list[dict]:
+        """One page of an issue's comments, oldest first, 100 to a page."""
+        return self._request("GET", f"repos/{repo}/issues/{number}/comments?per_page={PER_PAGE}&page={page}")
+
+    def issues(self, repo: str, state: str, page: int, labels: list[str]) -> list[dict]:
+        """One page of 100 issues, pull requests among them, most recently updated first."""
+        query = f"state={state}&sort=updated&direction=desc&per_page={PER_PAGE}&page={page}"
+        query += f"&labels={urllib.parse.quote(','.join(labels), safe='')}" if labels else ""
+        return self._request("GET", f"repos/{repo}/issues?{query}")
+
     def commit(self, repo: str, sha: str) -> dict | None:
         """A commit, or None when GitHub knows no commit by that (abbreviated) SHA."""
         return self._request("GET", f"repos/{repo}/commits/{self._segment(sha)}", absent=(404, 422))

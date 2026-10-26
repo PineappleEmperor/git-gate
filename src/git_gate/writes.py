@@ -242,10 +242,14 @@ def issue(
     number: int | None = None,
     title: str | None = None,
     body_file: str | None = None,
+    state: str | None = None,
+    labels: Sequence[str] | None = None,
+    limit: int | None = None,
+    reads: Sequence[str] = (),
 ) -> str:
     ctx.rules.require_write(repo)
-    given = _given(number=number, title=title, body_file=body_file)
-    _action("issue", action, ISSUE_ACTIONS, given)
+    given = _given(number=number, title=title, body_file=body_file, state=state, labels=labels, limit=limit)
+    _action("issue", action, ISSUE_ACTIONS, given, reads)
     n = _number(number, "number") if "number" in given else None
     if title is not None:
         _line(title, "title", MAX_TITLE)

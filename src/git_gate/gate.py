@@ -469,8 +469,14 @@ class Gate:
         number: int | None = None,
         title: str | None = None,
         body_file: str | None = None,
+        state: str | None = None,
+        labels: list[str] | None = None,
+        limit: int | None = None,
     ) -> str:
-        return writes.issue(self._writes(rules, token), repo, action, number, title, body_file)
+        fields = dict(number=number, title=title, body_file=body_file, state=state, labels=labels, limit=limit)
+        if isinstance(action, str) and action in reads.ISSUE_READS:
+            return reads.issue(self._ci(rules, token, repo), repo, action, **fields)
+        return writes.issue(self._writes(rules, token), repo, action, **fields, reads=tuple(reads.ISSUE_READS))
 
     @_untrusted
     def triage(

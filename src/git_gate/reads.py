@@ -9,7 +9,7 @@ import re
 
 from git_gate import Refused
 from git_gate.ci import Context, field, fit, listing, needs, number, text
-from git_gate.writes import _action, _given, _show
+from git_gate.writes import MAX_LABEL, _action, _given, _names, _show
 
 # action -> (required, optional, at least one of), as in writes
 PR_READS = {
@@ -22,6 +22,13 @@ LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 MAX_LIST = 100
 DEFAULT_LIST = 30
 MERGED_PAGES = 5  # pages of closed pull requests searched for merged ones
+ISSUE_READS = {
+    "view": ({"number"}, set(), set()),
+    "list": (set(), {"state", "labels", "limit"}, set()),
+}
+ISSUE_STATES = ("open", "closed", "all")
+COMMENTS = 20  # the latest comments an issue view shows
+ISSUE_PAGES = 3  # pages of 100 issues read to fill a list, pull requests left out
 REVIEW_STATES = {
     "APPROVED": "approved",
     "CHANGES_REQUESTED": "requested changes",
@@ -127,6 +134,82 @@ def _pr_state(p: dict) -> str:
     if p.get("merged_at"):
         return "merged"
     return field(p.get("state")) + (", draft" if p.get("draft") else "")
+
+
+# --- issue -----------------------------------------------------------------------------------------
+
+
+def issue(ctx: Context, repo: str, action: str, **kwargs) -> str:
+    """The read actions of the issue tool; its write actions are in writes."""
+    ctx.rules.access(repo)
+    given = _given(**kwargs)
+    _action("issue", action, ISSUE_READS, given)
+    if action == "list":
+        return _issue_list(ctx, repo, **{k: given.get(k) for k in ("state", "labels", "limit")})
+    return _issue_view(ctx, repo, number(kwargs["number"], "number"))
+
+
+def _issue_view(ctx: Context, repo: str, n: int) -> str:
+    api = ctx.api
+    found = needs(repo, "Issues", lambda: api.issue(repo, n))
+    if found is None:
+        raise Refused(f"{repo} has no issue #{n}.")
+    count = found.get("comments") if type(found.get("comments")) is int else 0
+    comments: list[dict] = []
+    page = max(1, -(-count // 100))  # the last page
+    while page >= 1 and len(comments) < COMMENTS and count:
+        got = needs(repo, "Issues", lambda page=page: api.issue_comments(repo, n, page))
+        comments = [c for c in got if isinstance(c, dict)] + comments if isinstance(got, list) else comments
+        page -= 1
+    comments = comments[-COMMENTS:]
+    assignees = [field(a.get("login")) for a in found.get("assignees") or [] if isinstance(a, dict)]
+    state = field(found.get("state"))
+    if found.get("state_reason") and found.get("state") == "closed":
+        state += f" ({field(found['state_reason'])})"
+    lines = [
+        f"Issue #{n} of {repo}: {field(found.get('title'))}",
+        f"State: {state}"
+        + (" (a pull request: pr view shows its branches and reviews)" if found.get("pull_request") else ""),
+        f"Author: {field((found.get('user') or {}).get('login'))}",
+        f"Labels: {_labels(found) or '-'}",
+        f"Assignees: {listing(assignees) or '-'}",
+        f"Opened: {field(found.get('created_at'))}, updated {field(found.get('updated_at'))}",
+        field(found.get("html_url")),
+        "Body:",
+        text(found.get("body") or "(empty)"),
+    ]
+    if count:
+        shown = f"last {len(comments)} of {count}" if len(comments) < count else f"{count} of {count}"
+        lines.append(f"Comments ({shown}):")
+        for c in comments:
+            who = field((c.get("user") or {}).get("login"))
+            lines += [f"{who} at {field(c.get('created_at'))}:", text(c.get("body") or "(empty)")]
+    return fit(lines, [], ctx.max_output)
+
+
+def _issue_list(ctx: Context, repo: str, state=None, labels=None, limit=None) -> str:
+    state = _choice(state or "open", "state", ISSUE_STATES)
+    labels = _names(labels or [], "labels", MAX_LABEL)
+    if any("," in name for name in labels):
+        raise Refused("labels: GitHub takes a comma-separated list, so a label name with a comma cannot be listed.")
+    limit = _limit(limit, DEFAULT_LIST, MAX_LIST)
+    found: list[dict] = []
+    for page in range(1, ISSUE_PAGES + 1):
+        got = needs(repo, "Issues", lambda page=page: ctx.api.issues(repo, state, page, labels))
+        got = [i for i in got if isinstance(i, dict)] if isinstance(got, list) else []
+        found += [i for i in got if "pull_request" not in i]
+        if len(found) >= limit or len(got) < MAX_LIST:
+            break
+    found = found[:limit]
+    if not found:
+        return f"No issues of {repo} match (state {state}{', labels ' + ', '.join(labels) if labels else ''})."
+    lines = [
+        f"#{field(i.get('number'))} {field(i.get('title'))} [{field(i.get('state'))}]"
+        + (f" labels: {_labels(i)}" if _labels(i) else "")
+        + f"; updated {field(i.get('updated_at'))}"
+        for i in found
+    ]
+    return fit([f"Issues of {repo} ({state}, most recently updated first):", *lines], [], ctx.max_output)
 
 
 # --- shared ----------------------------------------------------------------------------------------

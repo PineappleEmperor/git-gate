@@ -228,3 +228,133 @@ def test_pr_actions_refuse_what_they_do_not_take(env, gh, kwargs, extra):
 def test_pr_names_its_read_actions(env, gh):
     with pytest.raises(Refused, match="view, list, diff"):
         call(env, "pr", repo="me/app", action="show", number=12)
+
+
+# --- issue ----------------------------------------------------------------------------------------
+
+ISSUE = ("GET", "repos/me/app/issues/3")
+ISSUES = "repos/me/app/issues?state={}&sort=updated&direction=desc&per_page=100&page={}"
+
+
+def issue(number=3, comments=0, **extra):
+    return {
+        "number": number,
+        "title": f"It breaks {number}",
+        "state": "open",
+        "state_reason": None,
+        "user": {"login": "bob"},
+        "labels": [{"name": "bug"}],
+        "assignees": [{"login": "alice"}],
+        "comments": comments,
+        "created_at": "2026-10-20T09:00:00Z",
+        "updated_at": "2026-10-26T10:00:00Z",
+        "html_url": f"https://github.com/me/app/issues/{number}",
+        "body": "Steps:\r\n1. \x1b[1mrun\x1b[0m it",
+        **extra,
+    }
+
+
+def comment(i):
+    return {"user": {"login": f"u{i}"}, "created_at": f"2026-10-26T10:{i % 60:02d}:00Z", "body": f"comment {i}"}
+
+
+def test_issue_view(env, gh):
+    gh.replies[ISSUE] = issue(comments=2)
+    gh.replies[("GET", "repos/me/app/issues/3/comments?per_page=100&page=1")] = [comment(1), comment(2)]
+    out = call(env, "issue", repo="me/app", action="view", number=3)
+    assert requests(gh) == [ISSUE, ("GET", "repos/me/app/issues/3/comments?per_page=100&page=1")]
+    assert out.startswith(UNTRUSTED + "\n")
+    for part in (
+        "Issue #3 of me/app: It breaks 3",
+        "State: open",
+        "Author: bob",
+        "Labels: bug",
+        "Assignees: alice",
+        "https://github.com/me/app/issues/3",
+        "Steps:\n1. run it",
+        "Comments (2 of 2):",
+        "u1 at 2026-10-26T10:01:00Z:\ncomment 1",
+        "u2 at 2026-10-26T10:02:00Z:\ncomment 2",
+    ):
+        assert part in out, part
+
+
+def test_issue_view_shows_the_last_twenty_comments(env, gh):
+    gh.replies[ISSUE] = issue(comments=210)
+    page2 = ("GET", "repos/me/app/issues/3/comments?per_page=100&page=2")
+    page3 = ("GET", "repos/me/app/issues/3/comments?per_page=100&page=3")
+    gh.replies[page3] = [comment(i) for i in range(200, 210)]
+    gh.replies[page2] = [comment(i) for i in range(100, 200)]
+    out = call(env, "issue", repo="me/app", action="view", number=3)
+    assert requests(gh) == [ISSUE, page3, page2]
+    assert "Comments (last 20 of 210):" in out
+    assert "comment 190\n" in out and "comment 209" in out and "comment 189\n" not in out
+
+
+def test_issue_view_closed(env, gh):
+    gh.replies[ISSUE] = issue(state="closed", state_reason="not_planned")
+    assert "State: closed (not_planned)" in call(env, "issue", repo="me/app", action="view", number=3)
+
+
+def test_issue_view_missing(env, gh):
+    gh.replies[ISSUE] = (404, "Not Found", {})
+    with pytest.raises(Refused, match="has no issue #3"):
+        call(env, "issue", repo="me/app", action="view", number=3)
+
+
+def test_issue_view_without_the_permission(env, gh):
+    gh.replies[ISSUE] = (403, "Resource not accessible by personal access token", {})
+    with pytest.raises(Refused, match='"Issues"'):
+        call(env, "issue", repo="me/app", action="view", number=3)
+
+
+def test_issue_list_leaves_out_pull_requests(env, gh):
+    path = ("GET", ISSUES.format("open", 1))
+    gh.replies[path] = [issue(5), issue(4, pull_request={"url": "x"}), issue(3, labels=[])]
+    out = call(env, "issue", repo="me/app", action="list")
+    assert requests(gh) == [path]
+    lines = out.splitlines()
+    assert lines[1] == "Issues of me/app (open, most recently updated first):"
+    assert lines[2:] == [
+        "#5 It breaks 5 [open] labels: bug; updated 2026-10-26T10:00:00Z",
+        "#3 It breaks 3 [open]; updated 2026-10-26T10:00:00Z",
+    ]
+
+
+def test_issue_list_filters_and_limit(env, gh):
+    path = ("GET", ISSUES.format("all", 1) + "&labels=bug%2Cgood%20first%20issue")
+    gh.replies[path] = [issue(i) for i in range(10, 0, -1)]
+    out = call(env, "issue", repo="me/app", action="list", state="all", labels=["bug", "good first issue"], limit=3)
+    assert requests(gh) == [path]
+    assert len([line for line in out.splitlines() if line.startswith("#")]) == 3
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"state": "merged"}, {"limit": 101}, {"labels": "bug"}, {"labels": ["a,b"]}, {"labels": ["\x1b"]}, {"number": 3}],
+)
+def test_issue_list_refuses_bad_arguments(env, gh, kwargs):
+    with pytest.raises(Refused):
+        call(env, "issue", repo="me/app", action="list", **kwargs)
+    assert requests(gh) == []
+
+
+def test_issue_reads_need_only_read_access(env, gh):
+    gh.replies[("GET", "repos/other/lib/issues/3")] = issue()
+    call(env, "issue", repo="other/lib", action="view", number=3)
+    with pytest.raises(Refused, match="read-only"):
+        call(env, "issue", repo="other/lib", action="close", number=3)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "extra"),
+    [
+        ({"action": "view", "number": 3, "title": "T"}, "title"),
+        ({"action": "close", "number": 3, "state": "open"}, "state"),
+        ({"action": "create", "title": "T", "labels": ["bug"]}, "labels"),
+    ],
+)
+def test_issue_actions_refuse_what_they_do_not_take(env, gh, kwargs, extra):
+    with pytest.raises(Refused, match=f"does not take {extra}"):
+        call(env, "issue", repo="me/app", **kwargs)
+    assert requests(gh) == []
