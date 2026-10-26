@@ -56,10 +56,13 @@ escapes and control characters.
 - `checks(repo, ref, wait=False, timeout_minutes=20)`: whether CI passed on a pull request (`12` or
   `"#12"`), branch or commit SHA. One line per check run and commit status (name, state,
   conclusion, duration, Actions run id, URL), then a verdict: `All N passed`, `N failing: <names>`,
-  `N still running` or `No checks reported`. Neutral and skipped count as not failing.
+  `N still running` or `No checks reported`. Neutral and skipped count as not failing. A private
+  repo hides check runs and commit statuses from a token without the Checks and Commit statuses
+  permissions; then the commit's Actions runs stand in for the check runs, and the answer says so.
 - `run(repo, run_id, wait=False, timeout_minutes=20)`: one Actions run, its jobs, the failed steps
   of failed jobs and, for a failed run, the last 80 lines of each failed job's log (at most 10 jobs;
-  each log download capped at 2 MiB, read from its end), then a verdict.
+  each log download capped at 2 MiB, read from its end), cut to the failed step's own lines where
+  the log's timestamps allow, then a verdict.
 - `runs(repo, branch, workflow, status, limit)`: the newest Actions runs, one line each.
 - `release(repo, action, tag, limit)`: `list`, or `view` of a tag or the latest release. Assets are
   listed, not downloaded.

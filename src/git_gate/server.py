@@ -196,6 +196,8 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         conclusion, duration, the Actions run id when there is one, URL), then a verdict line: "All N
         passed", "N failing: <names>", "N still running" or "No checks reported". Neutral and skipped
         checks count as not failing. For a failing Actions check, pass its run id to the run tool.
+        Where GitHub refuses the check runs to the gate's token (a private repo, without the token's
+        Checks permission), the commit's Actions runs stand in for them, and the answer says so.
 
         With wait=true the gate itself polls (every 15 s, slowing to every 60 s, backing off when
         GitHub rate-limits) until nothing is queued or in progress, then answers once; after
