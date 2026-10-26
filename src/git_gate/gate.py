@@ -560,6 +560,12 @@ class Gate:
     ) -> str:
         return reads.runs(self._ci(rules, token, repo), repo, branch, workflow, status, limit)
 
+    @_untrusted
+    def release(
+        self, rules: Rules, token: str, repo: str, action: str, tag: str | None = None, limit: int | None = None
+    ) -> str:
+        return reads.release(self._ci(rules, token, repo), repo, action, tag, limit)
+
     # --- read-only gh -------------------------------------------------------------------
 
     @_untrusted

@@ -35,6 +35,11 @@ RUN_STATUSES = (
 )  # fmt: skip
 WORKFLOW = re.compile(r"\d+|[A-Za-z0-9_.-]+\.ya?ml")  # an id, or a file name under .github/workflows
 MAX_RUNS = 50
+RELEASE_ACTIONS = {
+    "list": (set(), {"limit"}, set()),
+    "view": (set(), {"tag"}, set()),
+}
+MAX_RELEASES = 30
 REVIEW_STATES = {
     "APPROVED": "approved",
     "CHANGES_REQUESTED": "requested changes",
@@ -248,6 +253,67 @@ def runs(
             f"{field(r.get('html_url'))}"
         )
     return fit([f"Workflow runs of {repo}, newest first:", *lines], [], ctx.max_output)
+
+
+# --- release ---------------------------------------------------------------------------------------
+
+
+def release(ctx: Context, repo: str, action: object, tag: object = None, limit: object = None) -> str:
+    """List releases, or show one: by tag, or the latest published one."""
+    ctx.rules.access(repo)
+    if action == "download":
+        raise Refused(
+            "release download is not supported: the gate does not fetch release assets. view lists each asset's "
+            "name and size; ask the user for a file you need."
+        )
+    _action("release", action, RELEASE_ACTIONS, _given(tag=tag, limit=limit))
+    if action == "list":
+        n = _limit(limit, 10, MAX_RELEASES)
+        found = needs(repo, "Contents", lambda: ctx.api.releases(repo, n))
+        found = [r for r in found if isinstance(r, dict)] if isinstance(found, list) else []
+        if not found:
+            return f"{repo} has no releases."
+        lines = [f"Releases of {repo}, newest first:"]
+        for r in found:
+            flags = [f for f in ("draft", "prerelease") if r.get(f)]
+            when = f"published {field(r['published_at'])}" if r.get("published_at") else "not published"
+            lines.append(
+                f"- {field(r.get('tag_name'))}: {field(r.get('name'))}" + (f" [{', '.join(flags)}]" if flags else "")
+                + f", {when}, {field(r.get('html_url'))}"
+            )  # fmt: skip
+        return fit(lines, [], ctx.max_output)
+    latest = tag is None or tag == "latest"
+    if not latest and not (isinstance(tag, str) and tag and tag.isprintable() and len(tag) <= 255):
+        raise Refused(f'tag must be a tag name or "latest", not {_show(tag)}.')
+    found = needs(repo, "Contents", lambda: ctx.api.release(repo, None if latest else tag))
+    if found is None:
+        raise Refused(f"{repo} has no published release." if latest else f"{repo} has no release with tag {tag}.")
+    flags = [f for f in ("draft", "prerelease") if found.get(f)]
+    assets = [
+        f"{field(a.get('name'))} ({_size(a.get('size'))})" for a in found.get("assets") or [] if isinstance(a, dict)
+    ]
+    lines = [
+        f"Release {field(found.get('name'))} of {repo} (tag {field(found.get('tag_name'))})"
+        + (f" [{', '.join(flags)}]" if flags else ""),
+        f"Published: {field(found.get('published_at'))} by {field((found.get('author') or {}).get('login'))}",
+        f"Assets: {listing(assets) or '-'}",
+        field(found.get("html_url")),
+        "Notes:",
+        text(found.get("body") or "(empty)"),
+    ]
+    return fit(lines, [], ctx.max_output)
+
+
+def _size(value: object) -> str:
+    if type(value) is not int or value < 0:
+        return "size unknown"
+    if value < 1024:
+        return f"{value} B"
+    for unit in ("KiB", "MiB", "GiB"):
+        value /= 1024
+        if value < 1024 or unit == "GiB":
+            return f"{value:.1f} {unit}"
+    return ""
 
 
 # --- shared ----------------------------------------------------------------------------------------

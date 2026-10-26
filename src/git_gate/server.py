@@ -241,6 +241,18 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         return await run("runs", repo=repo, branch=branch, workflow=workflow, status=status, limit=limit)
 
     @server.tool()
+    async def release(repo: str, action: str, tag: str | None = None, limit: int | None = None) -> str:
+        """Read releases: use this, not `gh release list` or `gh release view`.
+
+        - list: optional limit (at most 30, default 10). One line each: tag, name, draft or
+          prerelease, published time, URL.
+        - view: optional tag (default "latest", the latest published release). Name, tag, draft or
+          prerelease, published time and author, each asset's name and size, URL and notes.
+        Downloading assets is not supported. Creating and editing releases is the user's.
+        """
+        return await run("release", repo=repo, action=action, tag=tag, limit=limit)
+
+    @server.tool()
     async def pr(
         repo: str,
         action: str,

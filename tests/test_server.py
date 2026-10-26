@@ -19,20 +19,9 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 
 
 TOOLS = {
-    "clone",
-    "fetch",
-    "push",
-    "prune",
-    "gh",
-    "pr",
-    "issue",
-    "triage",
-    "workflow_run",
-    "label",
-    "checks",
-    "run",
-    "runs",
-}
+    "clone", "fetch", "push", "prune", "gh", "pr", "issue", "triage", "workflow_run", "label",
+    "checks", "run", "runs", "release",
+}  # fmt: skip
 
 
 def test_tools_registered(env):

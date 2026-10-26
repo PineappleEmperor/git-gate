@@ -431,6 +431,18 @@ class GitHub:
         query += f"&status={urllib.parse.quote(status, safe='')}" if status else ""
         return self._request("GET", f"{base}?{query}", absent=(404,) if workflow else ())
 
+    def releases(self, repo: str, per_page: int) -> list[dict]:
+        """The newest releases, drafts among them when the token may see drafts."""
+        return self._request("GET", f"repos/{repo}/releases?per_page={per_page}")
+
+    def release(self, repo: str, tag: str | None) -> dict | None:
+        """The release of tag `tag`, or the latest published one for None; None when there is none.
+        Each `/`-separated part of the tag is a segment of its own, as in tag_exists."""
+        if tag is None:
+            return self._request("GET", f"repos/{repo}/releases/latest", absent=(404,))
+        path = "/".join(self._segment(part) for part in tag.split("/"))
+        return self._request("GET", f"repos/{repo}/releases/tags/{path}", absent=(404,))
+
     def run(self, repo: str, run_id: int) -> dict:
         """A workflow run, which says among other things which branch it ran on (`head_branch`)."""
         return self._request("GET", f"repos/{repo}/actions/runs/{run_id}")

@@ -446,3 +446,96 @@ def test_runs_needs_read_access(env, gh):
     call(env, "runs", repo="other/lib")
     with pytest.raises(Refused, match="allowlist"):
         call(env, "runs", repo="nobody/x")
+
+
+# --- release --------------------------------------------------------------------------------------
+
+
+def rel(tag="v1.2.0", **extra):
+    return {
+        "tag_name": tag,
+        "name": f"Release {tag}",
+        "draft": False,
+        "prerelease": False,
+        "published_at": "2026-10-25T08:00:00Z",
+        "author": {"login": "alice"},
+        "html_url": f"https://github.com/me/app/releases/tag/{tag}",
+        "assets": [{"name": "app.zip", "size": 1536}, {"name": "app.tar.gz", "size": 3 << 20}],
+        "body": "## Changes\r\n- \x1b[32mfix\x1b[0m",
+        **extra,
+    }
+
+
+def test_release_list(env, gh):
+    path = ("GET", "repos/me/app/releases?per_page=10")
+    gh.replies[path] = [rel(), rel("v1.3.0-rc1", prerelease=True), rel("v2", draft=True, published_at=None)]
+    out = call(env, "release", repo="me/app", action="list")
+    assert requests(gh) == [path]
+    lines = out.splitlines()
+    assert lines[1] == "Releases of me/app, newest first:"
+    assert (
+        lines[2]
+        == "- v1.2.0: Release v1.2.0, published 2026-10-25T08:00:00Z, https://github.com/me/app/releases/tag/v1.2.0"
+    )
+    assert "[prerelease]" in lines[3] and "[draft]" in lines[4] and "not published" in lines[4]
+
+
+def test_release_list_limit(env, gh):
+    path = ("GET", "repos/me/app/releases?per_page=30")
+    gh.replies[path] = []
+    assert "has no releases" in call(env, "release", repo="me/app", action="list", limit=30)
+    assert requests(gh) == [path]
+
+
+@pytest.mark.parametrize(
+    ("tag", "path"),
+    [
+        (None, "repos/me/app/releases/latest"),
+        ("latest", "repos/me/app/releases/latest"),
+        ("v1.2.0", "repos/me/app/releases/tags/v1%2E2%2E0"),
+        ("release/v1", "repos/me/app/releases/tags/release/v1"),
+    ],
+)
+def test_release_view(env, gh, tag, path):
+    gh.replies[("GET", path)] = rel()
+    out = call(env, "release", repo="me/app", action="view", **({"tag": tag} if tag else {}))
+    assert requests(gh) == [("GET", path)]
+    for part in (
+        "Release v1.2.0 of me/app (tag v1.2.0)",
+        "Published: 2026-10-25T08:00:00Z by alice",
+        "Assets: app.zip (1.5 KiB), app.tar.gz (3.0 MiB)",
+        "## Changes\n- fix",
+    ):
+        assert part in out, part
+
+
+def test_release_view_missing(env, gh):
+    gh.replies[("GET", "repos/me/app/releases/tags/v9")] = (404, "Not Found", {})
+    with pytest.raises(Refused, match="has no release with tag v9"):
+        call(env, "release", repo="me/app", action="view", tag="v9")
+    gh.replies[("GET", "repos/me/app/releases/latest")] = (404, "Not Found", {})
+    with pytest.raises(Refused, match="has no published release"):
+        call(env, "release", repo="me/app", action="view")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"action": "download", "tag": "v1"},
+        {"action": "create", "tag": "v1"},
+        {"action": "list", "limit": 31},
+        {"action": "list", "tag": "v1"},
+        {"action": "view", "limit": 3},
+        {"action": "view", "tag": "a/../b"},
+        {"action": "view", "tag": ""},
+    ],
+)
+def test_release_refuses(env, gh, kwargs):
+    with pytest.raises(Refused):
+        call(env, "release", repo="me/app", **kwargs)
+    assert requests(gh) == []
+
+
+def test_release_download_says_it_is_not_supported(env, gh):
+    with pytest.raises(Refused, match="not supported"):
+        call(env, "release", repo="me/app", action="download", tag="v1")
