@@ -20,6 +20,8 @@ from git_gate.gitops import Git
 SHA = re.compile(r"[0-9a-fA-F]{7,40}")
 PULL_REF = re.compile(r"#(\d+)")
 ACTIONS_JOB = re.compile(r"/actions/runs/(\d+)/job/\d+")
+LOG_STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z ")  # GitHub's prefix on each log line
+STEP_ERROR = "##[error]"  # the line GitHub writes when a step fails
 PASSING = {"success", "neutral", "skipped"}  # conclusions that are not failing
 QUIET = {"neutral", "skipped"}
 MAX_FIELD = 200  # characters of one field GitHub sent
@@ -237,23 +239,46 @@ def _job_line(job: dict) -> str:
 
 
 def _log(ctx: Context, repo: str, job: dict) -> list[str]:
-    """The last LOG_LINES lines of a failed job's log, or why there are none."""
+    """The last LOG_LINES lines of a failed job's failed step, or of its whole log when the step's
+    part cannot be found, or why there are none."""
     name = field(job.get("name"))
     try:
         data, note = needs(repo, "Actions", lambda: ctx.api.job_log(repo, number(job.get("id"), "job id")))
     except Refused as e:
         return [f"The log of {name} is not available: {e}"]
-    tail = _log_lines(data)
-    head = f"Last {len(tail)} lines of the log of {name}" + (f" ({note})" if note else "") + ":"
-    return [head, *tail]
-
-
-def _log_lines(data: bytes) -> list[str]:
-    """The end of a log as printable lines (see `text`), each cut to MAX_LOG_LINE characters."""
     lines = text(data).split("\n")
     if lines and lines[-1] == "":
         lines.pop()
-    return [line if len(line) <= MAX_LOG_LINE else line[:MAX_LOG_LINE] + "..." for line in lines[-LOG_LINES:]]
+    step, part = _failed_step(job, lines)
+    tail = [line if len(line) <= MAX_LOG_LINE else line[:MAX_LOG_LINE] + "..." for line in part[-LOG_LINES:]]
+    where = f'the failed step "{step}" of {name}' if step else f"the log of {name}"
+    return [f"Last {len(tail)} lines of {where}" + (f" ({note})" if note else "") + ":", *tail]
+
+
+def _failed_step(job: dict, lines: list[str]) -> tuple[str | None, list[str]]:
+    """The first failed step's name and its part of the job's log, ending at its last error line.
+
+    Each log line starts with GitHub's timestamp and each step reports its start and end, to the
+    second; a line without a timestamp continues the one before. This leaves out the steps around
+    the failure, the job's cleanup above all. When the step or the timestamps are missing, or no
+    line falls in the step's time, the answer is (None, the whole log).
+    """
+    steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
+    step = next((s for s in steps if s.get("conclusion") not in (*PASSING, None)), None)
+    start, end = (step or {}).get("started_at"), (step or {}).get("completed_at")
+    if not (isinstance(start, str) and isinstance(end, str) and LOG_STAMP.fullmatch(start[:-1] + "Z ")):
+        return None, lines
+    start, end = start[:19], end[:19]
+    part, stamp = [], None
+    for line in lines:
+        if found := LOG_STAMP.match(line):
+            stamp = found.group(1)
+        if stamp is not None and start <= stamp <= end:
+            part.append(line)
+    if not part:
+        return None, lines
+    last_error = max((i for i, line in enumerate(part) if STEP_ERROR in line), default=None)
+    return field(step.get("name")), part if last_error is None else part[: last_error + 1]
 
 
 def _run_verdict(status: object, conclusion: object, jobs: list[dict], failing: list[dict]) -> str:

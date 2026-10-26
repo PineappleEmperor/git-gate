@@ -38,9 +38,13 @@ def workflow_run(status="completed", conclusion="success", **extra):
     }
 
 
-def job(job_id, name, status="completed", conclusion="success", failed_steps=()):
+def job(job_id, name, status="completed", conclusion="success", failed_steps=(), step_times=None):
+    """`step_times`, when given, is (start, end) of the failed step, as GitHub reports them."""
     steps = [{"name": "Set up job", "status": "completed", "conclusion": "success", "number": 1}]
     steps += [{"name": s, "status": "completed", "conclusion": "failure", "number": 2} for s in failed_steps]
+    if step_times:
+        for s in steps[1:]:
+            s["started_at"], s["completed_at"] = step_times
     return {
         "id": job_id,
         "name": name,
@@ -279,10 +283,11 @@ def test_a_rate_limit_fails_without_wait(env, gh):
 # --- run ------------------------------------------------------------------------------------------
 
 
-def failed(gh, *logs: bytes):
+def failed(gh, *logs: bytes, step_times=None):
     """Make run 5 fail in job 72 (test), whose log download answers with each of `logs` in turn."""
     gh.replies[RUN] = workflow_run(conclusion="failure")
-    gh.replies[JOBS] = {"jobs": [job(71, "build"), job(72, "test", conclusion="failure", failed_steps=["Run tests"])]}
+    bad = job(72, "test", conclusion="failure", failed_steps=["Run tests"], step_times=step_times)
+    gh.replies[JOBS] = {"jobs": [job(71, "build"), bad]}
     gh.replies[log_of(72)] = Redirected("redirected", BLOB.format(72))
     gh._downloads = FakeDownloads(*(FakeResponse(data, {"Content-Length": str(len(data))}) for data in logs))
 
@@ -309,6 +314,41 @@ def test_a_failed_run_shows_its_failed_steps_and_log_tail(env, gh):
     assert "- test: completed, failure, 2m; failed steps: Run tests" in out
     assert "line 120\n" in out and "line 199" in out and "line 119\n" not in out
     assert out.splitlines()[-1] == "Failed (failure): 1 of 2 jobs failed: test."
+
+
+STEP_LOG = (
+    b"2026-10-26T10:00:05.1000000Z set up the job\n"
+    b"2026-10-26T10:00:20.1000000Z ##[group]Run tests\n"
+    b"2026-10-26T10:00:21.2000000Z test_one FAILED\n"
+    b"    a continuation line\n"
+    b"2026-10-26T10:01:30.1000000Z ##[error]Process completed with exit code 1.\n"
+    b"2026-10-26T10:01:30.2000000Z Post job cleanup.\n"
+    b"2026-10-26T10:01:30.3000000Z [command]/usr/bin/git version\n"
+    b"2026-10-26T10:01:45.1000000Z Cleaning up orphan processes\n"
+)
+
+
+def test_a_failed_runs_log_is_cut_to_its_failed_step(env, gh):
+    failed(gh, STEP_LOG, step_times=("2026-10-26T10:00:20Z", "2026-10-26T10:01:30Z"))
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert 'Last 4 lines of the failed step "Run tests" of test:' in out
+    assert "test_one FAILED" in out and "a continuation line" in out and "exit code 1." in out
+    for noise in ("set up the job", "Post job cleanup", "/usr/bin/git version", "orphan processes"):
+        assert noise not in out
+
+
+def test_a_failed_step_without_an_error_line_shows_the_whole_step(env, gh):
+    log = STEP_LOG.replace(b"##[error]Process completed", b"Process completed")
+    failed(gh, log, step_times=("2026-10-26T10:00:20Z", "2026-10-26T10:01:30Z"))
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert 'Last 6 lines of the failed step "Run tests" of test:' in out
+    assert "test_one FAILED" in out and "set up the job" not in out and "orphan processes" not in out
+
+
+def test_a_failed_step_with_no_lines_in_its_time_falls_back_to_the_log_tail(env, gh):
+    failed(gh, STEP_LOG, step_times=("2026-10-26T11:00:00Z", "2026-10-26T11:00:05Z"))
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert "Last 8 lines of the log of test:" in out and "orphan processes" in out
 
 
 def test_a_log_is_cleaned(env, gh):
