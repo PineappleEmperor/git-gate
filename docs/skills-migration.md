@@ -107,16 +107,16 @@ Each read needs read access to the repo.
 |---|---|
 | `gh pr view N` | `pr(repo, "view", number=N)` |
 | `gh pr list [--state S] [--head H] [--base B] [-L N]` | `pr(repo, "list", state=S, head=H, base=B, limit=N)`; `state` is `open` (default), `closed`, `merged` or `all`; `limit` at most 100 |
-| `gh pr list --search "TEXT" [--state S] [-L N]` | `pr(repo, "list", search="TEXT", state=S, limit=N)` |
+| `gh pr list --search "TEXT" [--state S] [-L N]` | `pr(repo, "list", search="TEXT", state=S, limit=N)`; without `state` a search covers every state, so `is:merged` or `is:closed` in the text decides |
 | `gh pr diff N` | `pr(repo, "diff", number=N)` |
-| `gh pr checks N` | `checks(repo, N)`; `ref` may also be `"#N"`, a branch or a commit SHA |
+| `gh pr checks N` | `checks(repo, N)`; `ref` may also be `"#N"`, a branch or a commit SHA. On a private repo GitHub refuses check runs to the gate's fine-grained token (no such token can hold a Checks permission), so the commit's Actions runs stand in and the answer says so |
 | `gh pr checks N --watch` | `checks(repo, N, wait=true)` |
 | `gh run list [--branch B] [--workflow W] [--status S] [-L N]` | `runs(repo, branch=B, workflow=W, status=S, limit=N)`; `limit` at most 50 |
-| `gh run view ID` / `gh run view ID --log-failed` | `run(repo, ID)`: jobs, failed steps, and the last 80 lines of each failed job's log |
+| `gh run view ID` / `gh run view ID --log-failed` | `run(repo, ID)`: jobs, failed steps, and the last 80 lines of each failed job's failed step, from its own start to its error |
 | `gh run watch ID` | `run(repo, ID, wait=true)` |
 | `gh issue view N [--comments]` | `issue(repo, "view", number=N)`, with the last 20 comments |
 | `gh issue list [--state S] [--label L] [-L N]` | `issue(repo, "list", state=S, labels=[L], limit=N)` |
-| `gh issue list --search "TEXT" [--state S] [--label L] [-L N]` | `issue(repo, "list", search="TEXT", state=S, labels=[L], limit=N)` |
+| `gh issue list --search "TEXT" [--state S] [--label L] [-L N]` | `issue(repo, "list", search="TEXT", state=S, labels=[L], limit=N)`; without `state` a search covers every state |
 | `gh release list` | `release(repo, "list", limit=N)`; `limit` at most 30 |
 | `gh release view [TAG]` | `release(repo, "view", tag=TAG)`; no tag means the latest release |
 | `gh repo view` | `api_get(repo, "")` |
@@ -145,13 +145,16 @@ or `.txt` file under the rules above (never a literal string, never `--body`).
 | `gh pr close N` / `gh pr reopen N` / `gh pr ready N` | `pr(repo, "close" \| "reopen" \| "ready", number=N)` |
 | `gh pr review N --comment --body-file F` | `pr(repo, "review_comment", number=N, body_file=F)` |
 | `gh pr review N --request-changes --body-file F` | `pr(repo, "request_changes", number=N, body_file=F)` |
-| `gh issue create --title T --body-file F` | `issue(repo, "create", title=T, body_file=F)` |
-| `gh issue edit N --title T --body-file F` | `issue(repo, "edit", number=N, title=T, body_file=F)` |
-| `gh issue comment N --body-file F` | `issue(repo, "comment", number=N, body_file=F)` |
-| `gh issue close N` / `gh issue reopen N` | `issue(repo, "close" \| "reopen", number=N)` |
 | `--add-label`, `--remove-label`, `--add-assignee`, `--remove-assignee`, `--add-reviewer`, `--remove-reviewer` on `pr edit` or `issue edit` | `triage(repo, N, add_labels=[...], remove_labels=[...], add_assignees=[...], remove_assignees=[...], add_reviewers=[...], remove_reviewers=[...])` |
-| `gh run rerun ID` / `gh run rerun ID --failed` / `gh run cancel ID` | `workflow_run(repo, "rerun" \| "rerun_failed" \| "cancel", ID)` |
 | `gh label create` / `gh label edit` | `label(repo, "create" \| "edit", name, color=, description=, new_name=)` |
+
+Two kinds of write are the user's, not an agent's, so skills give agents no recipe for them:
+
+- **Issues.** Agents do not create, edit, comment on, close or reopen issues: open work and
+  decisions go in session memory. The gate's token reads issues only, so an `issue` write is
+  refused with GitHub's 403. Issue reads (`view`, `list`, search) work.
+- **Rerunning and cancelling workflow runs.** The token reads Actions only, so `workflow_run`
+  answers with GitHub's 403; the user reruns and cancels in the web UI.
 
 `pineapple-pages` `reference/commits.md` carries a workaround, `gh api -X PATCH .../pulls/{n} -F
 body=@file`, for a body edit. Delete it: the gate refuses it, and `pr(repo, "edit", number=N,
