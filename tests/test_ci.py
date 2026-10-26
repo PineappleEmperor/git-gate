@@ -329,10 +329,10 @@ def test_a_rate_limit_fails_without_wait(env, gh):
 # --- run ------------------------------------------------------------------------------------------
 
 
-def failed(gh, *logs: bytes, step_times=None):
+def failed(gh, *logs: bytes, step_times=None, step="Run tests"):
     """Make run 5 fail in job 72 (test), whose log download answers with each of `logs` in turn."""
     gh.replies[RUN] = workflow_run(conclusion="failure")
-    bad = job(72, "test", conclusion="failure", failed_steps=["Run tests"], step_times=step_times)
+    bad = job(72, "test", conclusion="failure", failed_steps=[step], step_times=step_times)
     gh.replies[JOBS] = {"jobs": [job(71, "build"), bad]}
     gh.replies[log_of(72)] = Redirected("redirected", BLOB.format(72))
     gh._downloads = FakeDownloads(*(FakeResponse(data, {"Content-Length": str(len(data))}) for data in logs))
@@ -389,6 +389,41 @@ def test_a_failed_step_without_an_error_line_shows_the_whole_step(env, gh):
     out = call(env, "run", repo="me/app", run_id=5)
     assert 'Last 6 lines of the failed step "Run tests" of test:' in out
     assert "test_one FAILED" in out and "set up the job" not in out and "orphan processes" not in out
+
+
+def test_a_failed_step_starts_at_its_own_group_line(env, gh):
+    """Step times are whole seconds, so the step before can end in the failed step's first second;
+    its lines are left out by starting at the failed step's own ##[group] line."""
+    log = (
+        b"2026-10-26T10:00:20.0100000Z 49 passed in 0.25s\n"
+        b"2026-10-26T10:00:20.0200000Z ##[endgroup]\n"
+        b"2026-10-26T10:00:20.1000000Z ##[group]Run tests\n"
+        b"2026-10-26T10:00:20.2000000Z ##[endgroup]\n"
+        b"2026-10-26T10:00:21.2000000Z FAIL: test_one\n"
+        b"2026-10-26T10:00:21.3000000Z ##[error]Process completed with exit code 1.\n"
+    )
+    failed(gh, log, step_times=("2026-10-26T10:00:20Z", "2026-10-26T10:00:21Z"))
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert 'Last 4 lines of the failed step "Run tests" of test:' in out
+    assert "FAIL: test_one" in out and "49 passed" not in out
+
+
+def test_a_named_step_starts_at_the_last_group_before_its_error(env, gh):
+    """A step with its own name logs "Run <action or command>", not its name; the last such
+    group before the error is where the failing part starts."""
+    log = (
+        b"2026-10-26T10:00:20.0100000Z 49 passed in 0.25s\n"
+        b"2026-10-26T10:00:20.1000000Z ##[group]Run j178/prek-action@v1\n"
+        b"2026-10-26T10:00:20.2000000Z ##[endgroup]\n"
+        b"2026-10-26T10:00:21.0000000Z ##[group]Run prek run --all-files\n"
+        b"2026-10-26T10:00:25.0000000Z files were modified by this hook\n"
+        b"2026-10-26T10:00:25.1000000Z ##[endgroup]\n"
+        b"2026-10-26T10:00:25.2000000Z ##[error]prek exited with code 1\n"
+    )
+    failed(gh, log, step_times=("2026-10-26T10:00:20Z", "2026-10-26T10:00:25Z"), step="Pre-commit hooks")
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert 'Last 4 lines of the failed step "Pre-commit hooks" of test:' in out
+    assert "files were modified" in out and "49 passed" not in out and "prek-action@v1" not in out
 
 
 def test_a_failed_step_with_no_lines_in_its_time_falls_back_to_the_log_tail(env, gh):

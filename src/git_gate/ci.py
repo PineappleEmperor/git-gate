@@ -22,6 +22,7 @@ PULL_REF = re.compile(r"#(\d+)")
 ACTIONS_JOB = re.compile(r"/actions/runs/(\d+)/job/\d+")
 LOG_STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z ")  # GitHub's prefix on each log line
 STEP_ERROR = "##[error]"  # the line GitHub writes when a step fails
+STEP_GROUP = "##[group]Run "  # the line a step's own output opens with
 PASSING = {"success", "neutral", "skipped"}  # conclusions that are not failing
 QUIET = {"neutral", "skipped"}
 MAX_FIELD = 200  # characters of one field GitHub sent
@@ -340,7 +341,27 @@ def _failed_step(job: dict, lines: list[str]) -> tuple[str | None, list[str]]:
     if not part:
         return None, lines
     last_error = max((i for i, line in enumerate(part) if STEP_ERROR in line), default=None)
-    return field(step.get("name")), part if last_error is None else part[: last_error + 1]
+    if last_error is not None:
+        part = part[: last_error + 1]
+    return field(step.get("name")), part[_step_start(part, step.get("name")) :]
+
+
+def _step_start(part: list[str], name: object) -> int:
+    """Where the failed step's own lines begin in its time window, which can open with the end of
+    the step before it, since step times are whole seconds: the "##[group]Run ..." line its name
+    gives (a run step is named "Run <command>"); else, for a step named apart from what it runs, the
+    last "##[group]Run" line; else the window's start."""
+
+    def body(line: str) -> str:
+        found = LOG_STAMP.match(line)
+        return line[found.end() :] if found else line
+
+    if isinstance(name, str):
+        for i, line in enumerate(part):
+            if body(line) == STEP_GROUP + name.removeprefix("Run "):
+                return i
+    starts = [i for i, line in enumerate(part) if body(line).startswith(STEP_GROUP)]
+    return starts[-1] if starts else 0
 
 
 def _run_verdict(status: object, conclusion: object, jobs: list[dict], failing: list[dict]) -> str:
