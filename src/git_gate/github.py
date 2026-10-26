@@ -25,6 +25,57 @@ class FromGitHub(Refused):
     """A refusal whose message carries text GitHub sent, which the agent must treat as data."""
 
 
+class GitHubError(FromGitHub):
+    """GitHub answered an error `status`; `headers` are the answer's, for callers that act on them."""
+
+    def __init__(self, text: str, status: int, headers):
+        super().__init__(text)
+        self.status = status
+        self.headers = headers
+
+
+class RateLimited(GitHubError):
+    """GitHub refused the call under its primary or secondary rate limit."""
+
+    def wait(self, now: float) -> float | None:
+        """Seconds GitHub asks the caller to wait: Retry-After, else until x-ratelimit-reset when the
+        quota is spent; None when it names neither."""
+        after = _number(_header(self.headers, "retry-after"))
+        if after is not None:
+            return max(0.0, after)
+        return _reset_wait(self.headers, now)
+
+
+def _header(headers, name: str) -> str | None:
+    """A header by its name in any case; `headers` is an HTTPMessage, a dict or None."""
+    for key, value in (headers or {}).items():
+        if key.lower() == name:
+            return value
+    return None
+
+
+def _number(text: str | None) -> float | None:
+    try:
+        return float(text) if text is not None else None
+    except ValueError:
+        return None
+
+
+def _reset_wait(headers, now: float) -> float | None:
+    """Seconds until x-ratelimit-reset when x-ratelimit-remaining is 0; None otherwise."""
+    if _header(headers, "x-ratelimit-remaining") != "0":
+        return None
+    reset = _number(_header(headers, "x-ratelimit-reset"))
+    return None if reset is None else max(0.0, reset - now)
+
+
+def _rate_limited(status: int, message: str, headers) -> bool:
+    """A 429, or a 403 whose message or spent quota says it is GitHub's primary or secondary rate limit."""
+    return status == 429 or (
+        status == 403 and ("rate limit" in message.lower() or _header(headers, "x-ratelimit-remaining") == "0")
+    )
+
+
 def _plan_limit(message: str) -> bool:
     """True when a 403 says the plan cannot use the feature, rather than that the call was blocked."""
     return "Upgrade to GitHub Pro" in message or "make this repository public" in message.lower()
@@ -45,6 +96,15 @@ class GitHub:
         self.api = api.rstrip("/")
         self.timeout = timeout
         self._opener = urllib.request.build_opener(_SameHostRedirects)
+        self._reset: float | None = None  # x-ratelimit-reset of the last answer that spent the quota
+
+    def rate_wait(self, now: float) -> float:
+        """Seconds until the quota resets when the last answer said it is spent; else 0."""
+        return max(0.0, self._reset - now) if self._reset is not None else 0.0
+
+    def _saw(self, headers) -> None:
+        spent = _header(headers, "x-ratelimit-remaining") == "0"
+        self._reset = _number(_header(headers, "x-ratelimit-reset")) if spent else None
 
     def _request(
         self,
@@ -75,14 +135,19 @@ class GitHub:
         )
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
+                self._saw(getattr(resp, "headers", None))
                 body = resp.read()
         except urllib.error.HTTPError as e:
+            self._saw(e.headers)
             message, detail = self._message(e)
             if e.code in absent or (absent_if and absent_if(e.code, message)):
                 return None
             said = self._clean("; ".join(m for m in (message, *detail) if m))
+            if _rate_limited(e.code, message, e.headers):
+                text = f"GitHub {method} {path} returned {e.code}" + (f": {said}" if said else ".")
+                raise RateLimited(text, e.code, e.headers) from None
             if said:
-                raise FromGitHub(f"GitHub {method} {path} returned {e.code}: {said}") from None
+                raise GitHubError(f"GitHub {method} {path} returned {e.code}: {said}", e.code, e.headers) from None
             raise Refused(f"GitHub {method} {path} returned {e.code}.") from None
         except urllib.error.URLError as e:
             raise Refused(f"GitHub {method} {path} failed: {e.reason}.") from None

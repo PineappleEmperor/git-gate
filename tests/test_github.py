@@ -4,9 +4,9 @@ import urllib.error
 
 import pytest
 
-from conftest import URL, FakeOpener
+from conftest import URL, FakeOpener, FakeResponse
 from git_gate import Refused
-from git_gate.github import FromGitHub, GitHub
+from git_gate.github import FromGitHub, GitHub, GitHubError, RateLimited
 
 
 def make(replies=None):
@@ -327,3 +327,71 @@ def test_tag_lookup_refuses_dot_segments(name):
     with pytest.raises(Refused, match="segment"):
         gh.tag_exists("me/app", name)
     assert gh._opener.calls == []
+
+
+# --- rate limits ---------------------------------------------------------------------------------
+
+RUN5 = ("GET", "repos/me/app/actions/runs/5")
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "headers", "wait"),
+    [
+        (
+            403,
+            "API rate limit exceeded for user ID 1.",
+            {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1100"},
+            100,
+        ),
+        (403, "You have exceeded a secondary rate limit. Please wait.", {"Retry-After": "30"}, 30),
+        (429, "You have exceeded a secondary rate limit.", {}, None),
+        (
+            403,
+            "API rate limit exceeded",
+            {"retry-after": "7", "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1100"},
+            7,
+        ),
+    ],
+)
+def test_rate_limit_is_its_own_refusal(status, message, headers, wait):
+    gh = make({RUN5: (status, message, headers)})
+    with pytest.raises(RateLimited) as e:
+        gh.run("me/app", 5)
+    assert isinstance(e.value, FromGitHub) and e.value.status == status
+    assert f"returned {status}: {message}" in str(e.value)
+    assert e.value.wait(now=1000.0) == wait
+
+
+def test_a_429_without_a_body_is_a_rate_limit():
+    gh = make({RUN5: 429})
+    with pytest.raises(RateLimited, match="429"):
+        gh.run("me/app", 5)
+
+
+@pytest.mark.parametrize(
+    ("message", "headers"),
+    [
+        ("Resource not accessible by personal access token", {}),
+        ("Resource protected by organization SAML enforcement.", {"x-ratelimit-remaining": "4000"}),
+    ],
+)
+def test_other_403s_are_not_rate_limits(message, headers):
+    gh = make({RUN5: (403, message, headers)})
+    with pytest.raises(GitHubError) as e:
+        gh.run("me/app", 5)
+    assert not isinstance(e.value, RateLimited)
+    assert e.value.status == 403 and isinstance(e.value, FromGitHub)
+
+
+def test_an_exhausted_quota_on_a_good_answer_is_remembered():
+    reply = FakeResponse(b'{"id": 5}', {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1200"})
+    gh = make({RUN5: reply})
+    assert gh.rate_wait(now=1000.0) == 0
+    gh.run("me/app", 5)
+    assert gh.rate_wait(now=1000.0) == 200
+    assert gh.rate_wait(now=1300.0) == 0
+    gh._opener.replies[RUN5] = FakeResponse(
+        b'{"id": 5}', {"X-RateLimit-Remaining": "4999", "X-RateLimit-Reset": "1200"}
+    )
+    gh.run("me/app", 5)
+    assert gh.rate_wait(now=1000.0) == 0

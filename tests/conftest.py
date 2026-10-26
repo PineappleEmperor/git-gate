@@ -154,11 +154,20 @@ URL = "https://github.com/me/app/pull/7"
 
 
 class FakeResponse(io.BytesIO):
+    def __init__(self, data: bytes = b"", headers: dict | None = None, status: int = 200):
+        super().__init__(data)
+        self.headers = headers or {}
+        self.status = status
+
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         return False
+
+
+class Turns(list):
+    """Replies FakeOpener gives in turn, one per request; the last one repeats."""
 
 
 class FakeOpener:
@@ -173,6 +182,13 @@ class FakeOpener:
         body = json.loads(req.data) if req.data else None
         self.calls.append((req.get_method(), path, body))
         reply = self.replies.get((req.get_method(), path), {"html_url": URL})
+        if isinstance(reply, Turns):
+            reply = reply.pop(0) if len(reply) > 1 else reply[0]
+        if isinstance(reply, BaseException):
+            raise reply
+        if isinstance(reply, FakeResponse):
+            reply.seek(0)
+            return reply
         if isinstance(reply, int):
             raise urllib.error.HTTPError(req.full_url, reply, "status", {}, None)
         if isinstance(reply, tuple):  # (status, message, headers): an error with a GitHub-style body
