@@ -1,5 +1,7 @@
 """The read-only CI tools: checks and run."""
 
+import json
+
 import pytest
 
 from conftest import TOKEN, FakeDownloads, FakeOpener, FakeResponse, Turns, call
@@ -566,3 +568,39 @@ def test_a_waiting_call_counts_once_against_the_rate_limit(env, gh, clock):
     call(env, "checks", repo="me/app", ref=12, wait=True)
     (stamps,) = [f.read_text().split() for f in (env.state / "rate").iterdir()]
     assert len(stamps) == 1
+
+
+# --- audit ----------------------------------------------------------------------------------------
+
+
+def last_audit(env) -> dict:
+    return json.loads((env.state / "audit.log").read_text().splitlines()[-1])
+
+
+def test_the_audit_line_counts_polls_and_waiting(env, gh, clock):
+    gh.replies[RUNS] = Turns([RUNNING, RUNNING, DONE])
+    call(env, "checks", repo="me/app", ref=12, wait=True)
+    line = last_audit(env)
+    assert (line["tool"], line["outcome"], line["polls"], line["waited_s"]) == ("checks", "ok", 3, 45)
+
+
+def test_a_call_without_wait_is_one_poll(env, gh, clock):
+    call(env, "run", repo="me/app", run_id=5)
+    line = last_audit(env)
+    assert (line["polls"], line["waited_s"]) == (1, 0)
+
+
+def test_a_refused_wait_still_records_its_polls(env, gh, clock):
+    gh.replies[PULL] = LIMITED
+    with pytest.raises(Refused):
+        call(env, "checks", repo="me/app", ref=12, wait=True, timeout_minutes=2)
+    line = last_audit(env)
+    assert (line["outcome"], line["polls"], line["waited_s"]) == ("refused", 3, 120)
+
+
+def test_other_tools_audit_no_polls(env, gh, clock):
+    with pytest.raises(Refused):
+        call(env, "checks", repo="me/app", ref=0)
+    assert "polls" not in last_audit(env)
+    call(env, "clone", repo="me/app", path=str(env.ws / "c"))
+    assert "polls" not in last_audit(env) and "waited_s" not in last_audit(env)

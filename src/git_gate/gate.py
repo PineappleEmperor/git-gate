@@ -16,6 +16,7 @@ import time
 import urllib.parse
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import NoReturn
 
@@ -50,6 +51,11 @@ MAX_ARG = 1000  # characters of one string argument kept in audit.log
 MAX_ARGS = 8 << 10  # characters of all the arguments, as JSON, kept in audit.log
 # (entries kept, characters kept of each string in them) for list arguments, tried in turn until all fit
 LIST_STEPS = ((20, MAX_ARG), (20, 100), (5, 100), (0, 0))
+
+
+# Fields a tool adds to its own audit line (the CI tools' polls and waited_s). Per call and per
+# thread: the fallback server runs calls in worker threads of one process.
+_AUDIT_EXTRA: ContextVar[dict] = ContextVar("audit_extra")
 
 
 class InternalError(Exception):
@@ -125,6 +131,8 @@ class Gate:
         access = None  # the session's access to the repo, for audit.log
         outcome = "ok"
         message = None  # what the agent is told when the outcome is not ok, scrubbed
+        extra: dict = {}
+        reset = _AUDIT_EXTRA.set(extra)
         try:
             check_enabled(self.config)
             self._rate_limit(kwargs.get("repo"))
@@ -153,23 +161,25 @@ class Gate:
             message = utf8_safe(_scrub(f"{type(e).__name__}: {e}", token))
             raise InternalError(message) from e
         finally:
+            _AUDIT_EXTRA.reset(reset)
             ms = int((time.monotonic() - started) * 1000)
-            self._audit(tool, kwargs, outcome, token, message, ms, cwd, access)
+            self._audit(tool, kwargs, outcome, token, message, ms, cwd, access, extra)
 
     def _audit(
         self, tool: str, kwargs: dict, outcome: str, token: str | None, message: str | None, ms: int,
-        cwd: str | None, access: str | None,
+        cwd: str | None, access: str | None, extra: dict | None = None,
     ) -> None:  # fmt: skip
         """One line per call. `reason` is the first line of what the agent was told, without the
         untrusted-content marker a refusal carrying GitHub's text starts with. `access` is the
         calling session's access to the repo under v2 rules ("write", "read", "none", or
-        "no-session" when the folder is no session's), and null under v1 or before rules are read."""
+        "no-session" when the folder is no session's), and null under v1 or before rules are read.
+        `extra` holds the fields the tool added, after the common ones."""
         reason = message.strip().partition("\n")[0][:MAX_REASON] if message is not None else None
         try:
             line = json.dumps({
                 "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "args": _logged_args(kwargs, token),
                 "outcome": outcome, "reason": reason, "ms": ms, "session": _session(), "cwd": cwd,
-                "access": access,
+                "access": access, **(extra or {}),
             })  # fmt: skip
             audit(self.state, _scrub(line, token))
         except Exception as e:
@@ -496,7 +506,9 @@ class Gate:
     # --- CI status (the reading lives in ci.py) -----------------------------------------
 
     def _ci(self, rules: Rules, token: str) -> ci.Context:
-        return ci.Context(rules, self.github(token), self.git, MAX_OUTPUT, self.sleep, self.monotonic, self.clock)
+        return ci.Context(
+            rules, self.github(token), self.git, MAX_OUTPUT, self.sleep, self.monotonic, self.clock, _note_polls
+        )
 
     @_untrusted
     def checks(
@@ -575,6 +587,13 @@ class Gate:
             "BROWSER": "false",
             "NO_COLOR": "1",
         }
+
+
+def _note_polls(polls: int, waited: float) -> None:
+    """A CI tool's GitHub polls and seconds slept between them, for its audit line."""
+    extra = _AUDIT_EXTRA.get(None)
+    if extra is not None:
+        extra.update(polls=polls, waited_s=round(waited))
 
 
 def _gh_config(work: Path, token: str) -> Path:

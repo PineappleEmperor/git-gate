@@ -46,6 +46,7 @@ class Context:
     sleep: Callable[[float], None] = time.sleep
     monotonic: Callable[[], float] = time.monotonic  # for the wait's deadline
     clock: Callable[[], float] = time.time  # for GitHub's x-ratelimit-reset, a Unix time
+    report: Callable[[int, float], None] = lambda polls, waited: None  # for audit.log, once per call
 
 
 @dataclass(frozen=True)
@@ -301,25 +302,31 @@ def _poll[T](
     interval, backoff = FIRST_INTERVAL, FIRST_BACKOFF
     state: list[T] = []  # the last state fetched, once there is one
     limited: RateLimited | None = None
-    while True:
-        try:
-            state[:] = [fetch()]
-            limited = None
-            if not wait or not running(state[0]):
-                return state[0], []
-            delay = max(interval, ctx.api.rate_wait(ctx.clock()))
-            interval = min(interval * 2, MAX_INTERVAL)
-        except RateLimited as e:
-            if not wait:
-                raise
-            limited = e
-            delay = e.wait(ctx.clock())
-            if delay is None:
-                delay, backoff = backoff, min(backoff * 2, MAX_BACKOFF)
-        left = deadline - ctx.monotonic()
-        if left <= 0:
-            break
-        ctx.sleep(min(delay, left))
+    polls, waited = 0, 0.0
+    try:
+        while True:
+            polls += 1
+            try:
+                state[:] = [fetch()]
+                limited = None
+                if not wait or not running(state[0]):
+                    return state[0], []
+                delay = max(interval, ctx.api.rate_wait(ctx.clock()))
+                interval = min(interval * 2, MAX_INTERVAL)
+            except RateLimited as e:
+                if not wait:
+                    raise
+                limited = e
+                delay = e.wait(ctx.clock())
+                if delay is None:
+                    delay, backoff = backoff, min(backoff * 2, MAX_BACKOFF)
+            left = deadline - ctx.monotonic()
+            if left <= 0:
+                break
+            ctx.sleep(min(delay, left))
+            waited += min(delay, left)
+    finally:
+        ctx.report(polls, waited)
     span = _minutes(minutes) + (f" (timeout_minutes is capped at {MAX_WAIT_MINUTES})" if capped else "")
     if not state:
         raise FromGitHub(f"GitHub rate-limited every request for {span}, so the gate has no answer: {limited}")
