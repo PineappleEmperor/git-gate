@@ -37,10 +37,11 @@ the gate steps below are added beside the plain `git`/`gh` steps, never in place
 - **CI credentials are a separate matter.** `RELEASE_TOKEN`, the one secret a repository's workflows
   run with, is not the agent's credential; this migration does not change it. (A GitHub App pair
   cannot stand in for it: release-flow's opener mints no token.)
-- **A read the gate refuses as off the allowlist** is the user's to grant, as a `read` entry in
-  `rules.toml`; agents do not route around it with `curl` or a web fetch.
-- **A refusal saying the session has no access to a repo** is the user's to grant with
-  `gitgaterules`, never routed around.
+- **A refusal saying the session has no access to a repo** ("This session (<folder>) has no access
+  to <repo>", for a read or a write) is the user's to grant with
+  `gitgaterules grant <folder> read|write <repo>`; agents never route around it with `curl`, a web
+  fetch or another session. (Only a gate still on the old, unscoped rules file words it as "not on
+  the git-gate repo allowlist"; the same rule applies.)
 
 ## Bundles and body files
 
