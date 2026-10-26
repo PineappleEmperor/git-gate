@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import NoReturn
 
-from git_gate import Refused, ghpolicy, writes
+from git_gate import Refused, ci, ghpolicy, writes
 from git_gate.call import TOOLS, audit, log_error
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import FromGitHub, GitHub
@@ -488,6 +488,15 @@ class Gate:
         new_name: str | None = None,
     ) -> str:
         return writes.label(self._writes(rules, token), repo, action, name, color, description, new_name)
+
+    # --- CI status (the reading lives in ci.py) -----------------------------------------
+
+    def _ci(self, rules: Rules, token: str) -> ci.Context:
+        return ci.Context(rules, self.github(token), self.git, MAX_OUTPUT)
+
+    @_untrusted
+    def checks(self, rules: Rules, token: str, repo: str, ref: int | str) -> str:
+        return ci.checks(self._ci(rules, token), repo, ref)
 
     # --- read-only gh -------------------------------------------------------------------
 

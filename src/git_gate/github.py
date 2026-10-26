@@ -20,6 +20,8 @@ PROTECTING_RULES = {
 
 MAX_MESSAGE = 500
 MAX_LOG = 2 << 20  # bytes of a job log the gate downloads
+PER_PAGE = 100
+MAX_PAGES = 10  # pages of one list the gate reads: at most PER_PAGE * MAX_PAGES entries
 
 
 class FromGitHub(Refused):
@@ -334,6 +336,37 @@ class GitHub:
         means "no tag"; any other failure raises."""
         path = "/".join(self._segment(part) for part in name.split("/"))
         return self._request("GET", f"repos/{repo}/git/ref/tags/{path}", absent=(404,)) is not None
+
+    def _pages(self, path: str, key: str) -> list:
+        """The `key` list of a paged answer such as {"total_count": n, key: [...]}, page by page,
+        at most MAX_PAGES of them."""
+        items: list = []
+        sep = "&" if "?" in path else "?"
+        for page in range(1, MAX_PAGES + 1):
+            data = self._request("GET", f"{path}{sep}per_page={PER_PAGE}&page={page}")
+            data = data if isinstance(data, dict) else {}
+            got = data.get(key) if isinstance(data.get(key), list) else []
+            items += got
+            total = data.get("total_count")
+            if len(got) < PER_PAGE or (isinstance(total, int) and len(items) >= total):
+                break
+        return items
+
+    def pull(self, repo: str, number: int) -> dict | None:
+        """A pull request, or None when `repo` has none numbered `number`."""
+        return self._request("GET", f"repos/{repo}/pulls/{number}", absent=(404,))
+
+    def commit(self, repo: str, sha: str) -> dict | None:
+        """A commit, or None when GitHub knows no commit by that (abbreviated) SHA."""
+        return self._request("GET", f"repos/{repo}/commits/{self._segment(sha)}", absent=(404, 422))
+
+    def check_runs(self, repo: str, sha: str) -> list[dict]:
+        """Every check run of commit `sha`, the latest of each name."""
+        return self._pages(f"repos/{repo}/commits/{self._segment(sha)}/check-runs?filter=latest", "check_runs")
+
+    def statuses(self, repo: str, sha: str) -> list[dict]:
+        """The latest commit status of each context on commit `sha`."""
+        return self._pages(f"repos/{repo}/commits/{self._segment(sha)}/status", "statuses")
 
     def run(self, repo: str, run_id: int) -> dict:
         """A workflow run, which says among other things which branch it ran on (`head_branch`)."""

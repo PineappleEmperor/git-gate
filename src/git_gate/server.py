@@ -197,6 +197,19 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         return await run("gh", repo=repo, args=args)
 
     @server.tool()
+    async def checks(repo: str, ref: int | str) -> str:
+        """Whether CI passed on a pull request, branch or commit: use this, not `gh pr checks`.
+
+        `ref` is a pull request number (12 or "#12"), a branch name, or a commit SHA (7 to 40 hex
+        digits). Returns the commit SHA, then one line per check run and commit status (name, state,
+        conclusion, duration, the Actions run id when there is one, URL), then a verdict line: "All N
+        passed", "N failing: <names>", "N still running" or "No checks reported". Neutral and skipped
+        checks count as not failing. For a failing Actions check, pass its run id to the run tool.
+        Merging stays the user's.
+        """
+        return await run("checks", repo=repo, ref=ref)
+
+    @server.tool()
     async def pr(
         repo: str,
         action: str,
