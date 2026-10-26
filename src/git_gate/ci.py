@@ -75,21 +75,82 @@ def checks(ctx: Context, repo: str, ref: object, wait: object = False, timeout_m
     ref = _ref(ref)
     minutes, capped = _wait_args(wait, timeout_minutes)
     resolved: list[tuple[str, str]] = []
+    refused: list[str] = []  # what GitHub would not show the token, as notes
 
     def poll() -> list[Check]:
         if not resolved:
             resolved.append(_resolve(ctx, repo, ref))
         sha = resolved[0][1]
-        runs = needs(repo, "Checks", lambda: ctx.api.check_runs(repo, sha))
-        statuses = needs(repo, "Commit statuses", lambda: ctx.api.statuses(repo, sha))
-        return [_check_run(r) for r in runs if isinstance(r, dict)] + [
-            _status(s) for s in statuses if isinstance(s, dict)
-        ]
+        runs = needs(repo, "Checks", lambda: _unless_refused(lambda: ctx.api.check_runs(repo, sha)))
+        statuses = needs(repo, "Commit statuses", lambda: _unless_refused(lambda: ctx.api.statuses(repo, sha)))
+        refused.clear()
+        found = []
+        if runs is None:
+            actions = needs(repo, "Actions", lambda: ctx.api.commit_runs(repo, sha))
+            found += [_actions_run(r) for r in _latest_per_workflow(actions)]
+            refused.append(REFUSED_CHECKS)
+        else:
+            found += [_check_run(r) for r in runs if isinstance(r, dict)]
+        if statuses is None:
+            refused.append(REFUSED_STATUSES)
+        else:
+            found += [_status(s) for s in statuses if isinstance(s, dict)]
+        return found
 
     found, note = _poll(ctx, poll, lambda found: any(c.running for c in found), wait, minutes, capped)
     where, sha = resolved[0]
     head = [f"Checks of {repo} {where} at {field(sha)}:"]
-    return fit(head + [c.line for c in found], [_verdict(found), *note], ctx.max_output)
+    return fit(head + [c.line for c in found] + refused, [_verdict(found), *note], ctx.max_output)
+
+
+# A private repo hides these from a token without the permission; a public one shows them to anyone.
+REFUSED_CHECKS = (
+    "GitHub refuses this commit's check runs to the gate's token (it lacks the \"Checks\" permission, "
+    "read), so these are the commit's Actions runs instead."
+)
+REFUSED_STATUSES = (
+    "GitHub refuses this commit's commit statuses to the gate's token (it lacks the \"Commit statuses\" "
+    "permission, read), so any are left out."
+)
+
+
+def _unless_refused(read: Callable):
+    """`read()`, or None when GitHub refuses it to the token with a 403 that is not a rate limit."""
+    try:
+        return read()
+    except RateLimited:
+        raise
+    except GitHubError as e:
+        if e.status == 403:
+            return None
+        raise
+
+
+def _latest_per_workflow(runs: list[dict]) -> list[dict]:
+    """The newest run of each workflow; GitHub lists a commit's runs newest first."""
+    seen, latest = set(), []
+    for run in runs:
+        key = run.get("workflow_id") or run.get("name")
+        if key not in seen:
+            seen.add(key)
+            latest.append(run)
+    return latest
+
+
+def _actions_run(run: dict) -> Check:
+    status, conclusion = run.get("status"), run.get("conclusion")
+    running = status != "completed"
+    parts = [field(status), *([] if running else [field(conclusion)]), f"run {field(run.get('id'))}"]
+    if run.get("html_url"):
+        parts.append(field(run["html_url"]))
+    name = field(run.get("name"))
+    return Check(
+        name,
+        running,
+        not running and conclusion not in PASSING,
+        not running and conclusion in QUIET,
+        f"- {name} (Actions run): {', '.join(parts)}",
+    )
 
 
 def _ref(ref: object) -> int | str:

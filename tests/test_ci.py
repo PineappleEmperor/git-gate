@@ -246,9 +246,7 @@ def test_a_number_named_like_a_branch_hints_at_pull_requests(env, gh):
 @pytest.mark.parametrize(
     ("reply", "code", "permission"),
     [
-        (RUNS, 403, '"Checks"'),
         (RUNS, 404, '"Checks"'),
-        (STATUS, 403, '"Commit statuses"'),
         (STATUS, 404, '"Commit statuses"'),
         (PULL, 403, '"Pull requests"'),
         (BRANCH, 403, '"Contents"'),
@@ -262,6 +260,54 @@ def test_a_token_without_access_names_the_permission(env, gh, reply, code, permi
     text = str(e.value)
     assert text.startswith(UNTRUSTED) and "Resource not accessible" in text
     assert permission in text and "read" in text
+
+
+COMMIT_RUNS = ("GET", f"repos/me/app/actions/runs?head_sha={SHA}&per_page=100")
+NO_ACCESS = (403, "Resource not accessible by personal access token", {})
+
+
+def test_checks_refused_to_the_token_fall_back_to_the_commits_actions_runs(env, gh):
+    """A private repo hides check runs and statuses from a token without those permissions; its
+    Actions runs, which "Actions" read covers, still say whether CI passed."""
+    gh.replies[RUNS] = NO_ACCESS
+    gh.replies[STATUS] = NO_ACCESS
+    gh.replies[COMMIT_RUNS] = {
+        "total_count": 3,
+        "workflow_runs": [
+            workflow_run(id=9, name="Checks", workflow_id=1, conclusion="failure"),
+            workflow_run(id=8, name="Lint", workflow_id=2),
+            workflow_run(id=7, name="Checks", workflow_id=1),  # an older run of the same workflow
+        ],
+    }
+    out = call(env, "checks", repo="me/app", ref=12)
+    assert out.startswith(UNTRUSTED + "\n")
+    assert "- Checks (Actions run): completed, failure, run 9" in out
+    assert "- Lint (Actions run): completed, success, run 8" in out and "run 7" not in out
+    assert '"Checks"' in out and '"Commit statuses"' in out and "Actions runs" in out
+    assert out.splitlines()[-1] == "1 failing: Checks."
+
+
+def test_a_refused_status_alone_is_noted_and_the_check_runs_still_count(env, gh):
+    gh.replies[STATUS] = NO_ACCESS
+    out = call(env, "checks", repo="me/app", ref=12)
+    assert "- build: completed, success" in out and '"Commit statuses"' in out
+    assert COMMIT_RUNS not in requests(gh)
+    assert out.splitlines()[-1] == "All 1 passed."
+
+
+def test_the_fallback_runs_are_waited_on_like_checks(env, gh, clock):
+    gh.replies[RUNS] = NO_ACCESS
+    gh.replies[COMMIT_RUNS] = Turns(
+        [
+            {
+                "total_count": 1,
+                "workflow_runs": [workflow_run(id=9, name="Checks", status="in_progress", conclusion=None)],
+            },
+            {"total_count": 1, "workflow_runs": [workflow_run(id=9, name="Checks")]},
+        ]
+    )
+    out = call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert out.splitlines()[-1] == "All 1 passed."
 
 
 def test_checks_needs_read_access(env, gh):

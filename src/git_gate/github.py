@@ -419,6 +419,11 @@ class GitHub:
         """The latest commit status of each context on commit `sha`."""
         return self._pages(f"repos/{repo}/commits/{self._segment(sha)}/status", "statuses")
 
+    def commit_runs(self, repo: str, sha: str) -> list[dict]:
+        """The workflow runs of commit `sha`, newest first: one page of up to 100."""
+        data = self._request("GET", f"repos/{repo}/actions/runs?head_sha={self._segment(sha)}&per_page=100")
+        return [r for r in (data or {}).get("workflow_runs") or [] if isinstance(r, dict)]
+
     def find_run(self, repo: str, run_id: int) -> dict | None:
         """A workflow run, or None when `repo` has none with that id."""
         return self._request("GET", f"repos/{repo}/actions/runs/{run_id}", absent=(404,))
