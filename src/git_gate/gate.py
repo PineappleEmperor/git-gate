@@ -10,7 +10,6 @@ import os
 import secrets
 import shlex
 import shutil
-import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -21,21 +20,13 @@ from pathlib import Path
 from typing import NoReturn
 
 from git_gate import Refused, ci, ghpolicy, reads, writes
-from git_gate.call import TOOLS, audit, log_error
+from git_gate.call import RETIRED, TOOLS, audit, log_error
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import FromGitHub, GitHub
-from git_gate.gitops import EMPTY, MAX_STDERR, Git
+from git_gate.gitops import MAX_STDERR, Git
 from git_gate.handover import Handovers
 from git_gate.mirror import MAX_HAVE, Mirror, Protected, comparison
-from git_gate.paths import (
-    check_new_target,
-    copy_in,
-    copy_tree_into,
-    open_dir,
-    place_new_file,
-    require_absolute,
-    write_out,
-)
+from git_gate.paths import copy_in, open_dir, require_absolute, write_out
 
 MAX_OUTPUT = 200_000
 MAX_BUNDLE = 512 << 20
@@ -84,7 +75,6 @@ class Gate:
         *,
         base_url: str = "https://github.com",
         git: str = "/usr/bin/git",
-        gh: str = "/usr/bin/gh",
         github: Callable[[str], GitHub] = GitHub,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
@@ -96,7 +86,6 @@ class Gate:
         self.git = Git(self.state, base_url, git)
         self.mirror = Mirror(self.git, self.state)
         self.handovers = Handovers(self.state, mirror=self.mirror)
-        self.gh_bin = gh
         self.github = github
         self.clock = clock
         self.sleep = sleep
@@ -110,7 +99,7 @@ class Gate:
 
     def dispatch(self, tool: str, kwargs: dict) -> str:
         """Run the named tool with `kwargs` through `call`: the one place a tool name becomes a method."""
-        if tool not in TOOLS:
+        if tool not in TOOLS + RETIRED:
             raise Refused(f"git-gate has no tool {tool!r}.")
         if not isinstance(kwargs, dict):
             raise Refused(f"{tool}: the arguments must be a JSON object.")
@@ -574,71 +563,12 @@ class Gate:
     def api_get(self, rules: Rules, token: str, repo: str, path: str, query: dict | None = None) -> str:
         return reads.api_get(self._ci(rules, token, repo), repo, path, query)
 
-    # --- read-only gh -------------------------------------------------------------------
+    # --- retired ------------------------------------------------------------------------
 
-    @_untrusted
     def gh(self, rules: Rules, token: str, repo: str, args: list[str]) -> str:
-        rules.access(repo)
-        p = ghpolicy.plan(repo, args)
-        work = Path(tempfile.mkdtemp(dir=self.state / "tmp"))
-        try:
-            if p.download:
-                index, target, is_dir = p.download
-                check_new_target(rules, target, "Download target")
-                dl = work / "download"
-                dl.mkdir()
-                p.argv[index] = str(dl if is_dir else dl / Path(p.download[1]).name)
-            try:
-                proc = subprocess.run(
-                    [self.gh_bin, *p.argv],
-                    env=self._gh_env(_gh_config(work, token)) | p.env,
-                    cwd=self.state / EMPTY,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    timeout=rules.gh_timeout,
-                )
-            except subprocess.TimeoutExpired:
-                raise Refused(f"gh timed out after {rules.gh_timeout}s.") from None
-            out = proc.stdout + (("\n" + proc.stderr) if proc.stderr.strip() else "")
-            if proc.returncode != 0:
-                raise FromGitHub(f"gh exited {proc.returncode}:\n{_tail(out)}")
-            if p.download:
-                out += self._deliver(rules, p, dl)
-            return _tail(out) or "(no output)"
-        finally:
-            shutil.rmtree(work, ignore_errors=True)
-
-    def _deliver(self, rules: Rules, p: ghpolicy.GhPlan, dl: Path) -> str:
-        _, target, is_dir = p.download
-        if is_dir:
-            real, written, skipped = copy_tree_into(rules, dl, target, "Download target")
-        else:
-            got = dl / Path(target).name
-            if not got.is_file() or got.is_symlink():
-                return "\nNothing was downloaded."
-            real, written, skipped = place_new_file(rules, got, target, "Download target"), [Path(target).name], []
-        note = f"; skipped symlinks and dot-named entries: {', '.join(skipped)}" if skipped else ""
-        return f"\nSaved to {real}: {', '.join(written) or 'nothing'}{note}"
-
-    def _gh_env(self, config: Path) -> dict[str, str]:
-        """gh's whole environment. It never holds the token: `--jq` filters can read it (`$ENV`, `env`)."""
-        return self.git.env() | {
-            "GH_HOST": "github.com",
-            "GH_CONFIG_DIR": str(config),
-            "GH_PROMPT_DISABLED": "1",
-            "GH_NO_UPDATE_NOTIFIER": "1",
-            "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
-            "GH_SPINNER_DISABLED": "1",
-            "GH_PAGER": "cat",
-            "PAGER": "cat",
-            "GH_EDITOR": "false",
-            "EDITOR": "false",
-            "VISUAL": "false",
-            "GH_BROWSER": "false",
-            "BROWSER": "false",
-            "NO_COLOR": "1",
-        }
+        """Retired: conversations started on an older release may still call it, and are told what
+        replaces the command. Nothing runs and GitHub is not asked."""
+        raise Refused(ghpolicy.retired(args))
 
 
 def _note_polls(polls: int, waited: float) -> None:
@@ -646,30 +576,6 @@ def _note_polls(polls: int, waited: float) -> None:
     extra = _AUDIT_EXTRA.get(None)
     if extra is not None:
         extra.update(polls=polls, waited_s=round(waited))
-
-
-def _gh_config(work: Path, token: str) -> Path:
-    """A fresh gh config directory for one call, its token in hosts.yml (0600) rather than the environment.
-
-    Written in gh's multi-account layout with `version: "1"`, so gh migrates nothing and asks
-    GitHub for no user name. The directory goes when `work` does, at the end of the call.
-    """
-    config = work / "gh"
-    config.mkdir(mode=0o700)
-    quoted = json.dumps(token)  # a JSON string is a valid YAML scalar
-    files = {
-        "config.yml": 'version: "1"\n',
-        "hosts.yml": (
-            "github.com:\n"
-            f"    users:\n        git-gate:\n            oauth_token: {quoted}\n"
-            f"    git_protocol: https\n    user: git-gate\n    oauth_token: {quoted}\n"
-        ),
-    }
-    for name, text in files.items():
-        fd = os.open(config / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-    return config
 
 
 def _stale_refusal(branch: str, default: str, stale: tuple[str, ...]) -> str:
@@ -765,7 +671,3 @@ def utf8_safe(text: str) -> str:
 
 def _scrub(text: str, token: str | None) -> str:
     return text.replace(token, "[token]") if token else text
-
-
-def _tail(text: str) -> str:
-    return text if len(text) <= MAX_OUTPUT else "[... truncated ...]\n" + text[-MAX_OUTPUT:]

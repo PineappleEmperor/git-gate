@@ -586,14 +586,13 @@ def test_every_post_sends_a_json_body(env):
     assert gh._opener.calls[-1] == ("POST", "repos/me/app/actions/runs/5/rerun", {})
 
 
-def test_replies_are_marked_untrusted(env, api, body, fake_gh):
+def test_replies_are_marked_untrusted(env, api, body):
     for tool, kwargs, _ in CASES:
         assert call(env, tool, repo="me/app", **_fill(kwargs, body)).startswith(UNTRUSTED + "\n")
-    for args in (["pr", "view", "7"], ["run", "view", "5", "--log"], ["api", "repos/{owner}/{repo}/issues"]):
-        assert call(env, "gh", repo="me/app", args=args).startswith(UNTRUSTED + "\n")
-    with pytest.raises(Refused) as e:  # gh failing: its output is GitHub's text
-        call(env, "gh", repo="me/app", args=["pr", "view", "999"])
-    assert str(e.value).startswith(UNTRUSTED + "\n") and "999" in str(e.value)
+    api.label.side_effect = FromGitHub("GitHub POST repos/me/app/labels returned 422: Validation Failed")
+    with pytest.raises(Refused) as e:  # a refusal carrying GitHub's text is GitHub content too
+        call(env, "label", repo="me/app", action="create", name="bug")
+    assert str(e.value).startswith(UNTRUSTED + "\n") and "Validation Failed" in str(e.value)
     with pytest.raises(Refused) as e:  # the gate's own refusal carries no GitHub text
         call(env, "pr", repo="me/app", action="comment", number=0, body_file=str(body))
     assert not str(e.value).startswith(UNTRUSTED)

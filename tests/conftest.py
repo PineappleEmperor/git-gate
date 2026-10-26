@@ -1,6 +1,5 @@
 import io
 import json
-import stat
 import subprocess
 import urllib.error
 from pathlib import Path
@@ -215,35 +214,3 @@ class FakeDownloads:
         if isinstance(answer, BaseException):
             raise answer
         return answer
-
-
-@pytest.fixture
-def fake_gh(env):
-    """A stand-in gh that records its call; `999` among its arguments makes it fail."""
-    record = env.tmp / "gh-call.json"
-    script = env.tmp / "gh"
-    script.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, os, sys, pathlib\n"
-        f"rec = pathlib.Path({str(record)!r})\n"
-        "args = sys.argv[1:]\n"
-        "files = {a: pathlib.Path(a).read_text() for a in args if a.startswith('/') and pathlib.Path(a).is_file()}\n"
-        "cfg = pathlib.Path(os.environ.get('GH_CONFIG_DIR', '/nonexistent'))\n"
-        "hosts = cfg / 'hosts.yml'\n"
-        "seen = {'text': hosts.read_text(), 'mode': oct(hosts.stat().st_mode & 0o777),\n"
-        "        'dir_mode': oct(cfg.stat().st_mode & 0o777)} if hosts.is_file() else {}\n"
-        "rec.write_text(json.dumps({'args': args, 'cwd': os.getcwd(), 'env': dict(os.environ), 'files': files,\n"
-        "                           'hosts': seen}))\n"
-        "if '999' in args:\n"
-        "    print('GraphQL: Could not resolve to a PullRequest with the number of 999.', file=sys.stderr)\n"
-        "    sys.exit(1)\n"
-        "if '-D' in args:\n"
-        "    d = pathlib.Path(args[args.index('-D') + 1]); (d / 'art').mkdir(); (d / 'art/log.txt').write_text('L')\n"
-        "    (d / '.claude').mkdir(); (d / '.claude/settings.json').write_text('{}')\n"
-        "if '-O' in args:\n"
-        "    pathlib.Path(args[args.index('-O') + 1]).write_text('asset')\n"
-        "print('ok', os.environ.get('GH_TOKEN') or seen.get('text'))\n"
-    )
-    script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    env.gate.gh_bin = str(script)
-    return lambda: json.loads(record.read_text())

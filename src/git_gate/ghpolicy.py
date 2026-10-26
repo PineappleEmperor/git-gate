@@ -1,237 +1,65 @@
-"""Which `gh` invocations the gate runs, and how it rewrites them. Pure: no I/O."""
+"""gh is retired: which gate tool replaces each gh command an agent used to run. Pure: no I/O.
 
-import re
-from dataclasses import dataclass, field
+Agents in a gate session never call gh. Conversations started on a release that still registered
+the gh tool can call it until they end; each such call is refused with the tool that does the job.
+"""
 
-from git_gate import Refused
-
-READ = {
-    ("pr", "view"), ("pr", "list"), ("pr", "diff"), ("pr", "checks"),
-    ("issue", "view"), ("issue", "list"),
-    ("run", "list"), ("run", "view"), ("run", "watch"), ("run", "download"),
-    ("workflow", "list"), ("workflow", "view"),
-    ("release", "list"), ("release", "view"), ("release", "download"),
-    ("label", "list"),
-    ("repo", "view"),
-    ("api",),
+READS = {
+    ("pr", "view"): 'the pr tool, action "view"',
+    ("pr", "list"): 'the pr tool, action "list"',
+    ("pr", "diff"): 'the pr tool, action "diff"',
+    ("pr", "status"): 'the pr tool, action "list"',
+    ("pr", "checks"): "the checks tool (with wait=true instead of --watch)",
+    ("run", "list"): "the runs tool",
+    ("run", "view"): "the run tool (its reply has the end of each failed job's log)",
+    ("run", "watch"): "the run tool, with wait=true",
+    ("run", "download"): "nothing: downloading run artifacts is not supported; the run tool shows failed jobs' logs",
+    ("issue", "view"): 'the issue tool, action "view"',
+    ("issue", "list"): 'the issue tool, action "list"',
+    ("issue", "status"): 'the issue tool, action "list"',
+    ("release", "list"): 'the release tool, action "list"',
+    ("release", "view"): 'the release tool, action "view"',
+    ("release", "download"): "nothing: downloading release assets is not supported; release view lists them",
+    ("repo", "view"): 'the api_get tool, path ""',
+    ("workflow", "list"): 'the api_get tool, path "actions/workflows"',
+    ("workflow", "view"): 'the api_get tool, path "actions/workflows" (or "actions/workflows/<file>")',
+    ("label", "list"): 'the api_get tool, path "labels"',
+    ("api",): "the api_get tool (a GET of a path relative to the repo, with query for its parameters)",
 }  # fmt: skip
-# gh is read-only: each former write has a typed tool with checked parameters instead.
-TYPED_WRITES = {
-    ("pr", "create"): "use the gate's pr tool, action create",
-    ("pr", "edit"): (
-        "use the gate's pr tool, action edit, for the title, body and base, and its triage tool for labels, "
-        "assignees and reviewers"
-    ),
-    ("pr", "comment"): "use the gate's pr tool, action comment",
-    ("pr", "review"): (
-        "use the gate's pr tool, action review_comment or request_changes; approving is the user's, "
-        "since the token acts as the user"
-    ),
-    ("pr", "close"): "use the gate's pr tool, action close",
-    ("pr", "reopen"): "use the gate's pr tool, action reopen",
-    ("pr", "ready"): "use the gate's pr tool, action ready",
-    ("issue", "create"): "use the gate's issue tool, action create",
-    ("issue", "edit"): (
-        "use the gate's issue tool, action edit, for the title and body, and its triage tool for labels and assignees"
-    ),
-    ("issue", "comment"): "use the gate's issue tool, action comment",
-    ("issue", "close"): "use the gate's issue tool, action close",
-    ("issue", "reopen"): "use the gate's issue tool, action reopen",
-    ("run", "rerun"): "use the gate's workflow_run tool, action rerun (or rerun_failed for --failed)",
-    ("run", "cancel"): "use the gate's workflow_run tool, action cancel",
-    ("label", "create"): "use the gate's label tool, action create",
-    ("label", "edit"): "use the gate's label tool, action edit",
+WRITES = {
+    ("pr", "create"): "the pr tool, action create",
+    ("pr", "edit"): "the pr tool, action edit, and the triage tool for labels, assignees and reviewers",
+    ("pr", "comment"): "the pr tool, action comment",
+    ("pr", "review"): "the pr tool, action review_comment or request_changes; approving is the user's",
+    ("pr", "close"): "the pr tool, action close",
+    ("pr", "reopen"): "the pr tool, action reopen",
+    ("pr", "ready"): "the pr tool, action ready",
+    ("issue", "create"): "the issue tool, action create",
+    ("issue", "edit"): "the issue tool, action edit, and the triage tool for labels and assignees",
+    ("issue", "comment"): "the issue tool, action comment",
+    ("issue", "close"): "the issue tool, action close",
+    ("issue", "reopen"): "the issue tool, action reopen",
+    ("run", "rerun"): "the workflow_run tool, action rerun (or rerun_failed for --failed)",
+    ("run", "cancel"): "the workflow_run tool, action cancel",
+    ("label", "create"): "the label tool, action create",
+    ("label", "edit"): "the label tool, action edit",
+    ("repo", "clone"): "the clone tool",
+    ("pr", "checkout"): "the fetch tool, then a local checkout",
+    ("pr", "merge"): "nothing: merging lands code on the base branch, which stays the user's",
+    ("release", "create"): "nothing: releases create tags, which stay the user's",
+    ("release", "edit"): "nothing: releases move tags, which stay the user's",
+    ("release", "upload"): "nothing: release changes stay the user's",
 }
-REFUSED_HINTS = {
-    ("repo", "clone"): "use the gate's clone tool",
-    ("pr", "checkout"): "use the gate's fetch tool, then check out locally",
-    ("release", "create"): "releases create tags, which stay manual",
-    ("release", "edit"): "releases move tags, which stay manual",
-    ("release", "upload"): "release changes stay manual",
-    ("issue", "develop"): "it creates a remote branch outside push's rules; push a branch instead",
-    ("pr", "merge"): "merging lands code on the base branch, which stays the user's to do",
-    ("search", "issues"): "GitHub ORs repo: qualifiers, so it cannot be held to one repo; use issue list --search",
-    ("search", "prs"): "GitHub ORs repo: qualifiers, so it cannot be held to one repo; use pr list --search",
-    **TYPED_WRITES,
-}
-
-DENIED_FLAGS = {"-R", "--repo", "--hostname", "--web", "-w", "--editor", "-e", "--recover", "--admin", "--owner"}
-BODY_FILE_FLAGS = {"--body-file", "-F"}
-DOWNLOAD_DIR_FLAGS = {"-D", "--dir"}
-DOWNLOAD_FILE_FLAGS = {"-O", "--output"}
-
-API_VALUE_FLAGS = {
-    "-X", "--method", "-H", "--header", "-f", "--raw-field", "-F", "--field",
-    "-q", "--jq", "-t", "--template", "--cache", "-p", "--preview",
-}  # fmt: skip
-API_BOOL_FLAGS = {"--paginate", "--slurp", "-i", "--include", "--silent", "--verbose"}
-API_DENIED = {"--input", "--hostname"}
-
-URL_LIKE = re.compile(r"(?i)^(?:[a-z][a-z0-9+.-]*://|git@)\S*$|^\S*github\.com[/:]\S*$")
-# pflag reads any longer argument after "-<letter>" as that flag with the rest as its value, spaces and
-# all, so every such argument is refused: values go in their own argument, where the checks see them.
-SHORT_CLUSTER = re.compile(r"^-[A-Za-z].", re.DOTALL)
-# `--search` builds a GitHub search query; any of these would widen it past the forced repo.
-SCOPE_QUALIFIER = re.compile(r"(?i)\b(?:repo|org|user|owner):|\bis:(?:public|private)\b")
-SEARCH_FLAGS = {"--search", "-S"}
-# gh compiles --jq with gojq's environment loader: `env` and `$ENV` read gh's own environment.
-JQ_FLAGS = {"-q", "--jq"}
-JQ_ENV = re.compile(r"(?i)\benv\b")
+ALL = "the gate's typed tools: pr, issue, checks, run, runs, release, file, api_get, and the write tools"
 
 
-@dataclass
-class GhPlan:
-    argv: list[str]
-    env: dict[str, str] = field(default_factory=dict)
-    download: tuple[int, str, bool] | None = None  # (argv index, agent path, is_dir)
-
-
-def plan(repo: str, args: list[str]) -> GhPlan:
-    if not args:
-        raise Refused("gh needs a subcommand.")
-    for a in args:
-        if not isinstance(a, str) or "\0" in a:
-            raise Refused("gh arguments must be strings without NUL bytes.")
-    cmd = (args[0],) if args[0] == "api" else tuple(args[:2])
-    if cmd in REFUSED_HINTS:
-        raise Refused(f"gh {' '.join(cmd)} is not available through the gate: {REFUSED_HINTS[cmd]}.")
-    if cmd not in READ:
-        raise Refused(f"gh {' '.join(cmd)} is not on the gate's subcommand allowlist.")
-    rest = list(args[len(cmd) :])
-    if cmd == ("api",):
-        return _plan_api(repo, rest)
-    return _plan_command(repo, cmd, rest)
-
-
-def _flag_name(token: str) -> str:
-    return token.split("=", 1)[0] if token.startswith("--") else token
-
-
-def _check_jq(name: str, value: str) -> None:
-    if name in JQ_FLAGS and JQ_ENV.search(value):
-        raise Refused(f"gh {name} filters may not use env or $ENV: they read the gate's environment.")
-
-
-def _common_checks(tokens: list[str]) -> None:
-    for t in tokens:
-        if t == "--":
-            continue
-        if SHORT_CLUSTER.match(t) and not t.startswith("--"):
-            raise Refused(f"Pass short flags and their values as separate arguments ({t!r}).")
-        if URL_LIKE.match(t):
-            raise Refused(
-                f"{t!r} looks like a URL; the gate fixes the repository, so name PRs, issues and runs "
-                "by number. Put URLs in a body file instead of a bare argument."
-            )
-
-
-def _plan_command(repo: str, cmd: tuple[str, ...], rest: list[str]) -> GhPlan:
-    _common_checks(rest)
-    result = GhPlan(argv=[])
-    out: list[str] = []
-    i = 0
-    while i < len(rest):
-        t = rest[i]
-        name = _flag_name(t)
-        if name in DENIED_FLAGS:
-            raise Refused(f"gh flag {name} is not allowed through the gate.")
-        if name == "--clobber":
-            raise Refused(
-                "gh --clobber is not allowed through the gate: downloads go into a new directory "
-                "(or a new file) the gate creates, and never replace anything."
-            )
-        if name in BODY_FILE_FLAGS:
-            raise Refused(f"gh {name} is not allowed: gh is read-only, and bodies go through the gate's typed tools.")
-        if name in SEARCH_FLAGS | JQ_FLAGS:
-            value = t.split("=", 1)[1] if "=" in t else (rest[i + 1] if i + 1 < len(rest) else "")
-            _check_jq(name, value)
-            if name in SEARCH_FLAGS and SCOPE_QUALIFIER.search(value):
-                raise Refused("--search may not name repo:, org:, user:, owner: or is:public/private.")
-        if cmd[1] == "download" and name in DOWNLOAD_DIR_FLAGS | DOWNLOAD_FILE_FLAGS:
-            if "=" in t and t.startswith("--"):
-                value = t.split("=", 1)[1]
-                out.append(name)
-            else:
-                if i + 1 >= len(rest):
-                    raise Refused(f"gh flag {name} needs a value.")
-                value = rest[i + 1]
-                out.append(t)
-                i += 1
-            out.append(value)
-            if result.download:
-                raise Refused("Give one download target.")
-            result.download = (len(out) - 1, value, name in DOWNLOAD_DIR_FLAGS)
-        else:
-            out.append(t)
-        i += 1
-
-    if cmd[1] == "download" and not result.download:
-        raise Refused("gh download needs an absolute -D/--dir (or release download -O) inside a workspace.")
-    if result.download and result.download[1] == "-":
-        raise Refused("Downloads must go to a file or directory, not stdout.")
-
-    prefix = ["repo", "view", repo] if cmd == ("repo", "view") else [*cmd, "-R", repo]
-    offset = len(prefix)
-    result.argv = prefix + out
-    if result.download:
-        idx, path, is_dir = result.download
-        result.download = (idx + offset, path, is_dir)
-    return result
-
-
-def _plan_api(repo: str, rest: list[str]) -> GhPlan:
-    _common_checks(rest)
-    out: list[str] = []
-    endpoint = None
-    i = 0
-    while i < len(rest):
-        t = rest[i]
-        if t.startswith("-") and t != "-":
-            name = _flag_name(t)
-            if name in API_DENIED:
-                raise Refused(f"gh api {name} is not allowed through the gate.")
-            if name in API_BOOL_FLAGS:
-                out.append(t)
-                i += 1
-                continue
-            if name not in API_VALUE_FLAGS:
-                raise Refused(f"gh api flag {name} is not on the gate's list.")
-            if "=" in t and t.startswith("--"):
-                value = t.split("=", 1)[1]
-            else:
-                if i + 1 >= len(rest):
-                    raise Refused(f"gh api {name} needs a value.")
-                value = rest[i + 1]
-                i += 1
-            i += 1
-            _check_jq(name, value)
-            if name in ("-X", "--method"):
-                if value.upper() != "GET":
-                    raise Refused("gh api is GET-only through the gate.")
-                continue
-            if name in ("-H", "--header") and not value.lower().startswith("accept:"):
-                raise Refused("gh api accepts only Accept: headers through the gate.")
-            if name in ("-F", "--field") and value.partition("=")[2].startswith("@"):
-                raise Refused("gh api -F key=@file is not allowed: the gate does not read files for api.")
-            out += [name, value]
-            continue
-        if endpoint is not None:
-            raise Refused("gh api takes one endpoint.")
-        endpoint = t
-        out.append(t)
-        i += 1
-    if endpoint is None:
-        raise Refused("gh api needs an endpoint.")
-    _check_endpoint(repo, endpoint)
-    return GhPlan(argv=["api", "--method", "GET", *out], env={"GH_REPO": repo})
-
-
-def _check_endpoint(repo: str, endpoint: str) -> None:
-    path = endpoint.lstrip("/").split("?", 1)[0].split("#", 1)[0]
-    segs = path.split("/")
-    if "%" in path or "\\" in path or any(s in ("", ".", "..") for s in segs[:3]) or ".." in segs or "." in segs:
-        raise Refused(f"gh api endpoint {endpoint!r} is not a plain path.")
-    owner, name = repo.lower().split("/")
-    head = [s.lower() for s in segs[:3]]
-    if head not in (["repos", "{owner}", "{repo}"], ["repos", owner, name]):
-        raise Refused(f"gh api endpoint must be under repos/{{owner}}/{{repo}} ({repo}); got {endpoint!r}.")
+def retired(args: object) -> str:
+    """The refusal of a gh call: gh is retired, and what to use instead."""
+    words = [a for a in args if isinstance(a, str)][:2] if isinstance(args, list | tuple) else []
+    command = tuple(words)
+    use = READS.get(command) or WRITES.get(command) or READS.get(command[:1]) or ALL
+    shown = f"gh {' '.join(words)}".strip() if all(w.isprintable() and len(w) < 40 for w in words) else "gh"
+    return (
+        f"gh is retired in git-gate: agents never call gh. Instead of `{shown}`, use {use}. A tool added "
+        "after this conversation started is not in its tool list: ask the user to start a new conversation."
+    )
