@@ -7,6 +7,7 @@ gate marks the whole reply as GitHub content.
 """
 
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,6 +24,12 @@ PASSING = {"success", "neutral", "skipped"}  # conclusions that are not failing
 QUIET = {"neutral", "skipped"}
 MAX_FIELD = 200  # characters of one field GitHub sent
 MAX_NAMES = 20  # names in a verdict line
+FIRST_INTERVAL = 15.0  # seconds between polls while waiting, doubling up to MAX_INTERVAL
+MAX_INTERVAL = 60.0
+FIRST_BACKOFF = 60.0  # seconds to back off from a rate limit that names no wait, doubling up to MAX_BACKOFF
+MAX_BACKOFF = 300.0
+# Claude Code aborts a stdio tool call that sends nothing for 30 minutes; a wait stays well inside that.
+MAX_WAIT_MINUTES = 20
 LOG_LINES = 80  # lines of a failed job's log shown, from its end
 MAX_LOGS = 10  # failed jobs whose logs are read
 MAX_LOG_LINE = 1000  # characters of one log line
@@ -36,6 +43,9 @@ class Context:
     api: GitHub
     git: Git
     max_output: int
+    sleep: Callable[[float], None] = time.sleep
+    monotonic: Callable[[], float] = time.monotonic  # for the wait's deadline
+    clock: Callable[[], float] = time.time  # for GitHub's x-ratelimit-reset, a Unix time
 
 
 @dataclass(frozen=True)
@@ -50,15 +60,31 @@ class Check:
 # --- checks --------------------------------------------------------------------------------------
 
 
-def checks(ctx: Context, repo: str, ref: object) -> str:
-    """The check runs and commit statuses of the commit `ref` names, one line each, then a verdict."""
+def checks(ctx: Context, repo: str, ref: object, wait: object = False, timeout_minutes: object = 20) -> str:
+    """The check runs and commit statuses of the commit `ref` names, one line each, then a verdict.
+
+    `ref` is resolved to a commit once; with `wait`, its checks are polled until none is queued or
+    in progress, or the timeout passes.
+    """
     ctx.rules.access(repo)
-    where, sha = _resolve(ctx, repo, _ref(ref))
-    runs = _needs(repo, "Checks", lambda: ctx.api.check_runs(repo, sha))
-    statuses = _needs(repo, "Commit statuses", lambda: ctx.api.statuses(repo, sha))
-    found = [_check_run(r) for r in runs if isinstance(r, dict)] + [_status(s) for s in statuses if isinstance(s, dict)]
+    ref = _ref(ref)
+    minutes, capped = _wait_args(wait, timeout_minutes)
+    resolved: list[tuple[str, str]] = []
+
+    def poll() -> list[Check]:
+        if not resolved:
+            resolved.append(_resolve(ctx, repo, ref))
+        sha = resolved[0][1]
+        runs = _needs(repo, "Checks", lambda: ctx.api.check_runs(repo, sha))
+        statuses = _needs(repo, "Commit statuses", lambda: ctx.api.statuses(repo, sha))
+        return [_check_run(r) for r in runs if isinstance(r, dict)] + [
+            _status(s) for s in statuses if isinstance(s, dict)
+        ]
+
+    found, note = _poll(ctx, poll, lambda found: any(c.running for c in found), wait, minutes, capped)
+    where, sha = resolved[0]
     head = [f"Checks of {repo} {where} at {_field(sha)}:"]
-    return _fit(head + [c.line for c in found], [_verdict(found)], ctx.max_output)
+    return _fit(head + [c.line for c in found], [_verdict(found), *note], ctx.max_output)
 
 
 def _ref(ref: object) -> int | str:
@@ -84,11 +110,11 @@ def _resolve(ctx: Context, repo: str, ref: int | str) -> tuple[str, str]:
     if SHA.fullmatch(ref):
         commit = _needs(repo, "Contents", lambda: api.commit(repo, ref))
         if commit is not None:
-            return f"commit {ref}", commit["sha"]
+            return f"commit {_field(ref)}", commit["sha"]
     ctx.git.check_branch(ref, ctx.rules)  # a name check-ref-format refuses can hold "..": never in a URL
     branch = _needs(repo, "Contents", lambda: api.branch(repo, ref))
     if branch is not None:
-        return f"branch {ref}", branch["sha"]
+        return f"branch {_field(ref)}", branch["sha"]
     if SHA.fullmatch(ref):
         raise Refused(f"{repo} has no commit or branch {ref}.")
     hint = f' For pull request {ref}, pass {ref} or "#{ref}".' if ref.isdigit() else ""
@@ -146,18 +172,27 @@ def _verdict(found: list[Check]) -> str:
     return f"All {len(found)} passed{note}."
 
 
-# --- run ---------------------------------------------------------------------------------------
+# --- run -----------------------------------------------------------------------------------------
 
 
-def run(ctx: Context, repo: str, run_id: object) -> str:
-    """A workflow run, its jobs, and for a failed run the end of each failed job's log, then a verdict."""
+def run(ctx: Context, repo: str, run_id: object, wait: object = False, timeout_minutes: object = 20) -> str:
+    """A workflow run, its jobs, and for a failed run the end of each failed job's log, then a verdict.
+
+    With `wait`, the run and its jobs are polled until the run completes or the timeout passes;
+    the logs are read once, at the end.
+    """
     ctx.rules.access(repo)
     n = _number(run_id, "run_id")
+    minutes, capped = _wait_args(wait, timeout_minutes)
     api = ctx.api
-    found = _needs(repo, "Actions", lambda: api.find_run(repo, n))
-    if found is None:
-        raise Refused(f"{repo} has no workflow run {n}.")
-    jobs = [j for j in _needs(repo, "Actions", lambda: api.jobs(repo, n)) if isinstance(j, dict)]
+
+    def poll() -> tuple[dict, list[dict]]:
+        found = _needs(repo, "Actions", lambda: api.find_run(repo, n))
+        if found is None:
+            raise Refused(f"{repo} has no workflow run {n}.")
+        return found, [j for j in _needs(repo, "Actions", lambda: api.jobs(repo, n)) if isinstance(j, dict)]
+
+    (found, jobs), note = _poll(ctx, poll, lambda state: state[0].get("status") != "completed", wait, minutes, capped)
     status, conclusion = found.get("status"), found.get("conclusion")
     done = status == "completed"
     state = ", ".join([_field(status), *([_field(conclusion)] if done else [])])
@@ -175,7 +210,7 @@ def run(ctx: Context, repo: str, run_id: object) -> str:
         if len(failing) > MAX_LOGS:
             lines.append(f"Logs of {len(failing) - MAX_LOGS} more failed jobs left out: "
                          f"{_names([_field(j.get('name')) for j in failing[MAX_LOGS:]])}.")  # fmt: skip
-    return _fit(lines, [_run_verdict(status, conclusion, jobs, failing)], ctx.max_output)
+    return _fit(lines, [_run_verdict(status, conclusion, jobs, failing), *note], ctx.max_output)
 
 
 def _job_failed(job: dict) -> bool:
@@ -241,6 +276,61 @@ def _run_verdict(status: object, conclusion: object, jobs: list[dict], failing: 
 
 
 # --- shared --------------------------------------------------------------------------------------
+
+
+def _wait_args(wait: object, timeout_minutes: object) -> tuple[int, bool]:
+    """(minutes to wait at most, whether the agent asked for more than MAX_WAIT_MINUTES)."""
+    if type(wait) is not bool:
+        raise Refused(f"wait must be true or false, not {wait!r}.")
+    minutes = _number(timeout_minutes, "timeout_minutes")
+    return min(minutes, MAX_WAIT_MINUTES), minutes > MAX_WAIT_MINUTES
+
+
+def _poll[T](
+    ctx: Context, fetch: Callable[[], T], running: Callable[[T], bool], wait: bool, minutes: int, capped: bool
+) -> tuple[T, list[str]]:
+    """`fetch()` once, or with `wait` until `running` says it is done or `minutes` pass.
+
+    The interval starts at FIRST_INTERVAL seconds and doubles up to MAX_INTERVAL; an answer
+    saying the quota is spent puts the next poll after its reset. A rate limit while waiting is
+    waited out (Retry-After, else the quota's reset, else FIRST_BACKOFF seconds doubling up to
+    MAX_BACKOFF) rather than failing; any other error fails. No sleep runs past the deadline: at
+    the deadline the state so far comes back with a line saying so.
+    """
+    deadline = ctx.monotonic() + minutes * 60
+    interval, backoff = FIRST_INTERVAL, FIRST_BACKOFF
+    state: list[T] = []  # the last state fetched, once there is one
+    limited: RateLimited | None = None
+    while True:
+        try:
+            state[:] = [fetch()]
+            limited = None
+            if not wait or not running(state[0]):
+                return state[0], []
+            delay = max(interval, ctx.api.rate_wait(ctx.clock()))
+            interval = min(interval * 2, MAX_INTERVAL)
+        except RateLimited as e:
+            if not wait:
+                raise
+            limited = e
+            delay = e.wait(ctx.clock())
+            if delay is None:
+                delay, backoff = backoff, min(backoff * 2, MAX_BACKOFF)
+        left = deadline - ctx.monotonic()
+        if left <= 0:
+            break
+        ctx.sleep(min(delay, left))
+    span = _minutes(minutes) + (f" (timeout_minutes is capped at {MAX_WAIT_MINUTES})" if capped else "")
+    if not state:
+        raise FromGitHub(f"GitHub rate-limited every request for {span}, so the gate has no answer: {limited}")
+    note = f"Still running after {span}; the gate stopped waiting. Call again to keep waiting."
+    if limited:
+        note += " GitHub rate-limited the last poll, so this is the state before it."
+    return state[0], [note]
+
+
+def _minutes(n: int) -> str:
+    return f"{n} minute" if n == 1 else f"{n} minutes"
 
 
 def _needs(repo: str, permission: str, read: Callable):

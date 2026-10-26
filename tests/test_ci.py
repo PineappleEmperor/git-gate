@@ -2,7 +2,7 @@
 
 import pytest
 
-from conftest import TOKEN, FakeDownloads, FakeOpener, FakeResponse, call
+from conftest import TOKEN, FakeDownloads, FakeOpener, FakeResponse, Turns, call
 from git_gate import Refused
 from git_gate.github import GitHub, Redirected
 from git_gate.writes import UNTRUSTED
@@ -400,3 +400,169 @@ def test_run_needs_read_access(env, gh):
     with pytest.raises(Refused, match="allowlist"):
         call(env, "run", repo="nobody/x", run_id=5)
     assert requests(gh) == []
+
+
+# --- waiting --------------------------------------------------------------------------------------
+
+LIMITED = (403, "You have exceeded a secondary rate limit. Please wait a few minutes.", {})
+RUNNING = {"check_runs": [check_run(), check_run("test", "in_progress", None)]}
+DONE = {"check_runs": [check_run(), check_run("test")]}
+
+
+class FakeTime:
+    """The gate's clocks and sleep: sleeping moves both clocks on, and nothing really waits."""
+
+    def __init__(self):
+        self.now = 1_000_000.0
+        self.sleeps: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        assert seconds > 0
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def clock(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(env):
+    t = FakeTime()
+    env.gate.sleep, env.gate.monotonic, env.gate.clock = t.sleep, t.clock, t.clock
+    return t
+
+
+def test_without_wait_nothing_waits(env, gh, clock):
+    gh.replies[RUNS] = RUNNING
+    assert call(env, "checks", repo="me/app", ref=12).splitlines()[-1] == "1 still running."
+    assert clock.sleeps == []
+
+
+def test_checks_waits_until_nothing_runs(env, gh, clock):
+    gh.replies[RUNS] = Turns([RUNNING, RUNNING, DONE])
+    out = call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert out.splitlines()[-1] == "All 2 passed."
+    assert clock.sleeps == [15, 30]
+    assert requests(gh) == [PULL, RUNS, STATUS] + [RUNS, STATUS] * 2
+
+
+def test_the_interval_grows_to_a_minute(env, gh, clock):
+    gh.replies[RUNS] = Turns([RUNNING] * 7 + [DONE])
+    call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert clock.sleeps == [15, 30, 60, 60, 60, 60, 60]
+
+
+def test_a_pending_status_is_waited_for(env, gh, clock):
+    gh.replies[RUNS] = DONE
+    gh.replies[STATUS] = Turns([{"statuses": [status(state="pending")]}, {"statuses": [status()]}])
+    assert call(env, "checks", repo="me/app", ref=12, wait=True).splitlines()[-1] == "All 3 passed."
+    assert clock.sleeps == [15]
+
+
+def test_waiting_stops_at_the_timeout_with_the_state_so_far(env, gh, clock):
+    gh.replies[RUNS] = RUNNING
+    out = call(env, "checks", repo="me/app", ref=12, wait=True, timeout_minutes=2)
+    assert clock.sleeps == [15, 30, 60, 15]
+    lines = out.splitlines()
+    assert lines[-2] == "1 still running."
+    assert lines[-1] == "Still running after 2 minutes; the gate stopped waiting. Call again to keep waiting."
+
+
+def test_the_timeout_is_capped(env, gh, clock):
+    gh.replies[RUNS] = RUNNING
+    out = call(env, "checks", repo="me/app", ref=12, wait=True, timeout_minutes=500)
+    assert sum(clock.sleeps) == 20 * 60
+    assert "Still running after 20 minutes (timeout_minutes is capped at 20)" in out
+
+
+def test_a_rate_limit_backs_off_and_doubles(env, gh, clock):
+    gh.replies[RUNS] = Turns([LIMITED] * 5 + [DONE])
+    out = call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert clock.sleeps == [60, 120, 240, 300, 300]
+    assert out.splitlines()[-1] == "All 2 passed."
+
+
+def test_a_rate_limit_honours_retry_after(env, gh, clock):
+    gh.replies[RUNS] = Turns([(403, "secondary rate limit", {"Retry-After": "7"}), DONE])
+    call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert clock.sleeps == [7]
+
+
+def test_a_spent_quota_waits_for_its_reset(env, gh, clock):
+    reset = {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(clock.now) + 500)}
+    gh.replies[RUNS] = Turns([(403, "API rate limit exceeded for user ID 1.", reset), DONE])
+    call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert clock.sleeps == [500]
+
+
+def test_a_good_answer_that_spends_the_quota_delays_the_next_poll(env, gh, clock):
+    spent = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(int(clock.now) + 90)}
+    gh.replies[STATUS] = Turns([FakeResponse(b'{"statuses": []}', spent), {"statuses": []}])
+    gh.replies[RUNS] = Turns([RUNNING, DONE])
+    call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert clock.sleeps == [90]
+
+
+def test_a_rate_limit_on_the_first_lookup_is_waited_out(env, gh, clock):
+    gh.replies[PULL] = Turns([LIMITED, gh.replies[PULL]])
+    assert call(env, "checks", repo="me/app", ref=12, wait=True).splitlines()[-1] == "All 1 passed."
+    assert clock.sleeps == [60]
+
+
+def test_rate_limited_to_the_end_refuses(env, gh, clock):
+    gh.replies[PULL] = LIMITED
+    with pytest.raises(Refused, match="rate limit") as e:
+        call(env, "checks", repo="me/app", ref=12, wait=True, timeout_minutes=5)
+    assert str(e.value).startswith(UNTRUSTED) and "5 minutes" in str(e.value)
+    assert sum(clock.sleeps) == 300
+
+
+def test_rate_limited_at_the_end_gives_the_last_state(env, gh, clock):
+    gh.replies[RUNS] = Turns([RUNNING, LIMITED])
+    out = call(env, "checks", repo="me/app", ref=12, wait=True, timeout_minutes=3)
+    lines = out.splitlines()
+    assert lines[-2] == "1 still running."
+    assert "rate-limited" in lines[-1] and "Still running after 3 minutes" in lines[-1]
+
+
+def test_any_other_error_while_waiting_fails(env, gh, clock):
+    gh.replies[RUNS] = Turns([RUNNING, (500, "Server Error", {})])
+    with pytest.raises(Refused, match="500"):
+        call(env, "checks", repo="me/app", ref=12, wait=True)
+    assert clock.sleeps == [15]
+
+
+def test_run_waits_then_reads_the_logs_once(env, gh, clock):
+    failed(gh, b"boom\n")
+    gh.replies[RUN] = Turns([workflow_run(status="in_progress", conclusion=None), gh.replies[RUN]])
+    out = call(env, "run", repo="me/app", run_id=5, wait=True)
+    assert clock.sleeps == [15]
+    assert requests(gh) == [RUN, JOBS, RUN, JOBS, log_of(72)]
+    assert "boom" in out and out.splitlines()[-1].startswith("Failed (failure)")
+
+
+def test_run_stops_at_the_timeout(env, gh, clock):
+    gh.replies[RUN] = workflow_run(status="queued", conclusion=None)
+    out = call(env, "run", repo="me/app", run_id=5, wait=True, timeout_minutes=1)
+    assert out.splitlines()[-1].startswith("Still running after 1 minute;")
+    assert sum(clock.sleeps) == 60
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"wait": "yes"}, {"wait": 1}, {"timeout_minutes": 0}, {"timeout_minutes": -5}, {"timeout_minutes": True},
+     {"timeout_minutes": "10"}, {"timeout_minutes": 2.5}],
+)  # fmt: skip
+@pytest.mark.parametrize("tool", ["checks", "run"])
+def test_bad_wait_arguments_are_refused(env, gh, clock, tool, kwargs):
+    target = {"ref": 12} if tool == "checks" else {"run_id": 5}
+    with pytest.raises(Refused, match="wait|timeout_minutes"):
+        call(env, tool, repo="me/app", **target, **kwargs)
+    assert requests(gh) == []
+
+
+def test_a_waiting_call_counts_once_against_the_rate_limit(env, gh, clock):
+    gh.replies[RUNS] = Turns([RUNNING] * 4 + [DONE])
+    call(env, "checks", repo="me/app", ref=12, wait=True)
+    (stamps,) = [f.read_text().split() for f in (env.state / "rate").iterdir()]
+    assert len(stamps) == 1

@@ -81,6 +81,8 @@ class Gate:
         gh: str = "/usr/bin/gh",
         github: Callable[[str], GitHub] = GitHub,
         clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ):
         self.config = config or config_dir()
         self.state = state or state_dir()
@@ -91,6 +93,8 @@ class Gate:
         self.gh_bin = gh
         self.github = github
         self.clock = clock
+        self.sleep = sleep
+        self.monotonic = monotonic
         (self.state / "rate").mkdir(exist_ok=True, mode=0o700)
 
     # --- plumbing -----------------------------------------------------------------------
@@ -492,15 +496,19 @@ class Gate:
     # --- CI status (the reading lives in ci.py) -----------------------------------------
 
     def _ci(self, rules: Rules, token: str) -> ci.Context:
-        return ci.Context(rules, self.github(token), self.git, MAX_OUTPUT)
+        return ci.Context(rules, self.github(token), self.git, MAX_OUTPUT, self.sleep, self.monotonic, self.clock)
 
     @_untrusted
-    def checks(self, rules: Rules, token: str, repo: str, ref: int | str) -> str:
-        return ci.checks(self._ci(rules, token), repo, ref)
+    def checks(
+        self, rules: Rules, token: str, repo: str, ref: int | str, wait: bool = False, timeout_minutes: int = 20
+    ) -> str:
+        return ci.checks(self._ci(rules, token), repo, ref, wait, timeout_minutes)
 
     @_untrusted
-    def run(self, rules: Rules, token: str, repo: str, run_id: int) -> str:
-        return ci.run(self._ci(rules, token), repo, run_id)
+    def run(
+        self, rules: Rules, token: str, repo: str, run_id: int, wait: bool = False, timeout_minutes: int = 20
+    ) -> str:
+        return ci.run(self._ci(rules, token), repo, run_id, wait, timeout_minutes)
 
     # --- read-only gh -------------------------------------------------------------------
 
