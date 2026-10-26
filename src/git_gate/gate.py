@@ -359,7 +359,7 @@ class Gate:
                 new = self.mirror.new_commits(repo, sha, remote or default_tip, rules)
                 proc = self.mirror.push(repo, sha, branch, token, rules)
                 if proc.returncode != 0 and WORKFLOW_SCOPE in proc.stdout + proc.stderr:
-                    # The PAT has no Workflows permission; the user's own push is not bound by it (I1).
+                    # The token lacks the Workflows permission; the user's own push is not bound by it (I1).
                     hand_over(["GitHub refuses workflow changes from the gate's token."], [])
         if proc.returncode != 0:
             raise Refused(f"git push was rejected:\n{(proc.stdout + proc.stderr).strip()[-MAX_STDERR:]}")
