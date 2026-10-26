@@ -209,6 +209,17 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         """
         return await run("checks", repo=repo, ref=ref)
 
+    @server.tool(name="run")
+    async def run_tool(repo: str, run_id: int) -> str:
+        """One GitHub Actions run: use this, not `gh run view` or `gh run watch`.
+
+        Returns the run's name, event, branch, commit, status, conclusion and URL; each job with its
+        status and conclusion, and for a failed job its failed steps; for a failed run, the last 80
+        lines of each failed job's log; then a verdict line. Find run ids with the checks tool.
+        Rerunning and cancelling are workflow_run's; merging stays the user's.
+        """
+        return await run("run", repo=repo, run_id=run_id)
+
     @server.tool()
     async def pr(
         repo: str,

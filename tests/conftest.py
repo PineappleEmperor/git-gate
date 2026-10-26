@@ -198,6 +198,21 @@ class FakeOpener:
         return FakeResponse(json.dumps(reply).encode())
 
 
+class FakeDownloads:
+    """Stands in for the opener of token-less downloads: answers in turn, records each request."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls = []
+
+    def open(self, req, timeout=None):
+        self.calls.append((req.full_url, {k.lower(): v for k, v in req.header_items()}))
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+
 @pytest.fixture
 def fake_gh(env):
     """A stand-in gh that records its call; `999` among its arguments makes it fail."""

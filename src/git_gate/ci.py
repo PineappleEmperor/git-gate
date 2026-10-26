@@ -23,6 +23,11 @@ PASSING = {"success", "neutral", "skipped"}  # conclusions that are not failing
 QUIET = {"neutral", "skipped"}
 MAX_FIELD = 200  # characters of one field GitHub sent
 MAX_NAMES = 20  # names in a verdict line
+LOG_LINES = 80  # lines of a failed job's log shown, from its end
+MAX_LOGS = 10  # failed jobs whose logs are read
+MAX_LOG_LINE = 1000  # characters of one log line
+# ANSI escape sequences: CSI (colours, cursor), OSC (titles, links) ended by BEL or ST, and two-byte escapes.
+ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
 
 
 @dataclass(frozen=True)
@@ -139,6 +144,100 @@ def _verdict(found: list[Check]) -> str:
     quiet = sum(c.quiet for c in found)
     note = f" ({quiet} neutral or skipped, which count as not failing)" if quiet else ""
     return f"All {len(found)} passed{note}."
+
+
+# --- run ---------------------------------------------------------------------------------------
+
+
+def run(ctx: Context, repo: str, run_id: object) -> str:
+    """A workflow run, its jobs, and for a failed run the end of each failed job's log, then a verdict."""
+    ctx.rules.access(repo)
+    n = _number(run_id, "run_id")
+    api = ctx.api
+    found = _needs(repo, "Actions", lambda: api.find_run(repo, n))
+    if found is None:
+        raise Refused(f"{repo} has no workflow run {n}.")
+    jobs = [j for j in _needs(repo, "Actions", lambda: api.jobs(repo, n)) if isinstance(j, dict)]
+    status, conclusion = found.get("status"), found.get("conclusion")
+    done = status == "completed"
+    state = ", ".join([_field(status), *([_field(conclusion)] if done else [])])
+    lines = [
+        f"Run {n} of {repo}: {_field(found.get('name'))} ({_field(found.get('event'))} on "
+        f"{_field(found.get('head_branch'))}, commit {_field(found.get('head_sha'))}): {state}",
+        _field(found.get("html_url")),
+        "Jobs:" if jobs else "No jobs reported.",
+        *(_job_line(j) for j in jobs),
+    ]
+    failing = [j for j in jobs if _job_failed(j)]
+    if done and conclusion not in PASSING:
+        for j in failing[:MAX_LOGS]:
+            lines += _log(ctx, repo, j)
+        if len(failing) > MAX_LOGS:
+            lines.append(f"Logs of {len(failing) - MAX_LOGS} more failed jobs left out: "
+                         f"{_names([_field(j.get('name')) for j in failing[MAX_LOGS:]])}.")  # fmt: skip
+    return _fit(lines, [_run_verdict(status, conclusion, jobs, failing)], ctx.max_output)
+
+
+def _job_failed(job: dict) -> bool:
+    return job.get("status") == "completed" and job.get("conclusion") not in PASSING
+
+
+def _job_line(job: dict) -> str:
+    status, conclusion = job.get("status"), job.get("conclusion")
+    parts = [_field(status)]
+    if status == "completed":
+        parts.append(_field(conclusion))
+        if took := _duration(job.get("started_at"), job.get("completed_at")):
+            parts.append(took)
+    line = f"- {_field(job.get('name'))}: {', '.join(parts)}"
+    if _job_failed(job):
+        steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
+        bad = [_field(s.get("name")) for s in steps if s.get("conclusion") not in (*PASSING, None)]
+        if bad:
+            line += f"; failed steps: {_names(bad)}"
+    return line
+
+
+def _log(ctx: Context, repo: str, job: dict) -> list[str]:
+    """The last LOG_LINES lines of a failed job's log, or why there are none."""
+    name = _field(job.get("name"))
+    try:
+        data, note = _needs(repo, "Actions", lambda: ctx.api.job_log(repo, _number(job.get("id"), "job id")))
+    except Refused as e:
+        return [f"The log of {name} is not available: {e}"]
+    tail = _log_lines(data)
+    head = f"Last {len(tail)} lines of the log of {name}" + (f" ({note})" if note else "") + ":"
+    return [head, *tail]
+
+
+def _log_lines(data: bytes) -> list[str]:
+    """The end of a log as printable lines: bytes decoded losslessly, escapes removed, anything
+    unprintable shown as "?" (bytes that are not UTF-8 among them), each line cut to MAX_LOG_LINE."""
+    text = ANSI.sub("", data.decode("utf-8", "surrogateescape")).removeprefix("\ufeff")
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    out = []
+    for line in lines[-LOG_LINES:]:
+        line = "".join(c if c.isprintable() or c == "\t" else "?" for c in line)
+        out.append(line if len(line) <= MAX_LOG_LINE else line[:MAX_LOG_LINE] + "...")
+    return out
+
+
+def _run_verdict(status: object, conclusion: object, jobs: list[dict], failing: list[dict]) -> str:
+    if status != "completed":
+        waiting = sum(j.get("status") != "completed" for j in jobs)
+        return f"Still running ({_field(status)}): {waiting} of {len(jobs)} jobs not finished."
+    if conclusion in QUIET:
+        return f"Finished {conclusion}, which counts as not failing."
+    if conclusion == "success":
+        quiet = sum(j.get("conclusion") in QUIET for j in jobs)
+        note = f" ({quiet} neutral or skipped, which count as not failing)" if quiet else ""
+        return f"Passed: {len(jobs)} jobs, none failing{note}."
+    if failing:
+        names = _names([_field(j.get("name")) for j in failing])
+        return f"Failed ({_field(conclusion)}): {len(failing)} of {len(jobs)} jobs failed: {names}."
+    return f"Failed ({_field(conclusion)}): no job failed; see the run's page."
 
 
 # --- shared --------------------------------------------------------------------------------------

@@ -2,9 +2,9 @@
 
 import pytest
 
-from conftest import TOKEN, FakeOpener, call
+from conftest import TOKEN, FakeDownloads, FakeOpener, FakeResponse, call
 from git_gate import Refused
-from git_gate.github import GitHub
+from git_gate.github import GitHub, Redirected
 from git_gate.writes import UNTRUSTED
 
 SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
@@ -12,6 +12,42 @@ PULL = ("GET", "repos/me/app/pulls/12")
 BRANCH = ("GET", "repos/me/app/branches/feat")
 RUNS = ("GET", f"repos/me/app/commits/{SHA}/check-runs?filter=latest&per_page=100&page=1")
 STATUS = ("GET", f"repos/me/app/commits/{SHA}/status?per_page=100&page=1")
+RUN = ("GET", "repos/me/app/actions/runs/5")
+JOBS = ("GET", "repos/me/app/actions/runs/5/jobs?filter=latest&per_page=100&page=1")
+BLOB = "https://results.example.net/logs/{}.txt?sig=abc"
+
+
+def log_of(job_id: int) -> tuple[str, str]:
+    return ("GET", f"repos/me/app/actions/jobs/{job_id}/logs")
+
+
+def workflow_run(status="completed", conclusion="success", **extra):
+    return {
+        "id": 5,
+        "name": "CI",
+        "event": "pull_request",
+        "head_branch": "feat",
+        "head_sha": SHA,
+        "status": status,
+        "conclusion": conclusion,
+        "html_url": "https://github.com/me/app/actions/runs/5",
+        **extra,
+    }
+
+
+def job(job_id, name, status="completed", conclusion="success", failed_steps=()):
+    steps = [{"name": "Set up job", "status": "completed", "conclusion": "success", "number": 1}]
+    steps += [{"name": s, "status": "completed", "conclusion": "failure", "number": 2} for s in failed_steps]
+    return {
+        "id": job_id,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "started_at": "2026-10-26T10:00:00Z",
+        "completed_at": "2026-10-26T10:02:00Z" if status == "completed" else None,
+        "html_url": f"https://github.com/me/app/actions/runs/5/job/{job_id}",
+        "steps": steps,
+    }
 
 
 def check_run(name="build", status="completed", conclusion="success", run=111, **extra):
@@ -45,6 +81,9 @@ def gh(env):
         }
     )
     client.replies = client._opener.replies
+    client.replies[RUN] = workflow_run()
+    client.replies[JOBS] = {"total_count": 2, "jobs": [job(71, "build"), job(72, "test")]}
+    client._downloads = FakeDownloads()
 
     def factory(token):
         assert token == TOKEN
@@ -232,3 +271,132 @@ def test_a_rate_limit_fails_without_wait(env, gh):
     with pytest.raises(Refused, match="rate limit") as e:
         call(env, "checks", repo="me/app", ref=12)
     assert str(e.value).startswith(UNTRUSTED)
+
+
+# --- run ------------------------------------------------------------------------------------------
+
+
+def failed(gh, *logs: bytes):
+    """Make run 5 fail in job 72 (test), whose log download answers with each of `logs` in turn."""
+    gh.replies[RUN] = workflow_run(conclusion="failure")
+    gh.replies[JOBS] = {"jobs": [job(71, "build"), job(72, "test", conclusion="failure", failed_steps=["Run tests"])]}
+    gh.replies[log_of(72)] = Redirected("redirected", BLOB.format(72))
+    gh._downloads = FakeDownloads(*(FakeResponse(data, {"Content-Length": str(len(data))}) for data in logs))
+
+
+def test_a_passing_run(env, gh):
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert requests(gh) == [RUN, JOBS]
+    assert out.startswith(UNTRUSTED + "\n")
+    first = out.splitlines()[1]
+    for part in ("CI", "pull_request", "feat", "completed", "success"):
+        assert part in first
+    assert "https://github.com/me/app/actions/runs/5" in out
+    assert "- build: completed, success, 2m" in out and "- test: completed, success" in out
+    assert out.splitlines()[-1] == "Passed: 2 jobs, none failing."
+    assert gh._downloads.calls == []
+
+
+def test_a_failed_run_shows_its_failed_steps_and_log_tail(env, gh):
+    log = "".join(f"2026-10-26T10:00:{i % 60:02d}Z line {i}\n" for i in range(200)).encode()
+    failed(gh, log)
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert requests(gh) == [RUN, JOBS, log_of(72)]
+    assert [url for url, _ in gh._downloads.calls] == [BLOB.format(72)]
+    assert "- test: completed, failure, 2m; failed steps: Run tests" in out
+    assert "line 120\n" in out and "line 199" in out and "line 119\n" not in out
+    assert out.splitlines()[-1] == "Failed (failure): 1 of 2 jobs failed: test."
+
+
+def test_a_log_is_cleaned(env, gh):
+    failed(
+        gh,
+        b"\xef\xbb\xbf\x1b[31mred\x1b[0m text\r\nbad \xff byte\n"
+        b"\x1b]8;;http://x\x07link\x1b]8;;\x07 \xe2\x80\xae\x07bell\n",
+    )
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert "red text\n" in out and "bad ? byte" in out and "link" in out
+    assert "\x1b" not in out and "\x07" not in out and "\r" not in out
+    assert "\ufeff" not in out and "\u202e" not in out
+
+
+def test_long_log_lines_are_cut(env, gh):
+    failed(gh, b"x" * 50_000 + b"\n")
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert max(len(line) for line in out.splitlines()) < 2_000
+
+
+def test_a_log_that_cannot_be_read_is_said_not_failed(env, gh):
+    failed(gh)
+    gh.replies[log_of(72)] = (403, "Resource not accessible by personal access token", {})
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert "log of test is not available" in out and '"Actions"' in out
+    assert out.splitlines()[-1].startswith("Failed (failure)")
+
+
+def test_logs_are_read_for_at_most_ten_jobs(env, gh):
+    gh.replies[RUN] = workflow_run(conclusion="failure")
+    gh.replies[JOBS] = {"jobs": [job(100 + i, f"m{i}", conclusion="failure") for i in range(12)]}
+    for i in range(12):
+        gh.replies[log_of(100 + i)] = FakeResponse(b"boom\n")
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert len([r for r in requests(gh) if r[1].endswith("/logs")]) == 10
+    assert "m10, m11" in out and "12 of 12 jobs failed" in out
+
+
+def test_a_running_run(env, gh):
+    gh.replies[RUN] = workflow_run(status="in_progress", conclusion=None)
+    gh.replies[JOBS] = {"jobs": [job(71, "build"), job(72, "test", status="in_progress", conclusion=None)]}
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert "- test: in_progress" in out
+    assert out.splitlines()[-1] == "Still running (in_progress): 1 of 2 jobs not finished."
+
+
+@pytest.mark.parametrize("conclusion", ["skipped", "neutral"])
+def test_a_quiet_run_is_not_failing(env, gh, conclusion):
+    gh.replies[RUN] = workflow_run(conclusion=conclusion)
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert out.splitlines()[-1] == f"Finished {conclusion}, which counts as not failing."
+
+
+def test_a_skipped_job_is_named_in_a_pass(env, gh):
+    gh.replies[JOBS] = {"jobs": [job(71, "build"), job(72, "deploy", conclusion="skipped")]}
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert out.splitlines()[-1] == "Passed: 2 jobs, none failing (1 neutral or skipped, which count as not failing)."
+
+
+def test_jobs_are_paged(env, gh):
+    page2 = ("GET", JOBS[1].replace("&page=1", "&page=2"))
+    gh.replies[JOBS] = {"total_count": 101, "jobs": [job(i, f"j{i}") for i in range(100)]}
+    gh.replies[page2] = {"total_count": 101, "jobs": [job(500, "last")]}
+    out = call(env, "run", repo="me/app", run_id=5)
+    assert requests(gh) == [RUN, JOBS, page2]
+    assert "Passed: 101 jobs" in out
+
+
+def test_a_missing_run_is_a_plain_refusal(env, gh):
+    gh.replies[RUN] = (404, "Not Found", {})
+    with pytest.raises(Refused, match="has no workflow run 5") as e:
+        call(env, "run", repo="me/app", run_id=5)
+    assert UNTRUSTED not in str(e.value)
+
+
+@pytest.mark.parametrize("reply", [RUN, JOBS])
+def test_a_token_without_actions_read_is_named(env, gh, reply):
+    gh.replies[reply] = (403, "Resource not accessible by personal access token", {})
+    with pytest.raises(Refused) as e:
+        call(env, "run", repo="me/app", run_id=5)
+    assert str(e.value).startswith(UNTRUSTED) and '"Actions"' in str(e.value)
+
+
+@pytest.mark.parametrize("run_id", [0, -1, True, "5", None, 1.0])
+def test_a_bad_run_id_is_refused(env, gh, run_id):
+    with pytest.raises(Refused, match="run_id"):
+        call(env, "run", repo="me/app", run_id=run_id)
+    assert requests(gh) == []
+
+
+def test_run_needs_read_access(env, gh):
+    with pytest.raises(Refused, match="allowlist"):
+        call(env, "run", repo="nobody/x", run_id=5)
+    assert requests(gh) == []

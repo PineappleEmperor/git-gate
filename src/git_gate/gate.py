@@ -498,6 +498,10 @@ class Gate:
     def checks(self, rules: Rules, token: str, repo: str, ref: int | str) -> str:
         return ci.checks(self._ci(rules, token), repo, ref)
 
+    @_untrusted
+    def run(self, rules: Rules, token: str, repo: str, run_id: int) -> str:
+        return ci.run(self._ci(rules, token), repo, run_id)
+
     # --- read-only gh -------------------------------------------------------------------
 
     @_untrusted

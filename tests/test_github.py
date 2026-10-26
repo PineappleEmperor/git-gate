@@ -5,7 +5,7 @@ import urllib.request
 
 import pytest
 
-from conftest import URL, FakeOpener, FakeResponse
+from conftest import URL, FakeDownloads, FakeOpener, FakeResponse
 from git_gate import Refused
 from git_gate.github import MAX_LOG, FromGitHub, GitHub, GitHubError, RateLimited, Redirected, _SameHostRedirects
 
@@ -402,21 +402,6 @@ def test_an_exhausted_quota_on_a_good_answer_is_remembered():
 
 LOGS = ("GET", "repos/me/app/actions/jobs/9/logs")
 BLOB = "https://results.example.net/logs/9.txt?sig=abc"
-
-
-class FakeDownloads:
-    """Stands in for the opener of token-less downloads: answers in turn, records each request."""
-
-    def __init__(self, *answers):
-        self.answers = list(answers)
-        self.calls = []
-
-    def open(self, req, timeout=None):
-        self.calls.append((req.full_url, {k.lower(): v for k, v in req.header_items()}))
-        answer = self.answers.pop(0)
-        if isinstance(answer, BaseException):
-            raise answer
-        return answer
 
 
 def logs(*answers, api=None):
