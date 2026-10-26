@@ -747,3 +747,144 @@ def test_api_get_refuses(env, gh, kwargs):
 def test_api_get_needs_read_access(env, gh):
     with pytest.raises(Refused, match="allowlist"):
         call(env, "api_get", repo="nobody/x", path="")
+
+
+# --- search ---------------------------------------------------------------------------------------
+
+
+def searched(q: str, per_page: int = 30) -> tuple[str, str]:
+    from urllib.parse import quote
+
+    return ("GET", f"search/issues?q={quote(q, safe='')}&sort=updated&order=desc&per_page={per_page}")
+
+
+def hit(number, *, pull=False, merged=False, **extra):
+    item = issue(number, **extra)
+    if pull:
+        item["pull_request"] = {"url": "x", "merged_at": "2026-10-26T11:00:00Z" if merged else None}
+        item["draft"] = extra.get("draft", False)
+    return item
+
+
+def test_pr_search(env, gh):
+    path = searched("repo:me/app is:pr is:open flaky test")
+    gh.replies[path] = {"total_count": 2, "items": [hit(12, pull=True), hit(9, pull=True, draft=True)]}
+    out = call(env, "pr", repo="me/app", action="list", search="flaky test")
+    assert requests(gh) == [path]
+    lines = out.splitlines()
+    assert lines[0] == UNTRUSTED
+    assert lines[1] == 'Pull requests of me/app matching "flaky test" (open, most recently updated first; 2 found):'
+    assert lines[2] == "#12 It breaks 12 [open] labels: bug; updated 2026-10-26T10:00:00Z"
+    assert lines[3].startswith("#9 It breaks 9 [open, draft]")
+
+
+def test_pr_search_with_every_filter(env, gh):
+    path = searched('repo:me/app is:pr is:merged head:feat base:main "a b"', 5)
+    gh.replies[path] = {"items": [hit(4, pull=True, merged=True, state="closed")]}
+    out = call(
+        env, "pr", repo="me/app", action="list", search='"a b"', state="merged", head="feat", base="main", limit=5
+    )
+    assert requests(gh) == [path]
+    assert "#4 It breaks 4 [merged]" in out
+
+
+def test_issue_search(env, gh):
+    path = searched('repo:me/app is:issue label:"bug" label:"good first issue" crash -wontfix', 10)
+    gh.replies[path] = {"total_count": 1, "items": [hit(3)]}
+    out = call(env, "issue", repo="me/app", action="list", search="crash -wontfix", state="all",
+               labels=["bug", "good first issue"], limit=10)  # fmt: skip
+    assert requests(gh) == [path]
+    assert out.splitlines()[2] == "#3 It breaks 3 [open] labels: bug; updated 2026-10-26T10:00:00Z"
+
+
+def test_search_with_no_hits(env, gh):
+    gh.replies[searched("repo:me/app is:issue is:closed nothing")] = {"total_count": 0, "items": []}
+    out = call(env, "issue", repo="me/app", action="list", search="nothing", state="closed")
+    assert 'No issues of me/app match "nothing" (state closed).' in out
+
+
+def test_search_rate_limit_says_try_again_in_a_minute(env, gh):
+    gh.replies[searched("repo:me/app is:pr is:open x")] = (403, "API rate limit exceeded for search", {})
+    with pytest.raises(Refused, match="try again in a minute"):
+        call(env, "pr", repo="me/app", action="list", search="x")
+    assert len(requests(gh)) == 1
+
+
+def test_search_needs_read_access(env, gh):
+    gh.replies[searched("repo:other/lib is:issue is:open x")] = {"items": []}
+    call(env, "issue", repo="other/lib", action="list", search="x")
+    with pytest.raises(Refused, match="allowlist"):
+        call(env, "issue", repo="nobody/x", action="list", search="x")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "repo:other/x",
+        "REPO:other/x",
+        "fix -repo:me/app",
+        'fix "repo:other/x"',
+        "fix (repo:other/x)",
+        "org:github",
+        "user:octocat bug",
+        "Owner:octocat",
+        "is:public",
+        "is:PRIVATE",
+        'is:"public"',
+        "fix,repo:other/x",
+        "repo :other/x",
+        "a OR author:x",
+        "a AND b",
+        "NOT a",
+        "a) OR (b",
+        "tab\there",
+        "line\nbreak",
+        "\x1b[2J",
+        "x" * 257,
+        "",
+        "   ",
+    ],
+)
+@pytest.mark.parametrize("tool", ["pr", "issue"])
+def test_search_refuses_what_could_widen_or_break_it(env, gh, tool, text):
+    with pytest.raises(Refused) as e:
+        call(env, tool, repo="me/app", action="list", search=text)
+    assert requests(gh) == []
+    assert UNTRUSTED not in str(e.value)
+
+
+@pytest.mark.parametrize("text", ["or", "repository layout", "isn't public", "user-facing bug", "org chart", "x" * 256])
+def test_search_lets_plain_words_through(env, gh, text):
+    gh.replies[searched(f"repo:me/app is:issue is:open {text}")] = {"items": []}
+    call(env, "issue", repo="me/app", action="list", search=text)
+    assert len(requests(gh)) == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"head": "someone:fix"}, {"labels": ['a"b']}, {"search": 5}],
+)
+def test_search_refuses_filters_it_cannot_express(env, gh, kwargs):
+    tool = "issue" if "labels" in kwargs else "pr"
+    with pytest.raises(Refused):
+        call(env, tool, repo="me/app", action="list", **({"search": "x"} | kwargs))
+    assert requests(gh) == []
+
+
+def test_search_is_only_for_list(env, gh):
+    with pytest.raises(Refused, match="does not take search"):
+        call(env, "pr", repo="me/app", action="view", number=12, search="x")
+    with pytest.raises(Refused, match="does not take search"):
+        call(env, "issue", repo="me/app", action="create", title="T", search="x")
+
+
+def test_the_client_scopes_every_search_itself():
+    from conftest import FakeOpener
+    from git_gate.github import GitHub
+
+    client = GitHub("tok")
+    client._opener = FakeOpener({searched("repo:me/app is:pr x", 3): {"items": []}})
+    client.search_issues("me/app", "pr", "x", 3)
+    assert [p for _, p, _ in client._opener.calls] == [searched("repo:me/app is:pr x", 3)[1]]
+    with pytest.raises(Refused):
+        client.search_issues("me/app", "discussion", "x", 3)

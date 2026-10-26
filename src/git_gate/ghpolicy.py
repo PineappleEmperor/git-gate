@@ -24,6 +24,8 @@ READS = {
     ("workflow", "list"): 'the api_get tool, path "actions/workflows"',
     ("workflow", "view"): 'the api_get tool, path "actions/workflows" (or "actions/workflows/<file>")',
     ("label", "list"): 'the api_get tool, path "labels"',
+    ("search", "issues"): 'the issue tool, action "list" with search (this repo only)',
+    ("search", "prs"): 'the pr tool, action "list" with search (this repo only)',
     ("api",): "the api_get tool (a GET of a path relative to the repo, with query for its parameters)",
 }  # fmt: skip
 WRITES = {

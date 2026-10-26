@@ -12,13 +12,13 @@ import re
 
 from git_gate import Refused
 from git_gate.ci import Context, field, fit, listing, needs, number, text
-from git_gate.github import MAX_API, GitHubError, RateLimited, Redirected
+from git_gate.github import MAX_API, FromGitHub, GitHubError, RateLimited, Redirected
 from git_gate.writes import MAX_LABEL, _action, _given, _names, _show
 
 # action -> (required, optional, at least one of), as in writes
 PR_READS = {
     "view": ({"number"}, set(), set()),
-    "list": (set(), {"state", "head", "base", "limit"}, set()),
+    "list": (set(), {"state", "head", "base", "limit", "search"}, set()),
     "diff": ({"number"}, set(), set()),
 }
 PR_STATES = ("open", "closed", "merged", "all")
@@ -28,7 +28,7 @@ DEFAULT_LIST = 30
 MERGED_PAGES = 5  # pages of closed pull requests searched for merged ones
 ISSUE_READS = {
     "view": ({"number"}, set(), set()),
-    "list": (set(), {"state", "labels", "limit"}, set()),
+    "list": (set(), {"state", "labels", "limit", "search"}, set()),
 }
 ISSUE_STATES = ("open", "closed", "all")
 COMMENTS = 20  # the latest comments an issue view shows
@@ -46,6 +46,13 @@ RELEASE_ACTIONS = {
 MAX_RELEASES = 30
 MAX_FILE = 1 << 20  # bytes of a file the file tool shows
 REF = re.compile(r"[^\s~^:?*\[\\-][^\s~^:?*\[\\]{0,254}")  # a branch, tag or SHA, as git allows them
+MAX_SEARCH = 256  # characters of an agent's search text
+# Search text that could widen a search past its repo: GitHub ORs repeated repo: qualifiers, and
+# org:, user:, owner: and is:public/private reach other repos. Matched wherever a qualifier could
+# start, so quoted ("repo:x"), negated (-repo:x) and spaced (repo :x) forms are caught too.
+WIDENING = re.compile(r"(?i)(?<!\w)(?:(?:repo|org|user|owner)\s*:|is\s*:\s*[\"']?\s*(?:public|private)\b)")
+# Boolean operators and grouping would let text escape the qualifiers the gate puts before it.
+OPERATORS = re.compile(r"(?<!\w)(?:OR|AND|NOT)(?!\w)|[()]")
 MAX_QUERY = 20  # parameters an api_get query may hold
 REVIEW_STATES = {
     "APPROVED": "approved",
@@ -64,6 +71,8 @@ def pr(ctx: Context, repo: str, action: str, **kwargs) -> str:
     given = _given(**kwargs)
     _action("pr", action, PR_READS, given)
     if action == "list":
+        if "search" in given:
+            return _pr_search(ctx, repo, **{k: given.get(k) for k in ("search", "state", "head", "base", "limit")})
         return _pr_list(ctx, repo, **{k: given.get(k) for k in ("state", "head", "base", "limit")})
     n = number(kwargs["number"], "number")
     if action == "view":
@@ -163,6 +172,8 @@ def issue(ctx: Context, repo: str, action: str, **kwargs) -> str:
     given = _given(**kwargs)
     _action("issue", action, ISSUE_READS, given)
     if action == "list":
+        if "search" in given:
+            return _issue_search(ctx, repo, **{k: given.get(k) for k in ("search", "state", "labels", "limit")})
         return _issue_list(ctx, repo, **{k: given.get(k) for k in ("state", "labels", "limit")})
     return _issue_view(ctx, repo, number(kwargs["number"], "number"))
 
@@ -228,6 +239,93 @@ def _issue_list(ctx: Context, repo: str, state=None, labels=None, limit=None) ->
         for i in found
     ]
     return fit([f"Issues of {repo} ({state}, most recently updated first):", *lines], [], ctx.max_output)
+
+
+# --- search ----------------------------------------------------------------------------------------
+
+
+def _pr_search(ctx: Context, repo: str, search, state=None, head=None, base=None, limit=None) -> str:
+    text = _search_text(search)
+    state = _choice(state or "open", "state", PR_STATES)
+    limit = _limit(limit, DEFAULT_LIST, MAX_LIST)
+    terms = [*_state_terms(state)]
+    if head is not None:
+        if not isinstance(head, str) or ":" in head:
+            raise Refused(f'head with search is a branch of {repo}, not "owner:branch": {_show(head)}.')
+        terms.append(f"head:{_branch(ctx, head, 'head')}")
+    if base is not None:
+        terms.append(f"base:{_branch(ctx, base, 'base')}")
+    found, total = _search(ctx, repo, "pr", "Pull requests", [*terms, text], limit)
+    if not found:
+        return f'No pull requests of {repo} match "{text}" (state {state}).'
+    lines = [_search_line(i) for i in found]
+    head_line = f'Pull requests of {repo} matching "{text}" ({state}, most recently updated first; {total} found):'
+    return fit([head_line, *lines], [], ctx.max_output)
+
+
+def _issue_search(ctx: Context, repo: str, search, state=None, labels=None, limit=None) -> str:
+    text = _search_text(search)
+    state = _choice(state or "open", "state", ISSUE_STATES)
+    labels = _names(labels or [], "labels", MAX_LABEL)
+    if any('"' in name for name in labels):
+        raise Refused('labels: a label name with " cannot be searched for.')
+    limit = _limit(limit, DEFAULT_LIST, MAX_LIST)
+    terms = [*_state_terms(state), *(f'label:"{name}"' for name in labels), text]
+    found, total = _search(ctx, repo, "issue", "Issues", terms, limit)
+    if not found:
+        return f'No issues of {repo} match "{text}" (state {state}).'
+    lines = [_search_line(i) for i in found]
+    return fit(
+        [f'Issues of {repo} matching "{text}" ({state}, most recently updated first; {total} found):', *lines],
+        [], ctx.max_output,
+    )  # fmt: skip
+
+
+def _search_text(value: object) -> str:
+    """The agent's search text, refused when it could reach past the repo or is not one plain line."""
+    if not isinstance(value, str) or not value.strip():
+        raise Refused(f"search must be text to look for, not {_show(value)}.")
+    if not value.isprintable() or len(value) > MAX_SEARCH:
+        raise Refused(f"search must be one line of at most {MAX_SEARCH} printable characters.")
+    if WIDENING.search(value):
+        raise Refused(
+            "search may not hold repo:, org:, user:, owner:, is:public or is:private, in any form: GitHub ORs "
+            "repeated repo: qualifiers, so they would widen the search past this repo. The gate adds repo: itself."
+        )
+    if OPERATORS.search(value):
+        raise Refused(
+            "search may not hold OR, AND, NOT or parentheses: they could reach past the gate's own qualifiers."
+        )
+    return value.strip()
+
+
+def _state_terms(state: str) -> list[str]:
+    return [] if state == "all" else [f"is:{state}"]
+
+
+def _search(ctx: Context, repo: str, kind: str, permission: str, terms: list[str], limit: int):
+    """(the items found, GitHub's total count) of one page of search/issues."""
+    try:
+        got = needs(repo, permission, lambda: ctx.api.search_issues(repo, kind, " ".join(terms), limit))
+    except RateLimited as e:
+        raise FromGitHub(f"{e} GitHub allows 30 searches a minute; try again in a minute.") from None
+    got = got if isinstance(got, dict) else {}
+    items = [i for i in got.get("items") or [] if isinstance(i, dict)][:limit]
+    total = got.get("total_count") if type(got.get("total_count")) is int else len(items)
+    return items, total
+
+
+def _search_line(item: dict) -> str:
+    pull = item.get("pull_request") if isinstance(item.get("pull_request"), dict) else None
+    if pull and pull.get("merged_at"):
+        state = "merged"
+    else:
+        state = field(item.get("state")) + (", draft" if item.get("draft") else "")
+    return (
+        f"#{field(item.get('number'))} {field(item.get('title'))} [{state}]"
+        + (f" labels: {_labels(item)}" if _labels(item) else "")
+        + f"; updated {field(item.get('updated_at'))}"
+    )
 
 
 # --- runs ------------------------------------------------------------------------------------------

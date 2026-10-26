@@ -46,6 +46,8 @@ def test_instructions_say_agents_never_call_gh():
         (["pr", "create", "--title", "x"], "pr tool, action create"),
         (["run", "rerun", "5"], "workflow_run tool"),
         (["pr", "merge", "7"], "merging"),
+        (["search", "issues", "flaky"], 'issue tool, action "list" with search'),
+        (["search", "prs", "flaky"], 'pr tool, action "list" with search'),
         (["browse"], "typed tools"),
         ([], "typed tools"),
     ],

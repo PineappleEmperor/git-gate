@@ -276,6 +276,7 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         draft: bool = False,
         state: str | None = None,
         limit: int | None = None,
+        search: str | None = None,
     ) -> str:
         """Read, open or change pull requests. Push the branch first. Merging and approving are the user's.
 
@@ -283,7 +284,10 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         - view: number. Title, state, draft, author, branches, mergeable state, labels, requested
           reviewers, each reviewer's latest review, URL and body.
         - list: optional state (open, closed, merged, all; default open), head (a branch, or
-          owner:branch for a fork), base, limit (at most 100, default 30). One line each.
+          owner:branch for a fork), base, limit (at most 100, default 30), search (text GitHub's
+          search matches, at most 256 characters; the gate adds repo: and is:pr itself and refuses
+          repo:, org:, user:, owner:, is:public, is:private, OR, AND, NOT and parentheses; with
+          search, head is a plain branch). One line each.
         - diff: number. The unified diff, cut when longer than the gate shows.
         Writes, and what they take (anything else is refused):
         - create: title, head (a pushed branch); optional body_file, base (default branch), draft
@@ -297,7 +301,7 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         """
         return await run(
             "pr", repo=repo, action=action, number=number, title=title, body_file=body_file, base=base, head=head,
-            draft=draft, state=state, limit=limit,
+            draft=draft, state=state, limit=limit, search=search,
         )  # fmt: skip
 
     @server.tool()
@@ -310,13 +314,15 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         state: str | None = None,
         labels: list[str] | None = None,
         limit: int | None = None,
+        search: str | None = None,
     ) -> str:
         """Read, open or change issues.
 
         Reads (read access is enough):
         - view: number. Title, state, author, labels, assignees, URL, body and the last 20 comments.
         - list: optional state (open, closed, all; default open), labels (issues with all of them),
-          limit (at most 100, default 30). Pull requests are left out. One line each.
+          limit (at most 100, default 30), search (text to look for, as for pr list). Pull requests
+          are left out. One line each.
         Writes, and what they take (anything else is refused):
         - create: title; optional body_file
         - edit: number, and at least one of title, body_file
@@ -327,7 +333,7 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         """
         return await run(
             "issue", repo=repo, action=action, number=number, title=title, body_file=body_file, state=state,
-            labels=labels, limit=limit,
+            labels=labels, limit=limit, search=search,
         )  # fmt: skip
 
     @server.tool()

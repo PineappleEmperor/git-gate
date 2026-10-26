@@ -397,6 +397,16 @@ class GitHub:
         query += f"&labels={urllib.parse.quote(','.join(labels), safe='')}" if labels else ""
         return self._request("GET", f"repos/{repo}/issues?{query}")
 
+    def search_issues(self, repo: str, kind: str, terms: str, per_page: int) -> dict:
+        """One page of GET search/issues, most recently updated first, always held to `repo` and to
+        pull requests or issues (`kind` "pr" or "issue"): this method puts both qualifiers first
+        itself. `terms` must already be checked: GitHub ORs repeated repo: qualifiers, so text that
+        names another repo, owner or visibility would widen the search past `repo`."""
+        if kind not in ("pr", "issue"):
+            raise Refused(f"Searches are of pull requests or issues, not {kind!r}.")
+        q = urllib.parse.quote(f"repo:{repo} is:{kind} {terms}".strip(), safe="")
+        return self._request("GET", f"search/issues?q={q}&sort=updated&order=desc&per_page={per_page}")
+
     def commit(self, repo: str, sha: str) -> dict | None:
         """A commit, or None when GitHub knows no commit by that (abbreviated) SHA."""
         return self._request("GET", f"repos/{repo}/commits/{self._segment(sha)}", absent=(404, 422))

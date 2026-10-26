@@ -441,9 +441,10 @@ class Gate:
         draft: bool = False,
         state: str | None = None,
         limit: int | None = None,
+        search: str | None = None,
     ) -> str:
         fields = dict(number=number, title=title, body_file=body_file, base=base, head=head, draft=draft, state=state,
-                      limit=limit)  # fmt: skip
+                      limit=limit, search=search)  # fmt: skip
         if isinstance(action, str) and action in reads.PR_READS:
             return reads.pr(self._ci(rules, token, repo), repo, action, **fields)
         return writes.pr(self._writes(rules, token), repo, action, **fields, reads=tuple(reads.PR_READS))
@@ -461,8 +462,11 @@ class Gate:
         state: str | None = None,
         labels: list[str] | None = None,
         limit: int | None = None,
+        search: str | None = None,
     ) -> str:
-        fields = dict(number=number, title=title, body_file=body_file, state=state, labels=labels, limit=limit)
+        fields = dict(
+            number=number, title=title, body_file=body_file, state=state, labels=labels, limit=limit, search=search
+        )
         if isinstance(action, str) and action in reads.ISSUE_READS:
             return reads.issue(self._ci(rules, token, repo), repo, action, **fields)
         return writes.issue(self._writes(rules, token), repo, action, **fields, reads=tuple(reads.ISSUE_READS))

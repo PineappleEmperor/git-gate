@@ -194,12 +194,14 @@ def pr(
     draft: bool = False,
     state: str | None = None,
     limit: int | None = None,
+    search: str | None = None,
     reads: Sequence[str] = (),
 ) -> str:
     ctx.rules.require_write(repo)
     given = _given(
-        number=number, title=title, body_file=body_file, base=base, head=head, draft=draft, state=state, limit=limit
-    )
+        number=number, title=title, body_file=body_file, base=base, head=head, draft=draft, state=state, limit=limit,
+        search=search,
+    )  # fmt: skip
     _action("pr", action, PR_ACTIONS, given, reads)
     n = _number(number, "number") if "number" in given else None
     if title is not None:
@@ -245,10 +247,13 @@ def issue(
     state: str | None = None,
     labels: Sequence[str] | None = None,
     limit: int | None = None,
+    search: str | None = None,
     reads: Sequence[str] = (),
 ) -> str:
     ctx.rules.require_write(repo)
-    given = _given(number=number, title=title, body_file=body_file, state=state, labels=labels, limit=limit)
+    given = _given(
+        number=number, title=title, body_file=body_file, state=state, labels=labels, limit=limit, search=search
+    )
     _action("issue", action, ISSUE_ACTIONS, given, reads)
     n = _number(number, "number") if "number" in given else None
     if title is not None:
