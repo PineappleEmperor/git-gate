@@ -261,7 +261,8 @@ After `y`, the repo exists (created by `POST /user/repos` with the app's user to
 4. Agent: push `main` to `<scratch>` (the user runs the `gitgatepush` handover). User: run
    `gitgatesetup <id>` again.
 
-Expect: only the ruleset is left to apply; after `y` the run ends `Done. Setup <id> is closed.` with
+Expect: only the ruleset is left to apply (if step 5 found the status unreadable, the
+`dependency graph: unknown → enabled` line shows again and is applied too); after `y` the run ends `Done. Setup <id> is closed.` with
 exit status 0. The ruleset shows under the repo's Settings, Rules.
 
 5. User: note the `dependency graph` line of the first and second runs.
@@ -273,7 +274,9 @@ Expect: record whether the status was readable with this token (`disabled → en
    the same values and the user runs its id.
 
 Expect: the first gives `No open setup <id>.` and a non-zero status. The second lists every item as
-`already set`, no `Apply?` prompt, and closes.
+`already set`, no `Apply?` prompt, and closes. If step 5 found the status unreadable, the
+`dependency graph` line shows `unknown → enabled` on every run, `Apply?` is asked for it alone, and the
+setup closes in that run because GitHub accepted the PATCH.
 
 7. User: the token expires after 8 hours but is kept nowhere, so it cannot be tried. Run
    `grep -r ghu_ ~/.config/git-gate ~/.local/state/git-gate` after a run.
