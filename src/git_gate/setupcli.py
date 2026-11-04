@@ -119,9 +119,11 @@ def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, secrets: 
         if not _yes(stdin, say):
             say(f"Not applied. Setup {s.id} stays open.")
             return "declined"
+        accepted: set[str] = set()
         for item in todo:
             try:
                 item.apply()
+                accepted.add(item.name)
             except Refused as e:
                 if isinstance(e, GitHubError) and e.status in NOT_INSTALLED:
                     say(f"GitHub refused {item.name} ({e.status}). The app may not be installed on this repository "
@@ -131,7 +133,7 @@ def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, secrets: 
                     say(f"Applying {item.name} failed: {e}")
                 say(f"Setup {s.id} stays open. Re-run: gitgatesetup {s.id}")
                 return "open"
-        plan = _survey(gh, s)
+        plan = _survey(gh, s, frozenset(accepted))
 
     _others(gh, s, plan, say)
     left = [item for item in plan.items if item.line != SET]
@@ -157,9 +159,10 @@ def _yes(stdin, say) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def _survey(gh: GitHub, s: SetupRequest) -> Survey:
+def _survey(gh: GitHub, s: SetupRequest, accepted: frozenset[str] = frozenset()) -> Survey:
     """Read GitHub's live state for every item of `s`. Every value read from GitHub is cleaned before
-    it is shown, and an item's `apply` is set only when it differs from the request."""
+    it is shown, and an item's `apply` is set only when it differs from the request. `accepted` names
+    the items GitHub took a change for in this run."""
     repo, out = s.repo, Survey()
     live = gh.repo(repo)
     if live is None:
@@ -178,12 +181,21 @@ def _survey(gh: GitHub, s: SetupRequest) -> Survey:
         out.items.append(
             _item("Issues", live.get("has_issues") is True, "off", "on", lambda: gh.edit_repo(repo, has_issues=True))
         )
-        topics, graph = gh.topics(repo), gh.dependency_graph_on(repo)
+        topics, graph = gh.topics(repo), gh.dependency_graph_on(repo, live)
     out.items.append(_item("topics", set(topics) == set(s.topics), _names(topics), _names(s.topics),
                            lambda: gh.set_topics(repo, s.topics)))  # fmt: skip
-    out.items.append(_item("dependency graph", graph, "off", "on", lambda: gh.enable_dependency_graph(repo)))
+    out.items.append(_graph(gh, repo, graph, accepted))
     out.items.append(_ruleset(gh, s, live, out))
     return out
+
+
+def _graph(gh: GitHub, repo: str, on: bool | None, accepted: frozenset[str]) -> Item:
+    """The dependency graph. Its status may be unreadable to the app; then the enabling PATCH is sent,
+    and GitHub accepting it is the verification, so an unreadable status never blocks closing."""
+    if on or (on is None and "dependency graph" in accepted):
+        return Item("dependency graph", SET)
+    current = "unknown" if on is None else "disabled"
+    return Item("dependency graph", f"{current} → enabled", lambda: gh.enable_dependency_graph(repo))
 
 
 def _ruleset(gh: GitHub, s: SetupRequest, live: dict | None, out: Survey) -> Item:

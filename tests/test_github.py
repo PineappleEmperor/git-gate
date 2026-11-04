@@ -567,20 +567,34 @@ def test_topics_are_the_names():
     assert gh._opener.calls == [("GET", "repos/me/app/topics", None)]
 
 
+SBOM = ("GET", "repos/me/app/dependency-graph/sbom")
+
+
+@pytest.mark.parametrize(("status", "on"), [("enabled", True), ("disabled", False)])
+def test_dependency_graph_status_comes_from_security_and_analysis(status, on):
+    live = {"security_and_analysis": {"dependency_graph": {"status": status}}}
+    gh = make({("GET", "repos/me/app"): live})
+    assert gh.dependency_graph_on("me/app") is on
+    assert gh._opener.calls == [("GET", "repos/me/app", None)]  # no SBOM read
+    gh = make()
+    assert gh.dependency_graph_on("me/app", live) is on
+    assert gh._opener.calls == []  # the repository object the caller already holds
+
+
 @pytest.mark.parametrize(
     ("reply", "on"),
-    [(b'{"sbom": {}}', True), (404, False), ((403, "Resource not accessible by integration", {}), False)],
+    [(b'{"sbom": {}}', True), (404, None), ((403, "Resource not accessible by integration", {}), None)],
 )
-def test_dependency_graph_on_reads_the_sbom(reply, on):
-    gh = make({("GET", "repos/me/app/dependency-graph/sbom"): reply})
-    assert gh.dependency_graph_on("me/app") is on
-    assert gh._opener.calls == [("GET", "repos/me/app/dependency-graph/sbom", None)]
+def test_dependency_graph_without_a_status_reads_the_sbom(reply, on):
+    gh = make({SBOM: reply})
+    assert gh.dependency_graph_on("me/app", {"security_and_analysis": {"advanced_security": {}}}) is on
+    assert gh._opener.calls == [(*SBOM, None)]
 
 
 def test_dependency_graph_rate_limit_still_refuses():
-    gh = make({("GET", "repos/me/app/dependency-graph/sbom"): (403, "API rate limit exceeded", {})})
+    gh = make({SBOM: (403, "API rate limit exceeded", {})})
     with pytest.raises(RateLimited):
-        gh.dependency_graph_on("me/app")
+        gh.dependency_graph_on("me/app", {})
 
 
 def test_rulesets_lists_the_repositorys_own_page_by_page():

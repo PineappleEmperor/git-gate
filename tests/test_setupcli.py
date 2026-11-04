@@ -97,7 +97,7 @@ class FakeGitHub:
         self._call("set_topics", repo, tuple(names))
         self.live_topics = list(names)
 
-    def dependency_graph_on(self, repo):
+    def dependency_graph_on(self, repo, live=None):
         self._call("dependency_graph_on", repo)
         return self.graph
 
@@ -394,9 +394,38 @@ def test_a_change_that_does_not_take_keeps_the_setup_open(setups):
     gh.enable_dependency_graph = lambda repo: gh._call("enable_dependency_graph", repo)  # GitHub ignores it
     code, out = run(["1"], gh)
     assert code == 1
-    assert "dependency graph: off → on" in out.split("Apply?")[1]
+    assert "dependency graph: disabled → enabled" in out.split("Apply?")[1]
     assert "Re-run: gitgatesetup 1" in out
     setups.get(1)
+
+
+def test_an_unreadable_dependency_graph_is_enabled_and_counts_once_accepted(setups):
+    create(setups)
+    gh = all_set(graph=None)
+    gh.enable_dependency_graph = lambda repo: gh._call("enable_dependency_graph", repo)  # still unreadable after
+    code, out = run(["1"], gh)
+    assert "dependency graph: unknown → enabled" in out
+    assert gh.writes() == [("enable_dependency_graph", REPO)]
+    assert code == 0, out
+    assert "Done. Setup 1 is closed." in out
+
+
+def test_an_unreadable_dependency_graph_whose_patch_is_refused_stays_open(setups):
+    create(setups)
+    gh = all_set(graph=None)
+    gh.fail["enable_dependency_graph"] = GitHubError("GitHub PATCH repos/me/app returned 403: no", 403, {})
+    code, out = run(["1"], gh)
+    assert code == 1 and "installations/new" in out
+    setups.get(1)
+
+
+def test_an_enabled_dependency_graph_is_not_patched(setups):
+    create(setups)
+    gh = all_set(graph=True, topics=())
+    code, out = run(["1"], gh)
+    assert code == 0, out
+    assert "dependency graph: already set" in out
+    assert ("enable_dependency_graph", REPO) not in gh.writes()
 
 
 def test_other_rulesets_requiring_checks_are_reported(setups):

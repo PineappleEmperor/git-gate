@@ -569,9 +569,18 @@ class GitHub:
         """Replace the repository's topics with `names`."""
         self._request("PUT", f"repos/{repo}/topics", {"names": list(names)})
 
-    def dependency_graph_on(self, repo: str) -> bool:
-        """Whether GitHub serves the repository's SBOM, which it does only with the dependency graph on.
-        404 and 403 mean off; a rate-limit 403 still refuses. One byte of the answer is enough."""
+    def dependency_graph_on(self, repo: str, live: dict | None = None) -> bool | None:
+        """Whether the dependency graph is on; None when GitHub does not say.
+
+        The repository object (`live`, else read here) says so in security_and_analysis when GitHub
+        includes it. Otherwise a served SBOM means on, and its 403 or 404 means unknown: the setup app
+        has no contents permission, which the SBOM may need. A rate-limit 403 still refuses. One byte
+        of the SBOM is enough."""
+        live = self.repo(repo) if live is None else live
+        found = live.get("security_and_analysis") if isinstance(live, dict) else None
+        graph = found.get("dependency_graph") if isinstance(found, dict) else None
+        if isinstance(graph, dict) and "status" in graph:
+            return graph["status"] == "enabled"
         data = self._request(
             "GET",
             f"repos/{repo}/dependency-graph/sbom",
@@ -579,7 +588,7 @@ class GitHub:
             absent_if=lambda status, message: status == 403 and "rate limit" not in message.lower(),
             raw=0,
         )
-        return data is not None
+        return True if data is not None else None
 
     def enable_dependency_graph(self, repo: str) -> None:
         data = {"security_and_analysis": {"dependency_graph": {"status": "enabled"}}}
