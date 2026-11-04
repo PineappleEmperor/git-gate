@@ -233,6 +233,55 @@ closed PR branches.`
 
 Expect: no `origin/smoke/*` remains.
 
+## 12. Repo setup (`repo_setup` and `gitgatesetup`)
+
+Needs a scratch repo name that does not exist yet, `<scratch>` (`PineappleEmperor/smoke-setup`), and a
+workspace holding a ruleset JSON file at `<abs>/.tmp/ruleset.json`.
+
+1. User: run `gitgatesetup --register`, approve the app on GitHub, then install it as the command
+   prints. Note whether **Enable Device Flow** was already ticked.
+
+Expect: `Registered <slug>.`, the install link, and the Device Flow reminder.
+`~/.config/git-gate/setup-app.json` holds only `client_id`, `slug` and `owner`. A second
+`--register` is refused with `A setup app is already registered`.
+
+2. User: install the app on **All repositories**, then create `<scratch>` later (step 3).
+
+Expect: step 3 needs no further install step.
+
+3. Agent: `repo_setup(<scratch>, "Scratch repo", ["smoke"], "<abs>/.tmp/ruleset.json")`. User: run the
+   `gitgatesetup <id>` it names.
+
+Expect: the reply `Setup <id> recorded for <scratch>.` with `gitgatesetup <id>`. The run prints the
+device code and URL, then `repository: absent → create public <scratch>`, the other items, and
+`ruleset: deferred: main does not exist yet; push it (gitgatepush), then re-run gitgatesetup <id>`.
+After `y`, the repo exists (created by `POST /user/repos` with the app's user token) and the run ends
+`Not done yet:` with the ruleset line, exit status 1. `gitgatesetup` with no id lists the setup.
+
+4. Agent: push `main` to `<scratch>` (the user runs the `gitgatepush` handover). User: run
+   `gitgatesetup <id>` again.
+
+Expect: only the ruleset is left to apply; after `y` the run ends `Done. Setup <id> is closed.` with
+exit status 0. The ruleset shows under the repo's Settings, Rules.
+
+5. User: note the `dependency graph` line of the first and second runs.
+
+Expect: record whether the status was readable with this token (`disabled → enabled`) or not
+(`unknown → enabled`), and whether the PATCH took (no `Applying dependency graph failed`).
+
+6. User: run `gitgatesetup <id>` once more. Then Agent: send a new `repo_setup` for `<scratch>` with
+   the same values and the user runs its id.
+
+Expect: the first gives `No open setup <id>.` and a non-zero status. The second lists every item as
+`already set`, no `Apply?` prompt, and closes.
+
+7. User: the token expires after 8 hours but is kept nowhere, so it cannot be tried. Run
+   `grep -r ghu_ ~/.config/git-gate ~/.local/state/git-gate` after a run.
+
+Expect: no match. After 8 hours a later `gitgatesetup <id>` signs in again.
+
+8. User: delete `<scratch>` on GitHub yourself (Settings, Danger Zone).
+
 ## Result
 
 The run passes when every Expect above held. Record the release sha, the date, and the first
