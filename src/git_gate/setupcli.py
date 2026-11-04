@@ -230,6 +230,14 @@ def _ruleset(gh: GitHub, s: SetupRequest, live: dict | None, out: Survey) -> Ite
         out.ruleset_id = id
         return Item("ruleset", SET)
     line = f"{_quote(str(name))} (id {id}) differs → replace it. rules: {_rules(have)} → {_rules(s.ruleset)}"
+    if _scope(have) != _scope(s.ruleset):
+        line += f"\n    branches: {_scope(have)} → {_scope(s.ruleset)}"
+    if have.get("enforcement") != s.ruleset.get("enforcement"):
+        line += (
+            f"\n    enforcement: {_clean(str(have.get('enforcement')))} → {_clean(str(s.ruleset.get('enforcement')))}"
+        )
+    if bypass := _bypass(have):
+        line += f"\n    bypass actors: {bypass} → {_bypass(s.ruleset) or 'none'}"
     if lost := _removed(have, s.ruleset):
         line += f"\n    removes: {lost}"
     return Item("ruleset", line, lambda: gh.update_ruleset(s.repo, id, s.ruleset))
@@ -282,12 +290,35 @@ def _rules(ruleset: object) -> str:
     return ", ".join(parts) or "(none)"
 
 
+def _refs(ruleset: object, key: str) -> list[str]:
+    """The `include` or `exclude` branch patterns of a ruleset's ref_name condition."""
+    conditions = ruleset.get("conditions") if isinstance(ruleset, dict) else None
+    ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
+    refs = ref_name.get(key) if isinstance(ref_name, dict) else None
+    return [str(r) for r in refs] if isinstance(refs, list) else []
+
+
+def _scope(ruleset: object) -> str:
+    """Which branches a ruleset covers: its include patterns, then any exclude patterns."""
+    exclude = _refs(ruleset, "exclude")
+    return f"include {_names(_refs(ruleset, 'include'))}" + (f"; exclude {_names(exclude)}" if exclude else "")
+
+
+def _bypass(ruleset: object) -> int:
+    actors = ruleset.get("bypass_actors") if isinstance(ruleset, dict) else None
+    return len(actors) if isinstance(actors, list) else 0
+
+
 def _removed(have: object, want: object) -> str:
-    """What replacing `have` with `want` drops: rule types, and required check contexts."""
+    """What replacing `have` with `want` drops: rule types, required check contexts, and branches it no
+    longer covers (an include pattern gone, or an exclude pattern added)."""
     kept = {r.get("type") for r in _rule_list(want)}
     gone = [_clean(str(r.get("type"))) for r in _rule_list(have) if r.get("type") not in kept]
     wanted = _checks(want)
     gone += [f'check "{_clean(c)}"' for c in _checks(have) if c not in wanted]
+    included, excluded = _refs(want, "include"), _refs(have, "exclude")
+    gone += [f'branches "{_clean(r)}"' for r in _refs(have, "include") if r not in included]
+    gone += [f'branches "{_clean(r)}" (newly excluded)' for r in _refs(want, "exclude") if r not in excluded]
     return ", ".join(gone)
 
 

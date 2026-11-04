@@ -287,6 +287,39 @@ def test_replacing_without_dropping_anything_has_no_removes_line(setups):
     assert "removes:" not in out
 
 
+def test_replacing_a_broader_ruleset_shows_the_branches_it_drops(setups):
+    create(setups)
+    broad = copy.deepcopy(RULESET)
+    broad["conditions"]["ref_name"]["include"] = ["~DEFAULT_BRANCH", "refs/heads/rel\x1b[31m/*"]
+    gh = all_set(rulesets=[live_ruleset(broad, 9)])
+    code, out = run(["1"], gh, answer="n\n")
+    assert code == 1 and gh.writes() == []
+    assert "branches: include ~DEFAULT_BRANCH, refs/heads/rel?[31m/* → include ~DEFAULT_BRANCH" in out
+    assert 'removes: branches "refs/heads/rel?[31m/*"' in out
+    assert "\x1b" not in out
+
+
+def test_replacing_with_a_new_exclude_shows_the_branches_it_drops(setups):
+    narrow = copy.deepcopy(RULESET)
+    narrow["conditions"]["ref_name"]["exclude"] = ["refs/heads/main"]
+    create(setups, ruleset=narrow)
+    code, out = run(["1"], all_set(rulesets=[live_ruleset(RULESET, 9)]), answer="n\n")
+    assert "branches: include ~DEFAULT_BRANCH → include ~DEFAULT_BRANCH; exclude refs/heads/main" in out
+    assert 'removes: branches "refs/heads/main" (newly excluded)' in out
+
+
+def test_replacing_shows_enforcement_and_bypass_changes(setups):
+    create(setups)
+    live = copy.deepcopy(RULESET)
+    live["enforcement"] = "evaluate"
+    live["bypass_actors"] = [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]
+    code, out = run(["1"], all_set(rulesets=[live_ruleset(live, 9)]), answer="n\n")
+    assert "enforcement: evaluate → active" in out
+    assert "bypass actors: 1 → none" in out
+    assert "removes:" not in out
+    assert "branches:" not in out
+
+
 def test_an_absent_ruleset_shows_the_wanted_rules(setups):
     create(setups)
     code, out = run(["1"], all_set(rulesets=[]), answer="n\n")
