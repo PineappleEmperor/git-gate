@@ -343,14 +343,14 @@ class GitHub:
         path = "/".join(self._segment(part) for part in name.split("/"))
         return self._request("GET", f"repos/{repo}/git/ref/tags/{path}", absent=(404,)) is not None
 
-    def _pages(self, path: str, key: str) -> list:
-        """The `key` list of a paged answer such as {"total_count": n, key: [...]}, page by page,
-        at most MAX_PAGES of them."""
+    def _pages(self, path: str, key: str | None) -> list:
+        """The `key` list of a paged answer such as {"total_count": n, key: [...]}, or with key None
+        an answer that is itself the list, page by page, at most MAX_PAGES of them."""
         items: list = []
         sep = "&" if "?" in path else "?"
         for page in range(1, MAX_PAGES + 1):
             data = self._request("GET", f"{path}{sep}per_page={PER_PAGE}&page={page}")
-            data = data if isinstance(data, dict) else {}
+            data = {None: data} if key is None else data if isinstance(data, dict) else {}
             got = data.get(key) if isinstance(data.get(key), list) else []
             items += got
             total = data.get("total_count")
@@ -540,3 +540,66 @@ class GitHub:
             self._request("PATCH", f"repos/{repo}/labels/{self._segment(name)}", data)
         else:
             raise Refused(f"Unknown label action {action!r}; use create or edit.")
+
+    # --- repository administration, for gitgatesetup (a user-to-server token of the setup app) ---
+
+    def viewer(self) -> str:
+        """The login of the user the token acts for."""
+        return self._request("GET", "user")["login"]
+
+    def repo(self, repo: str) -> dict | None:
+        """The repository, or None when there is none (or the token may not see it)."""
+        return self._request("GET", f"repos/{repo}", absent=(404,))
+
+    def create_user_repo(self, name: str, description: str) -> None:
+        """A public, empty repository under the token's user, Issues on."""
+        data = {"name": name, "description": description, "has_issues": True, "auto_init": False, "private": False}
+        self._request("POST", "user/repos", data)
+
+    def edit_repo(self, repo: str, *, description: str | None = None, has_issues: bool | None = None) -> None:
+        """Change only the fields given."""
+        fields = {"description": description, "has_issues": has_issues}
+        self._request("PATCH", f"repos/{repo}", {k: v for k, v in fields.items() if v is not None})
+
+    def topics(self, repo: str) -> list[str]:
+        names = (self._request("GET", f"repos/{repo}/topics") or {}).get("names")
+        return [n for n in names if isinstance(n, str)] if isinstance(names, list) else []
+
+    def set_topics(self, repo: str, names) -> None:
+        """Replace the repository's topics with `names`."""
+        self._request("PUT", f"repos/{repo}/topics", {"names": list(names)})
+
+    def dependency_graph_on(self, repo: str) -> bool:
+        """Whether GitHub serves the repository's SBOM, which it does only with the dependency graph on.
+        404 and 403 mean off; a rate-limit 403 still refuses. One byte of the answer is enough."""
+        data = self._request(
+            "GET",
+            f"repos/{repo}/dependency-graph/sbom",
+            absent=(404,),
+            absent_if=lambda status, message: status == 403 and "rate limit" not in message.lower(),
+            raw=0,
+        )
+        return data is not None
+
+    def enable_dependency_graph(self, repo: str) -> None:
+        data = {"security_and_analysis": {"dependency_graph": {"status": "enabled"}}}
+        self._request("PATCH", f"repos/{repo}", data)
+
+    def rulesets(self, repo: str) -> list[dict]:
+        """The repository's own rulesets, in summary (no rules); ruleset() reads one in full."""
+        return [r for r in self._pages(f"repos/{repo}/rulesets?includes_parents=false", None) if isinstance(r, dict)]
+
+    def ruleset(self, repo: str, id: int) -> dict:
+        return self._request("GET", f"repos/{repo}/rulesets/{int(id)}")
+
+    def create_ruleset(self, repo: str, body: dict) -> int:
+        return self._request("POST", f"repos/{repo}/rulesets", body)["id"]
+
+    def update_ruleset(self, repo: str, id: int, body: dict) -> None:
+        self._request("PUT", f"repos/{repo}/rulesets/{int(id)}", body)
+
+    def branch_rule_rulesets(self, repo: str, branch: str) -> list[dict]:
+        """The required_status_checks rules that apply to `branch`, from every ruleset, each naming
+        its ruleset_id and ruleset_source_type; [] when there are none."""
+        data = self._request("GET", f"repos/{repo}/rules/branches/{self._branch(branch)}", absent=(404,))
+        return [r for r in data or [] if isinstance(r, dict) and r.get("type") == "required_status_checks"]
