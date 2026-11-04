@@ -1,9 +1,13 @@
+import http.server
+import json
+import threading
 import webbrowser
+from urllib.parse import parse_qs
 
 import pytest
 
 from git_gate import Refused
-from git_gate.devicelogin import device_login
+from git_gate.devicelogin import _post, device_login
 
 URI = "https://github.com/login/device"
 FIRST = {
@@ -108,3 +112,84 @@ def test_token_never_said():
     h = Harness([{"access_token": "ghu_x"}])
     h.run()
     assert not any("ghu_x" in line or "dc_secret" in line for line in h.said)
+
+
+# The default post, against local servers on 127.0.0.1 only.
+
+
+@pytest.fixture
+def server():
+    """Start servers whose handler is `respond(handler) -> None`; record every request."""
+    started = []
+
+    def start(respond):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                seen.append((self.command, self.path, dict(self.headers), body, self.server.server_port))
+                respond(self)
+
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        started.append(srv)
+        return f"http://127.0.0.1:{srv.server_port}", seen
+
+    yield start
+    for srv in started:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _reply(status, body, headers=()):
+    def respond(h):
+        h.send_response(status)
+        for k, v in headers:
+            h.send_header(k, v)
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+
+    return respond
+
+
+def test_post_sends_form_with_json_accept(server):
+    base, seen = server(_reply(200, b'{"ok": 1}'))
+    assert _post(base + "/login/device/code", {"client_id": "Iv1.abc", "a": "b c"}) == {"ok": 1}
+    method, path, headers, body, _ = seen[0]
+    assert method == "POST" and path == "/login/device/code"
+    assert headers["Accept"] == "application/json"
+    assert headers["Content-Type"] == "application/x-www-form-urlencoded"
+    assert parse_qs(body.decode()) == {"client_id": ["Iv1.abc"], "a": ["b c"]}
+
+
+def test_post_refuses_cross_host_redirect(server):
+    other, target_seen = server(_reply(200, b"{}"))
+    base, seen = server(_reply(307, b"", [("Location", other + "/x")]))
+    with pytest.raises(Refused, match="another host"):
+        _post(base + "/start", {"client_id": "c"})
+    assert len(seen) == 1 and target_seen == []
+
+
+def test_post_http_error_is_refused_with_capped_snippet(server):
+    body = b"x" * 120 + b"access_token=ghu_secret"
+    base, _ = server(_reply(500, body))
+    with pytest.raises(Refused, match="HTTP 500") as e:
+        _post(base + "/t", {})
+    assert "ghu_secret" not in str(e.value) and "x" * 120 in str(e.value)
+
+
+def test_post_non_json_is_refused(server):
+    base, _ = server(_reply(200, b"<html>nope</html>"))
+    with pytest.raises(Refused, match="JSON"):
+        _post(base + "/t", {})
+
+
+def test_post_json_list_is_refused(server):
+    base, _ = server(_reply(200, json.dumps([1, 2]).encode()))
+    with pytest.raises(Refused, match="unexpected"):
+        _post(base + "/t", {})
