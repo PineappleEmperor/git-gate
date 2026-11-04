@@ -70,7 +70,8 @@ def main(argv: list[str], *, stdin=sys.stdin, stdout=sys.stdout, login=device_lo
         say(str(e), lines=True)
         return 1
     except KeyboardInterrupt:
-        say("\nInterrupted.")
+        say()
+        say("Interrupted.")
         return 1
 
 
@@ -112,7 +113,7 @@ def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, secrets: 
     plan = _survey(gh, s)
     say(f"Setup {s.id}: {s.repo}")
     for item in plan.items:
-        say(f"  {item.name}: {item.line}")
+        say(f"  {item.name}: {item.line}", lines=True)  # every live value in a line is cleaned already
     todo = [item for item in plan.items if item.apply]
     if todo:
         say("Apply? [y/N] ", end="")
@@ -124,8 +125,15 @@ def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, secrets: 
             try:
                 item.apply()
                 accepted.add(item.name)
+            except KeyboardInterrupt:
+                if not accepted:
+                    raise
+                say()
+                say("Interrupted.")
+                say(f"Re-run: gitgatesetup {s.id}")
+                return "open"
             except Refused as e:
-                if isinstance(e, GitHubError) and e.status in NOT_INSTALLED:
+                if isinstance(e, GitHubError) and (e.status in NOT_INSTALLED or _name_taken(item, e)):
                     say(f"GitHub refused {item.name} ({e.status}). The app may not be installed on this repository "
                         f"or may lack a permission; install it on all repositories: "
                         f"https://github.com/apps/{app.slug}/installations/new")  # fmt: skip
@@ -140,12 +148,17 @@ def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, secrets: 
     if left:
         say("Not done yet:")
         for item in left:
-            say(f"  {item.name}: {item.line}")
+            say(f"  {item.name}: {item.line}", lines=True)  # every live value in a line is cleaned already
         say(f"Re-run: gitgatesetup {s.id}")
         return "open"
     setups.close(s.id)
     say(f"Done. Setup {s.id} is closed.")
     return "closed"
+
+
+def _name_taken(item: Item, e: GitHubError) -> bool:
+    """Creating the repository failed because the name is taken: a private repo the app cannot see."""
+    return item.name == "repository" and e.status == 422 and "already exists" in str(e).lower()
 
 
 def _yes(stdin, say) -> bool:
@@ -168,7 +181,7 @@ def _survey(gh: GitHub, s: SetupRequest, accepted: frozenset[str] = frozenset())
     if live is None:
         name = repo.split("/")[1]
         create = functools.partial(gh.create_user_repo, name, s.description)
-        out.items.append(Item("repository", f"absent → create public {repo}", create))
+        out.items.append(Item("repository", f"absent (or not visible to the setup app) → create public {repo}", create))
         # The repo is created with the description and Issues on, so those two are not sent again.
         out.items.append(Item("description", f"(none) → {_quote(s.description)}"))
         out.items.append(Item("Issues", "off → on"))
@@ -210,11 +223,15 @@ def _ruleset(gh: GitHub, s: SetupRequest, live: dict | None, out: Survey) -> Ite
     ids = [r.get("id") for r in gh.rulesets(s.repo) if (r.get("name"), r.get("target"), r.get("source_type")) == wanted]
     id = next((i for i in ids if isinstance(i, int) and not isinstance(i, bool)), None)
     if id is None:
-        return Item("ruleset", f"absent → {_quote(str(name))}", lambda: gh.create_ruleset(s.repo, s.ruleset))
-    if _subset(s.ruleset, gh.ruleset(s.repo, id)):
+        line = f"absent → {_quote(str(name))}; rules: {_rules(s.ruleset)}"
+        return Item("ruleset", line, lambda: gh.create_ruleset(s.repo, s.ruleset))
+    have = gh.ruleset(s.repo, id)
+    if _subset(s.ruleset, have):
         out.ruleset_id = id
         return Item("ruleset", SET)
-    line = f"{_quote(str(name))} (id {id}) differs → replace it with the requested one"
+    line = f"{_quote(str(name))} (id {id}) differs → replace it. rules: {_rules(have)} → {_rules(s.ruleset)}"
+    if lost := _removed(have, s.ruleset):
+        line += f"\n    removes: {lost}"
     return Item("ruleset", line, lambda: gh.update_ruleset(s.repo, id, s.ruleset))
 
 
@@ -237,6 +254,41 @@ def _others(gh: GitHub, s: SetupRequest, plan: Survey, say) -> None:
         say(f"Other rulesets also require checks on {_clean(plan.default)}; review them (gitgatesetup leaves them):")
         for url in found.values():
             say(f"  {url}")
+
+
+def _checks(ruleset: object) -> list[str]:
+    """The required status check contexts of a ruleset, in order."""
+    out: list[str] = []
+    for rule in _rule_list(ruleset):
+        if rule.get("type") == "required_status_checks":
+            params = rule.get("parameters")
+            for check in (params.get("required_status_checks") if isinstance(params, dict) else None) or []:
+                out.append(str(check.get("context")) if isinstance(check, dict) else "?")
+    return out
+
+
+def _rule_list(ruleset: object) -> list[dict]:
+    rules = ruleset.get("rules") if isinstance(ruleset, dict) else None
+    return [r for r in rules if isinstance(r, dict)] if isinstance(rules, list) else []
+
+
+def _rules(ruleset: object) -> str:
+    """A ruleset's rule types in order; required_status_checks lists its contexts."""
+    parts = [
+        f"required_status_checks[{_names(_checks(ruleset))}]" if r.get("type") == "required_status_checks"
+        else _clean(str(r.get("type")))
+        for r in _rule_list(ruleset)
+    ]  # fmt: skip
+    return ", ".join(parts) or "(none)"
+
+
+def _removed(have: object, want: object) -> str:
+    """What replacing `have` with `want` drops: rule types, and required check contexts."""
+    kept = {r.get("type") for r in _rule_list(want)}
+    gone = [_clean(str(r.get("type"))) for r in _rule_list(have) if r.get("type") not in kept]
+    wanted = _checks(want)
+    gone += [f'check "{_clean(c)}"' for c in _checks(have) if c not in wanted]
+    return ", ".join(gone)
 
 
 def _item(name: str, done: bool, current: str, wanted: str, apply: Callable[[], object]) -> Item:

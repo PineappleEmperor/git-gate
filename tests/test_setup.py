@@ -137,7 +137,8 @@ def test_topics():
 
 def test_description():
     assert check_description("x" * 350) == "x" * 350
-    for bad in ("x" * 351, "a\nb", "", 5):
+    assert check_description("  A thing  ") == "A thing"
+    for bad in ("x" * 351, "a\nb", "", "   ", 5):
         with pytest.raises(Refused):
             check_description(bad)
 

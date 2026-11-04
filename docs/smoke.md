@@ -283,7 +283,16 @@ setup closes in that run because GitHub accepted the PATCH.
 
 Expect: no match. After 8 hours a later `gitgatesetup <id>` signs in again.
 
-8. User: delete `<scratch>` on GitHub yourself (Settings, Danger Zone).
+8. User: check three things GitHub does that the code assumes. Record each answer.
+   a. `GET /repos/<scratch>/rulesets/<id>` with the app's token: does it return `bypass_actors`? If it does not,
+      the ruleset never compares equal and is re-PUT on every run.
+   b. After step 4, does GitHub keep the order of `rules` and of `required_status_checks` as sent? If it
+      reorders them, the ordered comparison reports a difference on every run.
+   c. Try to create a second ruleset with the same name by hand: does GitHub refuse it?
+
+Expect: (a) yes, (b) yes, (c) refused. Any other answer needs a code change before release.
+
+9. User: delete `<scratch>` on GitHub yourself (Settings, Danger Zone).
 
 ## Result
 

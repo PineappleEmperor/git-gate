@@ -185,7 +185,7 @@ cmd_install() {
     sudo mv -T "$STAGE" "$RELEASES/$sha"
     STAGE=
 
-    "$RELEASES/$sha/.venv/bin/python" -I -c 'import git_gate.server' || die "release does not import; current unchanged."
+    "$RELEASES/$sha/.venv/bin/python" -I -c 'import git_gate.server, git_gate.setupcli' || die "release does not import; current unchanged."
     switch_to "$sha"
 }
 

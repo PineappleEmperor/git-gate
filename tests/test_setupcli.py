@@ -263,6 +263,36 @@ def test_same_name_ruleset_replaced(setups):
     assert '"Protect main" (id 9) differs' in out
 
 
+def test_replacing_a_stricter_ruleset_shows_what_it_removes(setups):
+    create(setups)
+    strict = copy.deepcopy(RULESET)
+    strict["rules"] = [{"type": "deletion"}, {"type": "non_fast_forward"}, {"type": "pull_request", "parameters": {}},
+                       {"type": "required_status_checks", "parameters": {
+                           "required_status_checks": [{"context": "ci"}, {"context": "li\x1b[31mnt"}]}}]  # fmt: skip
+    gh = all_set(rulesets=[live_ruleset(strict, 9)])
+    code, out = run(["1"], gh, answer="n\n")
+    assert code == 1 and gh.writes() == []
+    assert "rules: deletion, non_fast_forward, pull_request, required_status_checks[ci, li?[31mnt] → " in out
+    assert "→ deletion, non_fast_forward, required_status_checks[ci]" in out
+    assert 'removes: pull_request, check "li?[31mnt"' in out
+    assert "\x1b" not in out
+
+
+def test_replacing_without_dropping_anything_has_no_removes_line(setups):
+    create(setups)
+    live = copy.deepcopy(RULESET)
+    live["enforcement"] = "disabled"
+    code, out = run(["1"], all_set(rulesets=[live_ruleset(live, 9)]), answer="n\n")
+    assert "differs → replace it. rules: deletion, non_fast_forward, required_status_checks[ci] → " in out
+    assert "removes:" not in out
+
+
+def test_an_absent_ruleset_shows_the_wanted_rules(setups):
+    create(setups)
+    code, out = run(["1"], all_set(rulesets=[]), answer="n\n")
+    assert 'ruleset: absent → "Protect main"; rules: deletion, non_fast_forward, required_status_checks[ci]' in out
+
+
 def test_a_same_name_ruleset_from_elsewhere_is_not_replaced(setups):
     create(setups)
     org = live_ruleset(RULESET, 3, source_type="Organization")
@@ -299,6 +329,30 @@ def test_eof_or_interrupt_at_the_prompt_declines(setups, answer):
     setups.get(1)
 
 
+def test_interrupt_before_any_write_prints_a_clean_line(setups, dirs):
+    create(setups)
+    gh = FakeGitHub(repo=None)
+    gh.fail["create_user_repo"] = KeyboardInterrupt()
+    code, out = run(["1"], gh)
+    assert code == 1
+    assert "\nInterrupted.\n" in out and "?Interrupted" not in out
+    assert "Re-run" not in out
+    assert audit_lines(dirs)[-1]["outcome"] == "refused"
+
+
+def test_interrupt_after_a_write_says_rerun_and_audits_open(setups, dirs):
+    create(setups)
+    gh = all_set(topics=(), graph=False)
+    gh.live["description"] = "old"
+    gh.fail["set_topics"] = KeyboardInterrupt()
+    code, out = run(["1"], gh)
+    assert code == 1
+    assert ("edit_repo", REPO, DESCRIPTION, None) in gh.writes()
+    assert "\nInterrupted.\nRe-run: gitgatesetup 1\n" in out
+    assert audit_lines(dirs)[-1]["outcome"] == "open"
+    setups.get(1)
+
+
 def test_owner_mismatch_refused(setups, dirs):
     create(setups, repo="SomeOrg/app")
     gh = FakeGitHub(repo=None, login="me")
@@ -329,6 +383,22 @@ def test_forbidden_names_the_install_page(setups, dirs, status):
     assert f"https://github.com/apps/{SLUG}/installations/new" in out
     assert "not be installed on this repository or may lack a permission" in out
     assert ("enable_dependency_graph", REPO) not in gh.writes()  # it stops at the refusal
+    setups.get(1)
+    assert audit_lines(dirs)[-1]["outcome"] == "open"
+
+
+def test_a_private_repo_the_app_cannot_see_points_at_the_install_page(setups, dirs):
+    create(setups)
+    gh = FakeGitHub(repo=None)
+    gh.fail["create_user_repo"] = GitHubError(
+        "GitHub POST user/repos returned 422: name already exists on this account", 422, {}
+    )
+    code, out = run(["1"], gh)
+    assert code == 1
+    assert "repository: absent (or not visible to the setup app) → create public me/app" in out
+    assert "GitHub refused repository (422)" in out
+    assert f"https://github.com/apps/{SLUG}/installations/new" in out
+    assert "Setup 1 stays open" in out
     setups.get(1)
     assert audit_lines(dirs)[-1]["outcome"] == "open"
 
@@ -373,7 +443,7 @@ def test_new_repo_does_not_resend_description_or_issues(setups):
     gh = FakeGitHub(repo=None)
     code, out = run(["1"], gh)
     assert not [c for c in gh.writes() if c[0] == "edit_repo"]
-    assert "repository: absent → create public me/app" in out
+    assert "repository: absent (or not visible to the setup app) → create public me/app" in out
     lines = [line.strip().split(":")[0] for line in out.splitlines() if line.startswith("  ")]
     assert lines[:6] == ["repository", "description", "Issues", "topics", "dependency graph", "ruleset"]
 

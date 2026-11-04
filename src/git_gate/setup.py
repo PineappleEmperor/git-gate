@@ -36,7 +36,8 @@ class SetupRequest:
 
 
 def check_description(value: object) -> str:
-    return _line(value, "description", MAX_DESCRIPTION)
+    text = _line(value, "description", MAX_DESCRIPTION)
+    return text.strip()  # GitHub trims it, so an untrimmed one would never verify
 
 
 def check_topics(value: object) -> tuple[str, ...]:
