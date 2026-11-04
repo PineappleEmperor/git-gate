@@ -65,7 +65,11 @@ def open_dir(rules: Rules, path: str | Path, what: str = "Directory"):
 
 
 SCRATCH = ".tmp"
-EXCHANGE = {"bundle": ("Bundle", (".bundle",)), "body": ("Body file", (".md", ".txt"))}
+EXCHANGE = {
+    "bundle": ("Bundle", (".bundle",)),
+    "body": ("Body file", (".md", ".txt")),
+    "ruleset": ("Ruleset file", (".json",)),
+}
 
 
 def _purpose(purpose: str) -> tuple[str, tuple[str, ...]]:

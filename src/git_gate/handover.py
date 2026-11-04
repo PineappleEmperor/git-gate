@@ -57,6 +57,30 @@ class Handover:
         return f"refs/gate/handover/{self.id}"
 
 
+def allocate_id(dir: Path, highest: int) -> int:
+    """The next free id for the records in `dir`, from the flock-guarded <dir>/next counter.
+
+    `highest` is the highest id with a record file. The id is the larger of the counter and one
+    past it, so a lost, stale or corrupt counter can never reuse an id, and the counter is advanced
+    before the caller writes the record, so a crash between the two spends an id.
+    """
+    dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(dir / "next", os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+") as counter:
+        fcntl.flock(counter, fcntl.LOCK_EX)
+        try:
+            stored = int(counter.read().strip())
+        except ValueError:
+            stored = 0
+        number = max(stored if 0 < stored <= MAX_ID else 0, highest + 1, 1)
+        counter.seek(0)
+        counter.truncate()
+        counter.write(f"{number + 1}\n")
+        counter.flush()
+        os.fsync(counter.fileno())
+    return number
+
+
 class Handovers:
     """JSON records under <state>/handovers/<id>.json, ids from the flock-guarded <state>/handovers/next."""
 
@@ -79,27 +103,14 @@ class Handovers:
         or corrupt counter can never reuse an id, and the counter is advanced before the record is
         written, so a crash between the two spends an id rather than reusing it.
         """
-        self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(self.dir / "next", os.O_RDWR | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "r+") as counter:
-            fcntl.flock(counter, fcntl.LOCK_EX)
-            try:
-                stored = int(counter.read().strip())
-            except ValueError:
-                stored = 0
-            number = max(stored if 0 < stored <= MAX_ID else 0, self._highest() + 1, 1)
-            counter.seek(0)
-            counter.truncate()
-            counter.write(f"{number + 1}\n")
-            counter.flush()
-            os.fsync(counter.fileno())
-            h = Handover(
-                number, repo, branch, sha, base, lease, reason, self.clock(),
-                tuple(patterns), tuple(protected), tuple(exclude),
-            )  # fmt: skip
-            self._write(h)
-            expired = self._purge()
-        # After the counter lock is released: a caller may hold the mirror lock around create().
+        number = allocate_id(self.dir, self._highest())
+        h = Handover(
+            number, repo, branch, sha, base, lease, reason, self.clock(),
+            tuple(patterns), tuple(protected), tuple(exclude),
+        )  # fmt: skip
+        self._write(h)
+        expired = self._purge()
+        # The counter lock is long released: a caller may hold the mirror lock around create().
         for old in expired:
             self._drop_ref(old)
         return h
