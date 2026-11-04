@@ -111,11 +111,11 @@ cmd_post_switch() {
     link_launchers
 }
 
-# Point $BIN_DIR/gitgatepush and $BIN_DIR/gitgaterules at the live release's launchers, so they
+# Point $BIN_DIR/gitgatepush, gitgaterules and gitgatesetup at the live release's launchers, so they
 # work in any shell and always run the root-owned copy. Warn when another one earlier on PATH would
-# win. A release without a launcher (gitgaterules is newer) leaves that link as it is.
+# win. A release without a launcher (gitgaterules and gitgatesetup are newer) leaves that link as it is.
 link_launchers() {
-    for name in gitgatepush gitgaterules; do
+    for name in gitgatepush gitgaterules gitgatesetup; do
         link=$BIN_DIR/$name
         if [ ! -e "$ROOT/current/bin/$name" ]; then
             echo "This release has no $name; $link is left as it is."

@@ -21,7 +21,10 @@ def root(tmp_path):
     return tmp_path
 
 
-def release(root: Path, sha: str, launchers=("gitgatepush", "gitgaterules"), script: str | None = None) -> Path:
+LAUNCHERS = ("gitgatepush", "gitgaterules", "gitgatesetup")
+
+
+def release(root: Path, sha: str, launchers=LAUNCHERS, script: str | None = None) -> Path:
     path = root / "opt/releases" / sha
     (path / "bin").mkdir(parents=True)
     for name in launchers:
@@ -41,11 +44,11 @@ def install(root: Path, *args: str, on_path: bool = True) -> subprocess.Complete
     return subprocess.run(["sh", str(INSTALL), *args], env=env, capture_output=True, text=True, check=False)
 
 
-def test_both_launchers_are_linked_and_checked(root):
+def test_every_launcher_is_linked_and_checked(root):
     release(root, NEW)
     proc = install(root, "rollback", NEW)
     assert proc.returncode == 0, proc.stderr
-    for name in ("gitgatepush", "gitgaterules"):
+    for name in LAUNCHERS:
         link = root / "bin" / name
         assert os.readlink(link) == str(root / "opt/current/bin" / name)
         assert link.resolve() == root / "opt/releases" / NEW / "bin" / name
@@ -58,6 +61,7 @@ def test_a_launcher_off_path_is_warned_about(root):
     assert proc.returncode == 0
     assert "gitgatepush is not on your PATH" in proc.stderr
     assert "gitgaterules is not on your PATH" in proc.stderr
+    assert "gitgatesetup is not on your PATH" in proc.stderr
 
 
 def test_a_launcher_earlier_on_path_is_warned_about(root):
@@ -109,7 +113,7 @@ def test_this_script_as_the_new_release_links_everything(root):
     release(root, NEW, script=INSTALL.read_text())
     proc = install(root, "rollback", NEW)
     assert proc.returncode == 0, proc.stderr
-    assert (root / "bin/gitgatepush").is_symlink() and (root / "bin/gitgaterules").is_symlink()
+    assert all((root / "bin" / name).is_symlink() for name in LAUNCHERS)
 
 
 def test_post_switch_runs_only_for_the_live_release(root):
