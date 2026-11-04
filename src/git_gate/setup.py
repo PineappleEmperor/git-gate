@@ -61,7 +61,7 @@ def check_ruleset(data: bytes, path: str) -> dict:
         raise Refused(f"Ruleset file {path} is {len(data)} bytes; the limit is 64 KiB.")
     try:
         ruleset = json.loads(data)
-    except ValueError:  # includes UnicodeDecodeError
+    except ValueError, RecursionError:  # ValueError includes UnicodeDecodeError
         ruleset = None
     if not isinstance(ruleset, dict):
         raise Refused(f"Ruleset file {path} must hold one JSON object.")

@@ -110,7 +110,7 @@ def test_ruleset_refusals(change, fragment):
         check_ruleset(mutated(change), "/w/r.json")
 
 
-@pytest.mark.parametrize("data", [b"not json", b"[]", b"\xff"])
+@pytest.mark.parametrize("data", [b"not json", b"[]", b"\xff", b"[" * 60000])
 def test_ruleset_not_an_object(data):
     with pytest.raises(Refused, match="JSON object"):
         check_ruleset(data, "/w/r.json")
