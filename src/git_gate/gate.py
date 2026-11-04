@@ -19,14 +19,15 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import NoReturn
 
-from git_gate import Refused, ci, ghpolicy, reads, writes
+from git_gate import Refused, ci, ghpolicy, reads, setup, writes
 from git_gate.call import RETIRED, TOOLS, audit, log_error
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import FromGitHub, GitHub
 from git_gate.gitops import MAX_STDERR, Git
 from git_gate.handover import Handovers
 from git_gate.mirror import MAX_HAVE, Mirror, Protected, comparison
-from git_gate.paths import copy_in, open_dir, require_absolute, write_out
+from git_gate.paths import copy_in, open_dir, read_workspace_file, require_absolute, write_out
+from git_gate.setup import Setups
 
 MAX_OUTPUT = 200_000
 MAX_BUNDLE = 512 << 20
@@ -507,6 +508,21 @@ class Gate:
         new_name: str | None = None,
     ) -> str:
         return writes.label(self._writes(rules, token), repo, action, name, color, description, new_name)
+
+    def repo_setup(
+        self, rules: Rules, token: str, repo: str, description: str, topics: list[str], ruleset_file: str
+    ) -> str:
+        """Record a repository's settings for the user to apply with `gitgatesetup <id>`; no GitHub call."""
+        rules.require_write(repo)
+        description = setup.check_description(description)
+        topic_tuple = setup.check_topics(topics)
+        ruleset = setup.check_ruleset(read_workspace_file(rules, ruleset_file, "ruleset"), ruleset_file)
+        request = Setups(self.state, self.clock).create(repo, description, topic_tuple, ruleset)
+        return (
+            f"Setup {request.id} recorded for {repo}. Ask the user to run, in their own terminal:\n\n"
+            f"gitgatesetup {request.id}\n\n"
+            "It signs them in to GitHub in the browser, shows what will change, and applies it. Do not retry."
+        )
 
     # --- CI status (the reading lives in ci.py) -----------------------------------------
 

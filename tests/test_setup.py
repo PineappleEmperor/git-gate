@@ -4,6 +4,7 @@ import stat
 
 import pytest
 
+from conftest import call
 from git_gate import Refused
 from git_gate.handover import EXPIRES
 from git_gate.setup import Setups, check_description, check_ruleset, check_topics
@@ -167,3 +168,51 @@ def test_ids_stay_distinct_without_the_counter(tmp_path):
     (tmp_path / "setups" / "next").unlink()
     second = setups.create("me/app", "A thing", ("a",), TEMPLATE)
     assert second.id != first.id
+
+
+# --- the repo_setup tool -----------------------------------------------------------------------
+
+
+def _request(env, **over):
+    ruleset = env.ws / "ruleset.json"
+    ruleset.write_text(json.dumps(TEMPLATE))
+    args = dict(repo="me/app", description="A thing", topics=["home-assistant", "hacs"], ruleset_file=str(ruleset))
+    return args | over
+
+
+def test_repo_setup_records_and_answers(env):
+    def no_github(token):
+        raise AssertionError("repo_setup must not call GitHub")
+
+    env.gate.github = no_github
+    out = env.gate.dispatch("repo_setup", _request(env))
+    assert out == (
+        "Setup 1 recorded for me/app. Ask the user to run, in their own terminal:\n\ngitgatesetup 1\n\n"
+        "It signs them in to GitHub in the browser, shows what will change, and applies it. Do not retry."
+    )
+    s = Setups(env.gate.state).get(1)
+    assert s.topics == ("home-assistant", "hacs")
+    assert s.repo == "me/app"
+    assert s.ruleset == TEMPLATE
+
+
+def test_repo_setup_needs_write(env):
+    with pytest.raises(Refused, match="read-only"):
+        call(env, "repo_setup", **_request(env, repo="other/lib"))
+    with pytest.raises(Refused, match="allowlist"):
+        call(env, "repo_setup", **_request(env, repo="nobody/x"))
+    with pytest.raises(Refused, match="owner/name"):
+        call(env, "repo_setup", **_request(env, repo="nope"))
+
+
+def test_repo_setup_ruleset_outside_workspace(env):
+    with pytest.raises(Refused):
+        call(env, "repo_setup", **_request(env, ruleset_file="/etc/passwd.json"))
+    assert not (env.gate.state / "setups").exists() or not list((env.gate.state / "setups").glob("*.json"))
+
+
+def test_repo_setup_checks_arguments(env):
+    with pytest.raises(Refused):
+        call(env, "repo_setup", **_request(env, topics=["Bad Topic"]))
+    with pytest.raises(Refused):
+        call(env, "repo_setup", **_request(env, description="two\nlines"))
