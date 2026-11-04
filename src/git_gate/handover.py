@@ -14,8 +14,8 @@ import shlex
 import subprocess
 import sys
 import time
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -57,12 +57,15 @@ class Handover:
         return f"refs/gate/handover/{self.id}"
 
 
-def allocate_id(dir: Path, highest: int) -> int:
-    """The next free id for the records in `dir`, from the flock-guarded <dir>/next counter.
+@contextmanager
+def allocate_id(dir: Path, highest: Callable[[], int]) -> Iterator[int]:
+    """Yield the next free id for the records in `dir`, holding the flock on <dir>/next.
 
-    `highest` is the highest id with a record file. The id is the larger of the counter and one
-    past it, so a lost, stale or corrupt counter can never reuse an id, and the counter is advanced
-    before the caller writes the record, so a crash between the two spends an id.
+    `highest()` is the highest id with a record file, read under the lock. The id is the larger of
+    the counter and one past it, so a lost, stale or corrupt counter can never reuse an id. The
+    counter is advanced before the id is yielded, so a crash before the record is written spends an
+    id rather than reusing it. The lock is held until the caller's `with` body returns, so the
+    record is written before another creator can compute its id.
     """
     dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(dir / "next", os.O_RDWR | os.O_CREAT, 0o600)
@@ -72,13 +75,13 @@ def allocate_id(dir: Path, highest: int) -> int:
             stored = int(counter.read().strip())
         except ValueError:
             stored = 0
-        number = max(stored if 0 < stored <= MAX_ID else 0, highest + 1, 1)
+        number = max(stored if 0 < stored <= MAX_ID else 0, highest() + 1, 1)
         counter.seek(0)
         counter.truncate()
         counter.write(f"{number + 1}\n")
         counter.flush()
         os.fsync(counter.fileno())
-    return number
+        yield number
 
 
 class Handovers:
@@ -103,14 +106,14 @@ class Handovers:
         or corrupt counter can never reuse an id, and the counter is advanced before the record is
         written, so a crash between the two spends an id rather than reusing it.
         """
-        number = allocate_id(self.dir, self._highest())
-        h = Handover(
-            number, repo, branch, sha, base, lease, reason, self.clock(),
-            tuple(patterns), tuple(protected), tuple(exclude),
-        )  # fmt: skip
-        self._write(h)
-        expired = self._purge()
-        # The counter lock is long released: a caller may hold the mirror lock around create().
+        with allocate_id(self.dir, self._highest) as number:
+            h = Handover(
+                number, repo, branch, sha, base, lease, reason, self.clock(),
+                tuple(patterns), tuple(protected), tuple(exclude),
+            )  # fmt: skip
+            self._write(h)
+            expired = self._purge()
+        # After the counter lock is released: a caller may hold the mirror lock around create().
         for old in expired:
             self._drop_ref(old)
         return h

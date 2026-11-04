@@ -104,11 +104,10 @@ class Setups:
         self.clock = clock
 
     def create(self, repo: str, description: str, topics: tuple[str, ...], ruleset: dict) -> SetupRequest:
-        s = SetupRequest(
-            allocate_id(self.dir, self._highest()), repo, description, tuple(topics), ruleset, self.clock()
-        )
-        self._write(s)
-        self._purge()
+        with allocate_id(self.dir, self._highest) as number:
+            s = SetupRequest(number, repo, description, tuple(topics), ruleset, self.clock())
+            self._write(s)
+            self._purge()
         return s
 
     def get(self, id: int) -> SetupRequest:

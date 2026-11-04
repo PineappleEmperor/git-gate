@@ -159,3 +159,11 @@ def test_store_roundtrip_and_expiry(tmp_path):
     with pytest.raises(Refused, match=f"No open setup {second.id}."):
         setups.get(second.id)
     assert setups.open() == []
+
+
+def test_ids_stay_distinct_without_the_counter(tmp_path):
+    setups = Setups(tmp_path)
+    first = setups.create("me/app", "A thing", ("a",), TEMPLATE)
+    (tmp_path / "setups" / "next").unlink()
+    second = setups.create("me/app", "A thing", ("a",), TEMPLATE)
+    assert second.id != first.id
