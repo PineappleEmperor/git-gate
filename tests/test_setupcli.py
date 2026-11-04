@@ -3,6 +3,7 @@
 import copy
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,8 @@ import pytest
 from git_gate import Refused, setupcli
 from git_gate.github import GitHubError
 from git_gate.setup import Setups
+
+SRC = Path(__file__).resolve().parents[1] / "src"
 
 BIN = Path(__file__).resolve().parents[1] / "bin/gitgatesetup"
 TOKEN = "ghu_test"
@@ -624,7 +627,13 @@ def test_register_refusal_exits_1(dirs, monkeypatch):
 
 
 def test_the_module_runs_setup(dirs):
-    proc = subprocess.run([sys.executable, "-m", "git_gate", "setup"], capture_output=True, text=True, check=False)
+    proc = subprocess.run(
+        [sys.executable, "-m", "git_gate", "setup"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=os.environ | {"PYTHONPATH": str(SRC)},
+    )
     assert proc.returncode == 0 and proc.stdout == "no open setups\n", proc.stderr
 
 
