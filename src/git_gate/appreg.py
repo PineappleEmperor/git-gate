@@ -108,6 +108,8 @@ def serve(
     outcome: dict = {}
 
     class Handler(http.server.BaseHTTPRequestHandler):
+        timeout = 5  # an idle connection must not hold a thread forever
+
         def _send(self, status: int, text: str) -> None:
             raw = text.encode()
             self.send_response(status)
@@ -139,7 +141,8 @@ def serve(
         def log_message(self, *args) -> None:
             pass
 
-    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True  # an idle connection never blocks the loop or server_close
     server.timeout = 0.2
     try:
         if ready:
@@ -147,7 +150,8 @@ def serve(
         deadline = time.monotonic() + timeout
         while not outcome:
             if time.monotonic() >= deadline:
-                raise Refused("Gave up waiting for GitHub after 10 minutes; run the command again.")
+                waited = f"{timeout / 60:g} minutes" if timeout >= 60 else f"{timeout:g} seconds"
+                raise Refused(f"Gave up waiting for GitHub after {waited}; run the command again.")
             server.handle_request()
     except KeyboardInterrupt:
         raise Refused("Registration cancelled.") from None

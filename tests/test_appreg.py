@@ -192,3 +192,27 @@ def test_convert_posts_empty_to_local_server(monkeypatch):
     assert _convert("c0de")["slug"] == BODY["slug"]
     assert seen == {"path": "/app-manifests/c0de/conversions", "auth": None, "len": "0"}
     srv.server_close()
+
+
+def test_idle_connection_does_not_stall_serve():
+    import socket
+    import time
+
+    box, t = start_serve()
+    with socket.create_connection(("127.0.0.1", box["port"])):
+        start = time.monotonic()
+        get(box["port"], "/done?code=abc&state=st4te")
+        t.join(5)
+        assert box["code"] == "abc" and time.monotonic() - start < 4
+
+
+def test_idle_connection_does_not_defeat_timeout():
+    import socket
+    import time
+
+    box, t = start_serve(timeout=0.5)
+    with socket.create_connection(("127.0.0.1", box["port"])):
+        start = time.monotonic()
+        t.join(4)
+        assert not t.is_alive() and "Gave up waiting for GitHub after 0.5 seconds" in box["err"]
+        assert time.monotonic() - start < 3
