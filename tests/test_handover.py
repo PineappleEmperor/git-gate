@@ -869,8 +869,9 @@ def test_push_kept_failure_raises_and_keeps_open(env, hs, m, rules, checkout):
     h = stage(env, m, rules, checkout)
     seed = env.tmp / "seed"
     git("push", "-q", env.url, f"{commit(seed, 'moved.txt')}:refs/heads/feat", cwd=seed)
-    with pytest.raises(Refused, match="is still open"):
+    with pytest.raises(Refused, match="is still open") as failed:
         push_kept(hs, h.id, m, rules, lambda *a, **kw: None)
+    assert failed.value.code == 1  # git push's exit status for a rejected push
     assert hs.open() == [h]
     assert audit_lines(env)[-1]["outcome"] == "failed"
 
@@ -880,3 +881,21 @@ def test_screen_matches_the_gitgatepush_screen(env, hs, m, rules, checkout):
     _, out = run(env, [str(h.id)], "n\n")
     before = out.split("Push it?")[0]
     assert before == screen(h, m, rules) + "\n"
+
+
+def test_push_kept_twice_pushes_once(env, hs, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    outcomes = []
+
+    def one(_):
+        try:
+            push_kept(Handovers(env.state), h.id, Mirror(env.gate.git, env.state), rules, lambda *a, **kw: None)
+            return "pushed"
+        except Refused as e:
+            return str(e)
+
+    with ThreadPoolExecutor(2) as pool:
+        outcomes = list(pool.map(one, range(2)))
+    assert sorted(outcomes) == [f"No open handover {h.id}.", "pushed"]
+    assert [line["outcome"] for line in audit_lines(env) if line["tool"] == "gitgatepush"] == ["pushed"]
+    assert remote_has(env, "feat") == h.sha

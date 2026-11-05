@@ -296,13 +296,15 @@ def push_kept(
 
     Raises Refused when the record changed or went away, and PushFailed (a Refused) when git refused the push.
     """
-    again = handovers.get(id)  # another gitgatepush may have finished it while we waited
-    if shown is not None and again != shown:
-        raise Refused(f"Handover {id} changed while waiting; run it again.")
-    h = again
-    _check(h, mirror.git, rules)
-    url = mirror.git.user_push_url(h.repo)
-    with mirror.lock(h.repo):
+    first = shown or handovers.get(id)  # only names the repo to lock; the record is re-read under the lock
+    url = mirror.git.user_push_url(first.repo)
+    with mirror.lock(first.repo):
+        h = handovers.get(id)  # another gitgatepush may have finished it while we waited for the lock
+        if shown is not None and h != shown:
+            raise Refused(f"Handover {id} changed while waiting; run it again.")
+        if h.repo != first.repo:
+            raise Refused(f"Handover {id} changed while waiting; run it again.")
+        _check(h, mirror.git, rules)
         mirror_dir = mirror.path(h.repo)
         _require_commit(mirror, h, mirror_dir, rules)
         proc = subprocess.run(
