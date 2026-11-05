@@ -94,10 +94,13 @@ def revoke(
     sleep: Callable[[float], None] = time.sleep,
     say: Callable[[str], None],
 ) -> bool:
-    """Revoke the run's tokens at GitHub, then confirm the access token is dead; say how it went."""
+    """Revoke the run's tokens at GitHub, then confirm the access token is dead; say how it went. When
+    GitHub refuses the access and refresh tokens together, the access token is sent alone once more."""
     credentials = [login.token] + ([login.refresh] if login.refresh else [])
     try:
         status = post(REVOKE_URL, {"credentials": credentials})
+        if status != 202 and login.refresh:  # GitHub may refuse the pair: the access token alone, once more
+            status = post(REVOKE_URL, {"credentials": [login.token]})
         if status != 202:
             say(f"GitHub refused the revocation ({status}).")
         else:

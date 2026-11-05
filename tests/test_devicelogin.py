@@ -205,12 +205,12 @@ def test_login_keeps_the_refresh_token():
 class Revoking:
     def __init__(self, alive=(False,), status=202):
         self.alive_answers = list(alive)
-        self.status = status
+        self.statuses = list(status) if isinstance(status, list) else [status]
         self.said, self.posts, self.checks, self.sleeps = [], [], [], []
 
     def post(self, url, body):
         self.posts.append((url, body))
-        return self.status
+        return self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
 
     def alive(self, token):
         self.checks.append(token)
@@ -261,8 +261,27 @@ def test_revoke_still_alive_warns():
 def test_revoke_refused_warns_with_cause():
     r = Revoking(status=422)
     assert r.run() is False
+    assert [body for _, body in r.posts] == [{"credentials": ["ghu_x", "ghr_x"]}, {"credentials": ["ghu_x"]}]
     assert r.said == ["GitHub refused the revocation (422).", NOT_CONFIRMED]
     assert r.checks == []
+
+
+def test_a_refused_revoke_is_retried_with_only_the_access_token():
+    r = Revoking(status=[422, 202])
+    assert r.run() is True
+    assert r.posts == [
+        ("https://api.github.com/credentials/revoke", {"credentials": ["ghu_x", "ghr_x"]}),
+        ("https://api.github.com/credentials/revoke", {"credentials": ["ghu_x"]}),
+    ]
+    assert r.checks == ["ghu_x"] and r.sleeps == [5]
+    assert r.said == [REVOKED]
+
+
+def test_a_refused_revoke_without_refresh_is_not_sent_again():
+    r = Revoking(status=422)
+    assert revoke(Login("ghu_x", None), alive=r.alive, post=r.post, sleep=r.sleep, say=r.said.append) is False
+    assert len(r.posts) == 1
+    assert r.said == ["GitHub refused the revocation (422).", NOT_CONFIRMED]
 
 
 def test_revoke_interrupted_warns():

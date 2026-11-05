@@ -9,8 +9,10 @@ push is applied in the same run, over the user's own SSH key as gitgatepush push
 ruleset after it; a branch that already exists is never pushed over.
 """
 
+import contextlib
 import functools
 import json
+import signal
 import sys
 import time
 import urllib.parse
@@ -23,11 +25,11 @@ from git_gate import Refused
 from git_gate.appreg import load_app, register
 from git_gate.call import audit
 from git_gate.config import state_dir, valid_repo
-from git_gate.devicelogin import Login, device_login
+from git_gate.devicelogin import NOT_CONFIRMED, Login, device_login
 from git_gate.devicelogin import revoke as revoke_tokens
 from git_gate.github import GitHub, GitHubError
 from git_gate.gitops import Git
-from git_gate.handover import ID_RE, RULES, Handovers, _clean, push_kept, screen
+from git_gate.handover import ID_RE, RULES, Handover, Handovers, _clean, push_kept, screen
 from git_gate.mirror import Mirror
 from git_gate.setup import SetupRequest, Setups
 
@@ -35,6 +37,7 @@ USAGE = "usage: gitgatesetup [<id> | --register]"
 SET = "already set"
 NOT_INSTALLED = (403, 404)  # a write the app may not make: not installed on the repo, or lacking a permission
 FIRST = "main"  # the branch a kept first push creates
+HANGUPS = (signal.SIGHUP, signal.SIGTERM)  # end a run as Ctrl-C does
 
 
 @dataclass
@@ -56,8 +59,11 @@ class Survey:
 class KeptPushes(Protocol):
     """The push handovers `repo_setup` kept for a request's first push of main."""
 
-    def open(self, id: int) -> str | None:
-        """The kept commit when handover `id` is still open, else None."""
+    def open(self, id: int, repo: str) -> str | None:
+        """The kept commit when handover `id` is still open and is a first push of main to `repo`, else None."""
+
+    def pushed(self, id: int) -> bool:
+        """Whether handover `id` was pushed: its record is gone."""
 
     def screen(self, id: int) -> str:
         """What gitgatepush shows for handover `id` before its prompt."""
@@ -67,27 +73,42 @@ class KeptPushes(Protocol):
 
 
 class _Kept:
-    """The kept pushes in the gate's state, pushed with the code gitgatepush runs."""
+    """The kept pushes in the gate's state, pushed with the code gitgatepush runs. Only the record
+    `open` read is screened and pushed: a record that changes after it is refused."""
 
     def __init__(self, state: Path):
         self.state = state
         self.handovers = Handovers(state)
+        self.records: dict[int, Handover] = {}
 
     @functools.cached_property
     def mirror(self) -> Mirror:  # built on first use: Git creates its directories under the state
         return Mirror(Git(self.state, "https://github.com"), self.state)
 
-    def open(self, id: int) -> str | None:
+    def open(self, id: int, repo: str) -> str | None:
+        self.records.pop(id, None)
         try:
-            return self.handovers.get(id).sha
+            h = self.handovers.get(id)
         except Refused:
             return None
+        if (h.repo, h.branch, h.base, h.lease) != (repo, FIRST, None, None):
+            return None  # not the first push repo_setup keeps: gitgatepush's to show and run
+        self.records[id] = h
+        return h.sha
+
+    def pushed(self, id: int) -> bool:
+        return not self.handovers.dir.joinpath(f"{id}.json").exists()
+
+    def _record(self, id: int) -> Handover:
+        if id not in self.records:
+            raise Refused(f"No open handover {id}.")
+        return self.records[id]
 
     def screen(self, id: int) -> str:
-        return screen(self.handovers.get(id), self.mirror, RULES)
+        return screen(self._record(id), self.mirror, RULES)
 
     def push(self, id: int, say) -> None:
-        push_kept(self.handovers, id, self.mirror, RULES, say)
+        push_kept(self.handovers, id, self.mirror, RULES, say, shown=self._record(id))
 
 
 def main(
@@ -102,24 +123,44 @@ def main(
         stdout.write(_clean(text, lines=lines) + end)
         stdout.flush()
 
+    with _hangups_interrupt():
+        try:
+            state = state_dir()
+            if not argv:
+                return _list(Setups(state), say)
+            if argv == ["--register"]:
+                register(say=say)
+                return 0
+            if len(argv) != 1 or not ID_RE.fullmatch(argv[0]):
+                say(USAGE)
+                return 2
+            return _run(state, int(argv[0]), stdin, say, login, github, kept or _Kept(state), secrets, revoke)
+        except Refused as e:
+            say(str(e), lines=True)
+            return 1
+        except KeyboardInterrupt:
+            say()
+            say("Interrupted.")
+            return 1
+
+
+def _interrupt(signum, frame) -> None:
+    raise KeyboardInterrupt
+
+
+@contextlib.contextmanager
+def _hangups_interrupt():
+    """While a run lasts, SIGHUP (a closed terminal) and SIGTERM raise KeyboardInterrupt, so the run's
+    finally blocks still revoke its token and audit it. The previous handlers come back on the way out."""
+    previous = {}
+    with contextlib.suppress(ValueError):  # not the main thread: signals stay as they are
+        for signum in HANGUPS:
+            previous[signum] = signal.signal(signum, _interrupt)
     try:
-        state = state_dir()
-        if not argv:
-            return _list(Setups(state), say)
-        if argv == ["--register"]:
-            register(say=say)
-            return 0
-        if len(argv) != 1 or not ID_RE.fullmatch(argv[0]):
-            say(USAGE)
-            return 2
-        return _run(state, int(argv[0]), stdin, say, login, github, kept or _Kept(state), secrets, revoke)
-    except Refused as e:
-        say(str(e), lines=True)
-        return 1
-    except KeyboardInterrupt:
-        say()
-        say("Interrupted.")
-        return 1
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, signal.SIG_DFL if handler is None else handler)
 
 
 def _list(setups: Setups, say) -> int:
@@ -145,10 +186,12 @@ def _run(state: Path, id: int, stdin, say, login, github, kept: KeptPushes, secr
         revoked = None
         try:
             if signed_in:
+                revoked = False  # until revoke says otherwise: never null after a sign-in
                 revoked = revoke(signed_in[0], alive=functools.partial(_alive, github), say=say)
-        except Exception as e:  # revoke never ends the run itself: the run's own outcome stays
+        except BaseException as e:  # revoke never ends the run itself, Ctrl-C included: the run's own outcome stays
             revoked = False
             say(f"Could not confirm the revocation ({type(e).__name__}).")
+            say(NOT_CONFIRMED)
         finally:
             _audit(state, id, repo, outcome, revoked, say)
 
@@ -201,12 +244,15 @@ def _apply(setups: Setups, s: SetupRequest, gh: GitHub, kept: KeptPushes, plan: 
             say(f"Not applied. Setup {s.id} stays open.")
             return "declined"
         accepted: set[str] = set()
+        started = False  # whether GitHub may hold a change from this run
         for item in todo:
             try:
+                started = started or item.name == FIRST  # a push interrupted part-way may still have gone out
                 item.apply()
                 accepted.add(item.name)
+                started = True
             except KeyboardInterrupt:
-                if not accepted:
+                if not started:
                     raise
                 say()
                 say("Interrupted.")
@@ -281,7 +327,8 @@ def _survey(gh: GitHub, s: SetupRequest, kept: KeptPushes, say, accepted: frozen
     first = _first_push(gh, s, live, kept, say)
     if first:
         out.items.append(first)
-    out.items.append(_ruleset(gh, s, live, out, pending=bool(first and first.apply)))
+    pushed = first is None and s.handover is not None and kept.pushed(s.handover)
+    out.items.append(_ruleset(gh, s, live, out, pending=bool(first and first.apply), pushed=pushed))
     return out
 
 
@@ -301,7 +348,7 @@ def _first_push(gh: GitHub, s: SetupRequest, live: dict | None, kept: KeptPushes
         return None
     if live is not None and gh.branch(s.repo, FIRST) is not None:
         return Item(FIRST, SET)
-    sha = kept.open(s.handover)
+    sha = kept.open(s.handover, s.repo)
     if not sha:
         return None
     line = f"absent → push {_clean(sha[:12])} (handover {s.handover}; shown below)"
@@ -333,14 +380,21 @@ def _apply_ruleset(gh: GitHub, s: SetupRequest) -> None:
         gh.update_ruleset(s.repo, id, s.ruleset)
 
 
-def _ruleset(gh: GitHub, s: SetupRequest, live: dict | None, out: Survey, *, pending: bool = False) -> Item:
+def _ruleset(
+    gh: GitHub, s: SetupRequest, live: dict | None, out: Survey, *, pending: bool = False, pushed: bool = False
+) -> Item:
     """The ruleset; `pending` when a first push of main is applied before it in this run. Then the
     ruleset is applied after the push (by `_apply_ruleset`), but only when main is or may be the
-    default branch: a push of main does not give another default branch its first commit."""
+    default branch: a push of main does not give another default branch its first commit. `pushed`
+    when the request's first push already went out (its handover is closed), though GitHub may not
+    show main yet."""
     name = s.ruleset.get("name")
     default, exists = _default(gh, s, live)
     after = ""
     if not exists:
+        if pushed and default == FIRST:
+            return Item("ruleset", f"deferred: {FIRST} was pushed; GitHub does not show it yet. "
+                                   f"Re-run in a moment: gitgatesetup {s.id}")  # fmt: skip
         if not pending or (default is not None and default != FIRST):
             branch = _clean(default) if default else "the default branch"
             return Item("ruleset", f"deferred: {branch} does not exist yet; push it (gitgatepush), "

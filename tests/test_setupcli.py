@@ -1,10 +1,12 @@
 """gitgatesetup: the plan, the prompt, the apply order, verification and the record's close."""
 
 import copy
+import dataclasses
 import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from git_gate import Refused, setupcli
+from git_gate.devicelogin import NOT_CONFIRMED
 from git_gate.devicelogin import Login as Tokens
 from git_gate.github import GitHubError
 from git_gate.handover import Handovers
@@ -190,15 +193,22 @@ KEPT_SHA = "b" * 40
 class FakeKept:
     """Stands in for the kept first push: `push` records itself in the fake GitHub's calls and creates main."""
 
-    def __init__(self, gh, *, open=True, fail=None):
+    def __init__(self, gh, *, open=True, fail=None, pushed=False, lag=False):
         self.gh = gh
         self.is_open = open
         self.fail = fail
+        self.closed = pushed  # whether the handover was pushed (its record is gone)
+        self.lag = lag  # GitHub does not show main yet after the push
         self.screens: list[int] = []
         self.pushes: list[int] = []
+        self.opened: list[tuple[int, str]] = []
 
-    def open(self, id):
+    def open(self, id, repo):
+        self.opened.append((id, repo))
         return KEPT_SHA if self.is_open else None
+
+    def pushed(self, id):
+        return self.closed
 
     def screen(self, id):
         self.screens.append(id)
@@ -209,7 +219,8 @@ class FakeKept:
         self.pushes.append(id)
         if self.fail:
             raise self.fail
-        self.gh.has_branch = True
+        self.is_open, self.closed = False, True
+        self.gh.has_branch = not self.lag
         say(f"Pushed. Handover {id} is closed.")
 
 
@@ -672,10 +683,54 @@ def test_secrets_are_reminded_at_the_end(setups):
 
 def test_default_kept_reads_the_gates_handovers(dirs):
     kept = setupcli._Kept(dirs[0])
-    assert kept.open(1) is None
+    assert kept.open(1, REPO) is None
     h = Handovers(dirs[0]).create(REPO, "main", KEPT_SHA, None, None, "first push", patterns=(), protected=(),
                                   exclude=())  # fmt: skip
-    assert kept.open(h.id) == KEPT_SHA
+    assert kept.open(h.id, REPO) == KEPT_SHA
+    assert kept.pushed(h.id) is False
+    Handovers(dirs[0]).close(h.id)
+    assert kept.pushed(h.id) is True
+
+
+def first_push_record(dirs, **kw):
+    record = {"repo": REPO, "branch": "main", "base": None, "lease": None} | kw
+    return Handovers(dirs[0]).create(record["repo"], record["branch"], KEPT_SHA, record["base"], record["lease"],
+                                     "first push", patterns=(), protected=(), exclude=())  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "record",
+    [{"repo": "me/other"}, {"branch": "dev"}, {"lease": "c" * 40}, {"base": "d" * 40}],
+    ids=["another repo", "another branch", "a lease", "a base"],
+)
+def test_a_handover_that_is_not_this_setups_first_push_is_not_pushed(setups, dirs, record):
+    h = first_push_record(dirs, **record)
+    kept = setupcli._Kept(dirs[0])
+    assert kept.open(h.id, REPO) is None
+    create(setups, handover=h.id)
+    gh = FakeGitHub(repo=None)
+    code, out = run(["1"], gh, kept=kept)
+    assert code == 1
+    assert "  main:" not in out and "Pushed." not in out
+    assert "ruleset: deferred: main does not exist yet; push it (gitgatepush), then re-run gitgatesetup 1" in out
+    Handovers(dirs[0]).get(h.id)  # left for gitgatepush
+
+
+def test_default_kept_pushes_only_the_record_it_showed(dirs):
+    h = first_push_record(dirs)
+    kept = setupcli._Kept(dirs[0])
+    assert kept.open(h.id, REPO) == KEPT_SHA
+    Handovers(dirs[0])._write(dataclasses.replace(h, sha="c" * 40))
+    with pytest.raises(Refused, match=f"Handover {h.id} changed while waiting"):
+        kept.push(h.id, print)
+
+
+def test_default_kept_pushes_nothing_it_did_not_open(dirs):
+    h = first_push_record(dirs, repo="me/other")
+    kept = setupcli._Kept(dirs[0])
+    assert kept.open(h.id, REPO) is None
+    with pytest.raises(Refused, match=f"No open handover {h.id}"):
+        kept.push(h.id, print)
 
 
 # --- the rest of the controller's rulings ----------------------------------------------------------
@@ -989,3 +1044,95 @@ def test_refresh_token_echoed_in_a_failure_is_redacted(setups):
     gh.fail["enable_dependency_graph"] = Refused(f"echo {REFRESH}")
     code, out = run(["1"], gh)
     assert REFRESH not in out and "[token]" in out
+
+
+# --- the final fix wave ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("signum", [signal.SIGHUP, signal.SIGTERM], ids=["SIGHUP", "SIGTERM"])
+def test_a_hangup_or_terminate_ends_the_run_as_ctrl_c_does(setups, dirs, signum):
+    create(setups)
+
+    class Signalled(FakeGitHub):
+        def create_user_repo(self, name, description):
+            os.kill(os.getpid(), signum)
+            super().create_user_repo(name, description)
+
+    caught = []
+    previous = signal.signal(signum, lambda n, frame: caught.append(n))  # without the fix, the run goes on
+    try:
+        before = signal.getsignal(signum)
+        revoke = Revoke()
+        code, out = run(["1"], Signalled(repo=None), revoke=revoke)
+        assert signal.getsignal(signum) is before  # restored on the way out
+    finally:
+        signal.signal(signum, previous)
+    assert caught == []
+    assert code == 1 and len(revoke.calls) == 1
+    assert out.endswith(SIGNED_OUT + "\nInterrupted.\n")
+    assert audit_lines(dirs)[-1]["revoked"] is True
+    setups.get(1)
+
+
+def interrupted_revoke(login, *, alive, say):
+    say("")
+    raise KeyboardInterrupt
+
+
+def test_an_interrupt_at_the_end_of_revoke_keeps_the_runs_outcome(setups, dirs):
+    create(setups)
+    code, out = run(["1"], all_set(), revoke=interrupted_revoke)
+    assert code == 0, out
+    assert "Interrupted." not in out
+    assert out.splitlines()[-4:] == [
+        "Done. Setup 1 is closed.",
+        "",
+        "Could not confirm the revocation (KeyboardInterrupt).",
+        NOT_CONFIRMED,
+    ]
+    assert audit_lines(dirs)[-1]["outcome"] == "closed" and audit_lines(dirs)[-1]["revoked"] is False
+
+
+def test_an_interrupt_at_the_end_of_revoke_keeps_the_runs_error_line_last(setups, dirs):
+    create(setups)
+    code, out = run(["1"], FakeGitHub(repo=None, login="other"), revoke=interrupted_revoke)
+    assert code == 1
+    lines = out.splitlines()
+    assert lines[-2] == NOT_CONFIRMED and "not under your account" in lines[-1]
+    assert audit_lines(dirs)[-1]["outcome"] == "refused" and audit_lines(dirs)[-1]["revoked"] is False
+
+
+LAGGING = "  ruleset: deferred: main was pushed; GitHub does not show it yet. Re-run in a moment: gitgatesetup 1"
+
+
+def test_a_push_github_does_not_show_yet_says_rerun_in_a_moment(setups):
+    create(setups, handover=7)
+    gh = all_set(rulesets=[], branch=False)
+    kept = FakeKept(gh, lag=True)
+    code, out = run(["1"], gh, kept=kept)
+    assert code == 1 and kept.pushes == [7]
+    left = out.split("Not done yet:")[1]
+    assert LAGGING in left
+    assert "gitgatepush" not in left
+    assert not [c for c in gh.writes() if c[0] in ("create_ruleset", "update_ruleset")]
+    setups.get(1)
+
+
+def test_a_rerun_after_a_push_github_does_not_show_yet_says_rerun_in_a_moment(setups):
+    create(setups, handover=7)
+    gh = all_set(rulesets=[], branch=False)
+    code, out = run(["1"], gh, kept=FakeKept(gh, open=False, pushed=True))
+    assert code == 1
+    assert LAGGING in out and "gitgatepush" not in out
+    assert "Apply?" not in out
+
+
+def test_an_interrupt_during_the_first_push_says_rerun(setups, dirs):
+    create(setups, handover=7)
+    gh = all_set(rulesets=[], branch=False)
+    kept = FakeKept(gh, fail=KeyboardInterrupt())
+    code, out = run(["1"], gh, kept=kept)
+    assert code == 1 and kept.pushes == [7]
+    assert "\nInterrupted.\nRe-run: gitgatesetup 1\n" in out
+    assert audit_lines(dirs)[-1]["outcome"] == "open"
+    setups.get(1)
