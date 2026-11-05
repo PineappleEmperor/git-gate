@@ -275,7 +275,7 @@ Expect, in this order:
    - the kept screen, which lists `.github/workflows/ci.yml` under
      `Files under handover paths (1):`, followed by the `Run: git ... push` line;
    - one `Apply?` prompt: `Apply? [y/N]`;
-   - git's push output, then `Done. Setup <id> is closed.`;
+   - git's push output, then `Pushed. Handover <h> is closed.`, then `Done. Setup <id> is closed.`;
    - the secrets reminder:
      `Add these Actions secrets yourself on GitHub (gitgatesetup cannot check them):` and
      `  RELEASE_TOKEN: https://github.com/<scratch>/settings/secrets/actions/new`;
@@ -287,8 +287,9 @@ Exit status is 0. GitHub sends a notification that a credential was revoked. The
 
 5. User: note the `dependency graph` line of the run.
 
-Expect: record whether the status was readable with this token (`disabled → enabled`) or not
-(`unknown → enabled`), and whether the PATCH took (no `Applying dependency graph failed`).
+Expect: a new repo always shows `  dependency graph: disabled → enabled`, since the status of a repo
+created in the same run is not read. Record whether the PATCH took (no `Applying dependency graph
+failed`). Whether this token can read the status shows only on step 6's re-run.
 
 6. User: run `gitgatesetup <id>` once more. Then Agent: send a new `repo_setup` for `<scratch>` with
    the same values, with `secrets` but without `bundle`, and the user runs its id.
@@ -296,13 +297,14 @@ Expect: record whether the status was readable with this token (`disabled → en
 Expect: the first gives `No open setup <id>.` and a non-zero status, and since it never signed in it
 prints no `Signed out` line. The second signs in, lists every item as `already set`, asks no
 `Apply?`, prints `Done. Setup <id> is closed.`, the secrets reminder, and `Signed out: ...` again.
-If step 5 found the status unreadable, the `dependency graph` line shows `unknown → enabled` on every
-run, `Apply?` is asked for it alone, and the setup closes in that run because GitHub accepted the
-PATCH.
+Record the second run's `dependency graph` line: `already set` means this token can read the
+status. If it shows `unknown → enabled` instead, the status is unreadable: it shows so on every run,
+`Apply?` is asked for it alone, and the setup closes in that run because GitHub accepted the PATCH.
 
 7. User: the token is revoked at the end of each run and kept nowhere. Run
-   `grep -r ghu_ ~/.config/git-gate ~/.local/state/git-gate` after a run, and check that the token
-   no longer works.
+   `grep -rE 'gh[ur]_' ~/.config/git-gate ~/.local/state/git-gate` after a run, check that the run's
+   `audit.log` line says `"revoked": true`, and that GitHub's notification that a credential was
+   revoked arrived.
 
 Expect: no match. A later `gitgatesetup <id>` signs in again. The `audit.log` line for each run holds
 no token.

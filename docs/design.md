@@ -56,8 +56,10 @@ Creating a repo and its settings needs administration rights the gate's token do
   It is never written to disk, logged or printed, and expires after 8 hours. It is revoked at the end
   of every run that obtained one, however the run ends: `POST https://api.github.com/credentials/revoke`
   with no `Authorization` header and the access token (and the refresh token GitHub returns, which is
-  never used, only revoked). The run then calls `GET /user` with the access token, up to 6 times 5
-  seconds apart, and says `Signed out: GitHub revoked this run's token.` only once that answers 401.
+  never used, only revoked); if GitHub answers anything but 202, the access token is sent once more
+  on its own. SIGHUP and SIGTERM end a run as Ctrl-C does, so they revoke too. The run then calls
+  `GET /user` with the access token, up to 6 times 5 seconds apart, and says
+  `Signed out: GitHub revoked this run's token.` only once that answers 401.
   Otherwise it prints a warning with the page to revoke it by hand. Neither token reaches stdout,
   `audit.log` or `errors.log`.
 - App: one private app per user, registered once by `gitgatesetup --register` through the manifest
@@ -70,15 +72,20 @@ Creating a repo and its settings needs administration rights the gate's token do
   topics (1-20) and ruleset file (a plain branch ruleset for the default branch, at most 64 KiB).
 - Order, in one run: when the setup holds a first push, `gitgatesetup` applies, behind one `Apply?`:
   create the repo, description and Issues, topics, dependency graph, push `main`, ruleset. The ruleset
-  goes on after the push lands, so its required checks never refuse it. Without a first push (or once
-  its handover is gone) the ruleset is deferred, the setup stays open, and the user re-runs after
-  `gitgatepush`.
+  goes on after the push lands, so its required checks never refuse it. With `main` already on GitHub
+  and no handover, the ruleset applies in that run. Without a first push (or once its handover is
+  gone) and with no `main` on GitHub, the ruleset is deferred, the setup stays open, and the user
+  re-runs after `gitgatepush`. When the handover was pushed but GitHub does not show `main` yet, the
+  ruleset line says `deferred: main was pushed; GitHub does not show it yet. Re-run in a moment:
+  gitgatesetup <id>`.
 - The first push is a push handover: `repo_setup(..., bundle=<path>)` keeps the bundle's commit as a
   refused `push` keeps one, in the gate's mirror under `refs/gate/handover/<id>`, with the files under
   handover paths recorded; the setup records the handover id. The kept screen is shown before `Apply?`.
-  `gitgatepush <id>` still works on it, and whichever runs first pushes it. The branch is always
-  `main`, and the bundle must hold the complete history (no prerequisites), because the gate does not
-  sync from a repo that may not exist yet.
+  `gitgatepush <id>` still works on it, and whichever runs first pushes it. `gitgatesetup` pushes it
+  only while its record names the setup's repo, branch `main`, no base and no lease, and only the
+  record it showed: one that changes before the push is refused. The branch is always `main`, and
+  the bundle must hold the complete history (no prerequisites), because the gate does not sync from a
+  repo that may not exist yet.
 - `gitgatesetup` never overwrites a branch: if `main` exists on GitHub the push item is `already
   set`, whatever its commit. The kept handover is left for `gitgatepush` and the ruleset applies.
 - Actions secrets: `repo_setup(..., secrets=[names])` records 1-10 names (letters, digits and
@@ -88,9 +95,9 @@ Creating a repo and its settings needs administration rights the gate's token do
 - No suspension: suspending an installation needs the app's JWT (private key), which is never kept;
   revocation is the control.
 - A run: login, owner check, plan (`current → wanted`), `Apply? [y/N]`, apply (repository,
-  description, Issues, topics, dependency graph, ruleset), verify by reading back. The setup closes
-  only when all of it verified. Exit 0 closed, 1 open or refused, 2 usage. Each run writes one
-  `audit.log` line (id, repo, outcome) and never the token.
+  description, Issues, topics, dependency graph, push `main`, ruleset), verify by reading back. The
+  setup closes only when all of it verified. Exit 0 closed, 1 open or refused, 2 usage. Each run
+  writes one `audit.log` line (id, repo, outcome, revoked) and never the token.
 - Personal account only: the repo owner must equal the signed-in user's `login`.
 - Out of scope: reading or writing secret values, and local clone settings such as `core.hooksPath`.
 - GitHub attributes changes to the user; the app's name appears only in their security log.
