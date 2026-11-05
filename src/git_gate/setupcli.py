@@ -4,7 +4,9 @@ The user signs in to their own setup GitHub App through the device flow; the tok
 process only and is never printed or logged. The command shows how GitHub's live settings differ
 from the request, asks, applies over REST, reads every item back, and closes the request only when
 all of it took. A ruleset waits until the default branch exists, so the push that creates it is not
-refused by the ruleset's own required checks.
+refused by the ruleset's own required checks. When the request holds a kept first push of main, that
+push is applied in the same run, over the user's own SSH key as gitgatepush pushes it, and the
+ruleset after it; a branch that already exists is never pushed over.
 """
 
 import functools
@@ -15,6 +17,7 @@ import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 from git_gate import Refused
 from git_gate.appreg import load_app, register
@@ -22,12 +25,15 @@ from git_gate.call import audit
 from git_gate.config import state_dir, valid_repo
 from git_gate.devicelogin import device_login
 from git_gate.github import GitHub, GitHubError
-from git_gate.handover import ID_RE, _clean
+from git_gate.gitops import Git
+from git_gate.handover import ID_RE, RULES, Handovers, _clean, push_kept, screen
+from git_gate.mirror import Mirror
 from git_gate.setup import SetupRequest, Setups
 
 USAGE = "usage: gitgatesetup [<id> | --register]"
 SET = "already set"
 NOT_INSTALLED = (403, 404)  # a write the app may not make: not installed on the repo, or lacking a permission
+FIRST = "main"  # the branch a kept first push creates
 
 
 @dataclass
@@ -46,7 +52,47 @@ class Survey:
     ruleset_id: int | None = None  # the requested ruleset's id, when it is already set
 
 
-def main(argv: list[str], *, stdin=sys.stdin, stdout=sys.stdout, login=device_login, github=GitHub) -> int:
+class KeptPushes(Protocol):
+    """The push handovers `repo_setup` kept for a request's first push of main."""
+
+    def open(self, id: int) -> str | None:
+        """The kept commit when handover `id` is still open, else None."""
+
+    def screen(self, id: int) -> str:
+        """What gitgatepush shows for handover `id` before its prompt."""
+
+    def push(self, id: int, say) -> None:
+        """Push handover `id` as gitgatepush does; raises Refused when it does not go out."""
+
+
+class _Kept:
+    """The kept pushes in the gate's state, pushed with the code gitgatepush runs."""
+
+    def __init__(self, state: Path):
+        self.state = state
+        self.handovers = Handovers(state)
+
+    @functools.cached_property
+    def mirror(self) -> Mirror:  # built on first use: Git creates its directories under the state
+        return Mirror(Git(self.state, "https://github.com"), self.state)
+
+    def open(self, id: int) -> str | None:
+        try:
+            return self.handovers.get(id).sha
+        except Refused:
+            return None
+
+    def screen(self, id: int) -> str:
+        return screen(self.handovers.get(id), self.mirror, RULES)
+
+    def push(self, id: int, say) -> None:
+        push_kept(self.handovers, id, self.mirror, RULES, say)
+
+
+def main(
+    argv: list[str], *, stdin=sys.stdin, stdout=sys.stdout, login=device_login, github=GitHub,
+    kept: KeptPushes | None = None,
+) -> int:  # fmt: skip
     secrets: list[str] = []
 
     def say(text: str = "", end: str = "\n", *, lines: bool = False) -> None:
@@ -65,7 +111,7 @@ def main(argv: list[str], *, stdin=sys.stdin, stdout=sys.stdout, login=device_lo
         if len(argv) != 1 or not ID_RE.fullmatch(argv[0]):
             say(USAGE)
             return 2
-        return _run(state, int(argv[0]), stdin, say, login, github, secrets)
+        return _run(state, int(argv[0]), stdin, say, login, github, kept or _Kept(state), secrets)
     except Refused as e:
         say(str(e), lines=True)
         return 1
@@ -84,20 +130,20 @@ def _list(setups: Setups, say) -> int:
     return 0
 
 
-def _run(state: Path, id: int, stdin, say, login, github, secrets: list[str]) -> int:
+def _run(state: Path, id: int, stdin, say, login, github, kept: KeptPushes, secrets: list[str]) -> int:
     """One run of `gitgatesetup <id>`, audited whatever its end."""
     setups = Setups(state)
     repo, outcome = None, "refused"
     try:
         s = setups.get(id)
         repo = s.repo
-        outcome = _setup(setups, s, stdin, say, login, github, secrets)
+        outcome = _setup(setups, s, stdin, say, login, github, kept, secrets)
         return 0 if outcome == "closed" else 1
     finally:
         _audit(state, id, repo, outcome, say)
 
 
-def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, secrets: list[str]) -> str:
+def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, kept: KeptPushes, secrets: list[str]) -> str:
     if not valid_repo(s.repo):
         raise Refused(f"Setup {s.id} names a bad repository.")
     app = load_app()
@@ -110,11 +156,22 @@ def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, secrets: 
             f"{s.repo} is not under your account ({_clean(me)}); gitgatesetup sets up only your own repositories."
         )
 
-    plan = _survey(gh, s)
+    plan = _survey(gh, s, kept, say)
+    try:
+        return _apply(setups, s, gh, kept, plan, stdin, say, app.slug)
+    finally:
+        _secrets(s, say)
+
+
+def _apply(setups: Setups, s: SetupRequest, gh: GitHub, kept: KeptPushes, plan: Survey, stdin, say, slug: str) -> str:
+    """Show the plan, ask, apply, survey again, and close the request when nothing is left."""
     say(f"Setup {s.id}: {s.repo}")
     for item in plan.items:
         say(f"  {item.name}: {item.line}", lines=True)  # every live value in a line is cleaned already
     todo = [item for item in plan.items if item.apply]
+    if s.handover is not None and any(item.name == FIRST for item in todo):
+        say()
+        say(kept.screen(s.handover), lines=True)
     if todo:
         say("Apply? [y/N] ", end="")
         if not _yes(stdin, say):
@@ -136,12 +193,12 @@ def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, secrets: 
                 if isinstance(e, GitHubError) and (e.status in NOT_INSTALLED or _name_taken(item, e)):
                     say(f"GitHub refused {item.name} ({e.status}). The app may not be installed on this repository "
                         f"or may lack a permission; install it on all repositories: "
-                        f"https://github.com/apps/{app.slug}/installations/new")  # fmt: skip
+                        f"https://github.com/apps/{slug}/installations/new")  # fmt: skip
                 else:
                     say(f"Applying {item.name} failed: {e}")
                 say(f"Setup {s.id} stays open. Re-run: gitgatesetup {s.id}")
                 return "open"
-        plan = _survey(gh, s, frozenset(accepted))
+        plan = _survey(gh, s, kept, say, frozenset(accepted))
 
     _others(gh, s, plan, say)
     left = [item for item in plan.items if item.line != SET]
@@ -172,10 +229,10 @@ def _yes(stdin, say) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def _survey(gh: GitHub, s: SetupRequest, accepted: frozenset[str] = frozenset()) -> Survey:
+def _survey(gh: GitHub, s: SetupRequest, kept: KeptPushes, say, accepted: frozenset[str] = frozenset()) -> Survey:
     """Read GitHub's live state for every item of `s`. Every value read from GitHub is cleaned before
     it is shown, and an item's `apply` is set only when it differs from the request. `accepted` names
-    the items GitHub took a change for in this run."""
+    the items GitHub took a change for in this run. An absent repository has no main."""
     repo, out = s.repo, Survey()
     live = gh.repo(repo)
     if live is None:
@@ -198,7 +255,10 @@ def _survey(gh: GitHub, s: SetupRequest, accepted: frozenset[str] = frozenset())
     out.items.append(_item("topics", set(topics) == set(s.topics), _names(topics), _names(s.topics),
                            lambda: gh.set_topics(repo, s.topics)))  # fmt: skip
     out.items.append(_graph(gh, repo, graph, accepted))
-    out.items.append(_ruleset(gh, s, live, out))
+    first = _first_push(gh, s, live, kept, say)
+    if first:
+        out.items.append(first)
+    out.items.append(_ruleset(gh, s, live, out, pending=bool(first and first.apply)))
     return out
 
 
@@ -211,17 +271,58 @@ def _graph(gh: GitHub, repo: str, on: bool | None, accepted: frozenset[str]) -> 
     return Item("dependency graph", f"{current} → enabled", lambda: gh.enable_dependency_graph(repo))
 
 
-def _ruleset(gh: GitHub, s: SetupRequest, live: dict | None, out: Survey) -> Item:
+def _first_push(gh: GitHub, s: SetupRequest, live: dict | None, kept: KeptPushes, say) -> Item | None:
+    """The kept first push of main. A main that exists is never pushed over, whatever its commit; a
+    handover that is gone (pushed by gitgatepush, or expired) leaves no item."""
+    if s.handover is None:
+        return None
+    if live is not None and gh.branch(s.repo, FIRST) is not None:
+        return Item(FIRST, SET)
+    sha = kept.open(s.handover)
+    if not sha:
+        return None
+    line = f"absent → push {_clean(sha[:12])} (handover {s.handover}; shown below)"
+    return Item(FIRST, line, functools.partial(kept.push, s.handover, say))
+
+
+def _default(gh: GitHub, s: SetupRequest, live: dict | None) -> tuple[str | None, bool]:
+    """The repository's default branch (None when there is no repository) and whether it has commits."""
     default = str(live.get("default_branch") or "main") if live else None
-    if default is None or gh.branch(s.repo, default) is None:
+    return default, default is not None and gh.branch(s.repo, default) is not None
+
+
+def _same_name(gh: GitHub, s: SetupRequest) -> int | None:
+    """The id of this repository's own branch ruleset named as the request's, if there is one."""
+    wanted = (s.ruleset.get("name"), "branch", "Repository")
+    ids = [r.get("id") for r in gh.rulesets(s.repo) if (r.get("name"), r.get("target"), r.get("source_type")) == wanted]
+    return next((i for i in ids if isinstance(i, int) and not isinstance(i, bool)), None)
+
+
+def _apply_ruleset(gh: GitHub, s: SetupRequest) -> None:
+    """Apply the ruleset once the first push has landed. It writes nothing when the default branch
+    still has no commits (it is not main); the survey after applying then shows it deferred."""
+    if not _default(gh, s, gh.repo(s.repo))[1]:
+        return
+    id = _same_name(gh, s)
+    if id is None:
+        gh.create_ruleset(s.repo, s.ruleset)
+    else:
+        gh.update_ruleset(s.repo, id, s.ruleset)
+
+
+def _ruleset(gh: GitHub, s: SetupRequest, live: dict | None, out: Survey, *, pending: bool = False) -> Item:
+    """The ruleset; `pending` when a first push of main is applied before it in this run."""
+    name = s.ruleset.get("name")
+    default, exists = _default(gh, s, live)
+    if not exists and pending:
+        line = f"absent → {_quote(str(name))} after main is pushed; rules: {_rules(s.ruleset)}"
+        return Item("ruleset", line, lambda: _apply_ruleset(gh, s))
+    if not exists:
         branch = _clean(default) if default else "the default branch"
         return Item("ruleset", f"deferred: {branch} does not exist yet; push it (gitgatepush), "
                                f"then re-run gitgatesetup {s.id}")  # fmt: skip
     out.default = default
-    name = s.ruleset.get("name")
-    wanted = (name, "branch", "Repository")
-    ids = [r.get("id") for r in gh.rulesets(s.repo) if (r.get("name"), r.get("target"), r.get("source_type")) == wanted]
-    id = next((i for i in ids if isinstance(i, int) and not isinstance(i, bool)), None)
+    id = _same_name(gh, s)
     if id is None:
         line = f"absent → {_quote(str(name))}; rules: {_rules(s.ruleset)}"
         return Item("ruleset", line, lambda: gh.create_ruleset(s.repo, s.ruleset))
@@ -320,6 +421,16 @@ def _removed(have: object, want: object) -> str:
     gone += [f'branches "{_clean(r)}"' for r in _refs(have, "include") if r not in included]
     gone += [f'branches "{_clean(r)}" (newly excluded)' for r in _refs(want, "exclude") if r not in excluded]
     return ", ".join(gone)
+
+
+def _secrets(s: SetupRequest, say) -> None:
+    """Name the Actions secrets the request asked for. The app cannot read secrets, so a reminder
+    never keeps a setup open."""
+    if not s.secrets:
+        return
+    say("Add these Actions secrets yourself on GitHub (gitgatesetup cannot check them):")
+    for name in s.secrets:
+        say(f"  {_clean(name)}: https://github.com/{_clean(s.repo)}/settings/secrets/actions/new")
 
 
 def _item(name: str, done: bool, current: str, wanted: str, apply: Callable[[], object]) -> Item:

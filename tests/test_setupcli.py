@@ -13,6 +13,7 @@ import pytest
 
 from git_gate import Refused, setupcli
 from git_gate.github import GitHubError
+from git_gate.handover import Handovers
 from git_gate.setup import Setups
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -52,7 +53,8 @@ class FakeGitHub:
         self.live = repo
         self.live_topics = list(topics)
         self.graph = graph
-        self.has_branch = branch
+        self.has_branch = branch  # whether main exists
+        self.default_branch = "main"
         self.live_rulesets = [copy.deepcopy(r) for r in rulesets]
         self.checks = list(checks)
         self.fail: dict[str, BaseException] = {}
@@ -77,7 +79,10 @@ class FakeGitHub:
 
     def repo(self, repo):
         self._call("repo", repo)
-        return copy.deepcopy(self.live)
+        live = copy.deepcopy(self.live)
+        if live is not None:
+            live["default_branch"] = self.default_branch
+        return live
 
     def create_user_repo(self, name, description):
         self._call("create_user_repo", name, description)
@@ -110,7 +115,7 @@ class FakeGitHub:
 
     def branch(self, repo, branch):
         self._call("branch", repo, branch)
-        return {"sha": "a" * 40, "protected": False} if self.has_branch else None
+        return {"sha": "a" * 40, "protected": False} if self.has_branch and branch == "main" else None
 
     def rulesets(self, repo):
         self._call("rulesets", repo)
@@ -172,8 +177,37 @@ def setups(dirs):
     return Setups(dirs[0])
 
 
-def create(setups, repo=REPO, description=DESCRIPTION, topics=TOPICS, ruleset=RULESET):
-    return setups.create(repo, description, topics, ruleset)
+def create(setups, repo=REPO, description=DESCRIPTION, topics=TOPICS, ruleset=RULESET, **kw):
+    return setups.create(repo, description, topics, ruleset, **kw)
+
+
+KEPT_SHA = "b" * 40
+
+
+class FakeKept:
+    """Stands in for the kept first push: `push` records itself in the fake GitHub's calls and creates main."""
+
+    def __init__(self, gh, *, open=True, fail=None):
+        self.gh = gh
+        self.is_open = open
+        self.fail = fail
+        self.screens: list[int] = []
+        self.pushes: list[int] = []
+
+    def open(self, id):
+        return KEPT_SHA if self.is_open else None
+
+    def screen(self, id):
+        self.screens.append(id)
+        return f"Handover {id} screen\n\nRun: git push {id}"
+
+    def push(self, id, say):
+        self.gh.calls.append(("push", id))
+        self.pushes.append(id)
+        if self.fail:
+            raise self.fail
+        self.gh.has_branch = True
+        say(f"Pushed. Handover {id} is closed.")
 
 
 class Login:
@@ -187,10 +221,11 @@ class Login:
         return self.token
 
 
-def run(argv, gh=None, answer="y\n", login=None):
+def run(argv, gh=None, answer="y\n", login=None, kept=None):
     out = io.StringIO()
     stdin = answer if hasattr(answer, "readline") else io.StringIO(answer)
-    code = setupcli.main(argv, stdin=stdin, stdout=out, login=login or Login(), github=gh or FakeGitHub())
+    gh = gh or FakeGitHub()
+    code = setupcli.main(argv, stdin=stdin, stdout=out, login=login or Login(), github=gh, kept=kept or FakeKept(gh))
     return code, out.getvalue()
 
 
@@ -461,6 +496,119 @@ def test_token_never_printed(setups, dirs):
     for text in (out, out2, (dirs[0] / "audit.log").read_text()):
         assert TOKEN not in text
     assert "[token]" in out2
+
+
+# --- the first push of main and secret reminders --------------------------------------------------
+
+
+def test_fresh_repo_with_first_push_closes_in_one_run(setups, dirs):
+    create(setups, handover=7)
+    gh = FakeGitHub(repo=None)
+    kept = FakeKept(gh)
+    code, out = run(["1"], gh, kept=kept)
+    assert code == 0, out
+    shown = out.split("Apply? [y/N]")[0]
+    lines = [
+        "  repository: absent",
+        "  dependency graph: disabled → enabled",
+        f"  main: absent → push {KEPT_SHA[:12]} (handover 7; shown below)",
+        '  ruleset: absent → "Protect main" after main is pushed; rules: deletion, non_fast_forward, '
+        "required_status_checks[ci]",
+        "\n\nHandover 7 screen\n\nRun: git push 7\n",
+    ]
+    at = [shown.index(line) for line in lines]
+    assert at == sorted(at)
+    assert [c for c in gh.calls if c[0] in WRITES | {"push"}] == [
+        ("create_user_repo", "app", DESCRIPTION),
+        ("set_topics", REPO, TOPICS),
+        ("enable_dependency_graph", REPO),
+        ("push", 7),
+        ("create_ruleset", REPO, RULESET),
+    ]
+    assert kept.screens == [7]
+    assert out.endswith("Done. Setup 1 is closed.\n")
+    assert setups.open() == []
+    assert audit_lines(dirs)[-1]["outcome"] == "closed"
+
+
+def test_existing_main_is_never_pushed(setups):
+    create(setups, handover=7)
+    gh = all_set(rulesets=[], branch=True)
+    kept = FakeKept(gh)
+    code, out = run(["1"], gh, kept=kept)
+    assert code == 0, out
+    assert "  main: already set" in out
+    assert "→ push" not in out
+    assert kept.pushes == [] and kept.screens == []
+    assert gh.writes() == [("create_ruleset", REPO, RULESET)]
+
+
+def test_failed_push_keeps_the_setup_open(setups, dirs):
+    create(setups, handover=7)
+    gh = FakeGitHub(repo=None)
+    kept = FakeKept(gh, fail=Refused("git push failed (exit 128). Handover 7 is still open."))
+    code, out = run(["1"], gh, kept=kept)
+    assert code == 1
+    assert "git push failed (exit 128). Handover 7 is still open." in out
+    assert "Setup 1 stays open. Re-run: gitgatesetup 1" in out
+    assert kept.pushes == [7]
+    assert not [c for c in gh.writes() if c[0] in ("create_ruleset", "update_ruleset")]
+    setups.get(1)
+    assert audit_lines(dirs)[-1]["outcome"] == "open"
+
+
+def test_default_branch_not_main_defers_the_ruleset(setups):
+    create(setups, handover=7)
+    gh = FakeGitHub(repo=None)
+    gh.default_branch = "master"  # the user's default-branch setting: the new repo reports it once it exists
+    kept = FakeKept(gh)
+    code, out = run(["1"], gh, kept=kept)
+    assert code == 1
+    assert kept.pushes == [7]
+    assert not [c for c in gh.writes() if c[0] in ("create_ruleset", "update_ruleset")]
+    left = out.split("Not done yet:")[1]
+    assert "  ruleset: deferred: master does not exist yet; push it (gitgatepush), then re-run gitgatesetup 1" in left
+    assert "main:" not in left
+    setups.get(1)
+
+
+def test_gone_handover_falls_back_to_deferred(setups):
+    create(setups, handover=7)
+    gh = FakeGitHub(repo=None)
+    kept = FakeKept(gh, open=False)
+    code, out = run(["1"], gh, kept=kept)
+    assert code == 1
+    assert "ruleset: deferred: main does not exist yet; push it (gitgatepush), then re-run gitgatesetup 1" in out
+    assert "  main:" not in out
+    assert kept.pushes == [] and kept.screens == []
+
+
+def test_secrets_are_reminded_at_the_end(setups):
+    reminder = [
+        "Add these Actions secrets yourself on GitHub (gitgatesetup cannot check them):",
+        f"  RELEASE_TOKEN: https://github.com/{REPO}/settings/secrets/actions/new",
+    ]
+    create(setups, secrets=("RELEASE_TOKEN",))
+    code, out = run(["1"], all_set())
+    assert code == 0, out
+    assert out.splitlines()[-3:] == ["Done. Setup 1 is closed.", *reminder]
+
+    create(setups, secrets=("RELEASE_TOKEN",))
+    code, out = run(["2"], FakeGitHub(repo=None), answer="n\n")
+    assert code == 1
+    assert out.splitlines()[-3:] == ["Apply? [y/N] Not applied. Setup 2 stays open.", *reminder]
+
+    create(setups)
+    code, out = run(["3"], all_set())
+    assert "Actions secrets" not in out
+
+
+def test_default_kept_reads_the_gates_handovers(dirs):
+    kept = setupcli._Kept(dirs[0])
+    assert kept.open(1) is None
+    h = Handovers(dirs[0]).create(REPO, "main", KEPT_SHA, None, None, "first push", patterns=(), protected=(),
+                                  exclude=())  # fmt: skip
+    assert kept.open(h.id) == KEPT_SHA
 
 
 # --- the rest of the controller's rulings ----------------------------------------------------------
