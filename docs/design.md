@@ -42,7 +42,7 @@ sandbox.
 | `push(repo, branch)` | Pushes the branch to the explicit URL. | Repo allowlist; never a protected branch; fast-forward only; refuses commits touching `.github/workflows/` with a handover message; no tags; no force. |
 | `prune(repo, branch)` | Deletes a remote branch. | PR merged or closed; branch not protected. |
 | `gh(repo, args)` | Runs the real `gh` with `-R <repo>` forced and the gate's own `GH_CONFIG_DIR`. | Subcommand allowlist (includes `run watch`); `gh api` GET-only or excluded. |
-| `repo_setup(repo, description, topics, ruleset_file)` | Validates and stores a setup request; answers with `gitgatesetup <id>`. | Write access to the repo; never calls GitHub. |
+| `repo_setup(repo, description, topics, ruleset_file, bundle?, secrets?)` | Validates and stores a setup request; answers with `gitgatesetup <id>`. | Write access to the repo; never calls GitHub. |
 
 Force-push, tags, and workflow-file commits stay manual: the user pushes over SSH.
 
@@ -53,8 +53,13 @@ Creating a repo and its settings needs administration rights the gate's token do
 
 - No `gh` on this path: every call goes through `git_gate.github.GitHub` (`urllib`).
 - Credential: a GitHub App user-to-server token from the OAuth device flow, requested at each run.
-  It is never written to disk, logged or printed, and expires after 8 hours. There is no revocation,
-  since that needs the app's client secret, which is never kept.
+  It is never written to disk, logged or printed, and expires after 8 hours. It is revoked at the end
+  of every run that obtained one, however the run ends: `POST https://api.github.com/credentials/revoke`
+  with no `Authorization` header and the access token (and the refresh token GitHub returns, which is
+  never used, only revoked). The run then calls `GET /user` with the access token, up to 6 times 5
+  seconds apart, and says `Signed out: GitHub revoked this run's token.` only once that answers 401.
+  Otherwise it prints a warning with the page to revoke it by hand. Neither token reaches stdout,
+  `audit.log` or `errors.log`.
 - App: one private app per user, registered once by `gitgatesetup --register` through the manifest
   flow and installed on All repositories. Permissions are `administration: write` and
   `metadata: read`; no webhook. Only `client_id`, `slug` and `owner` are kept, in
@@ -63,16 +68,31 @@ Creating a repo and its settings needs administration rights the gate's token do
 - The gate's own token is unchanged. `repo_setup` stores the request under `<state>/setups/<id>.json`
   (14-day expiry, as handovers) after checking the description (one line, at most 350 characters),
   topics (1-20) and ruleset file (a plain branch ruleset for the default branch, at most 64 KiB).
-- Order: a repo is created before its first push. The ruleset is applied only once the default
-  branch exists, because its required checks would refuse the push that creates `main`. A setup
-  with a deferred ruleset stays open; the user pushes with `gitgatepush` and re-runs.
+- Order, in one run: when the setup holds a first push, `gitgatesetup` applies, behind one `Apply?`:
+  create the repo, description and Issues, topics, dependency graph, push `main`, ruleset. The ruleset
+  goes on after the push lands, so its required checks never refuse it. Without a first push (or once
+  its handover is gone) the ruleset is deferred, the setup stays open, and the user re-runs after
+  `gitgatepush`.
+- The first push is a push handover: `repo_setup(..., bundle=<path>)` keeps the bundle's commit as a
+  refused `push` keeps one, in the gate's mirror under `refs/gate/handover/<id>`, with the files under
+  handover paths recorded; the setup records the handover id. The kept screen is shown before `Apply?`.
+  `gitgatepush <id>` still works on it, and whichever runs first pushes it. The branch is always
+  `main`, and the bundle must hold the complete history (no prerequisites), because the gate does not
+  sync from a repo that may not exist yet.
+- `gitgatesetup` never overwrites a branch: if `main` exists on GitHub the push item is `already
+  set`, whatever its commit. The kept handover is left for `gitgatepush` and the ruleset applies.
+- Actions secrets: `repo_setup(..., secrets=[names])` records 1-10 names (letters, digits and
+  underscores, not starting with `GITHUB_`; shown upper-cased). `gitgatesetup` prints each with its
+  settings link (`https://github.com/<repo>/settings/secrets/actions/new`) at the end of every run.
+  The app has no `secrets` permission and cannot read them, so a reminder never keeps a setup open.
+- No suspension: suspending an installation needs the app's JWT (private key), which is never kept;
+  revocation is the control.
 - A run: login, owner check, plan (`current → wanted`), `Apply? [y/N]`, apply (repository,
   description, Issues, topics, dependency graph, ruleset), verify by reading back. The setup closes
   only when all of it verified. Exit 0 closed, 1 open or refused, 2 usage. Each run writes one
   `audit.log` line (id, repo, outcome) and never the token.
 - Personal account only: the repo owner must equal the signed-in user's `login`.
-- Out of scope: Actions secrets (the user pastes `RELEASE_TOKEN` on GitHub's secret page; the skill
-  hands over its link) and local clone settings such as `core.hooksPath`.
+- Out of scope: reading or writing secret values, and local clone settings such as `core.hooksPath`.
 - GitHub attributes changes to the user; the app's name appears only in their security log.
 
 ## Running git in place safely

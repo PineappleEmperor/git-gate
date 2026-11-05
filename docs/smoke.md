@@ -233,13 +233,16 @@ closed PR branches.`
 
 Expect: no `origin/smoke/*` remains.
 
-## 12. Repo setup (`repo_setup` and `gitgatesetup`)
+## 12. Repo setup (`repo_setup` and `gitgatesetup`, in one run)
 
-Needs a scratch repo name that does not exist yet, `<scratch>` (`PineappleEmperor/smoke-setup`), and a
-workspace holding a ruleset JSON file at `<abs>/.tmp/ruleset.json`.
+Needs a scratch repo name that does not exist yet, `<scratch>` (`PineappleEmperor/smoke-setup-2`),
+and a workspace holding a ruleset JSON file at `<abs>/.tmp/ruleset.json` and a repo with a commit on
+`main` whose tree holds `.github/workflows/ci.yml`. Make its bundle in the sandbox with
+`git bundle create <abs>/.tmp/main.bundle main` (branch `main` only, complete history).
 
-1. User: run `gitgatesetup --register`, approve the app on GitHub, then install it as the command
-   prints. Note whether **Enable Device Flow** was already ticked.
+1. User: run `gitgatesetup --register` (skip if `~/.config/git-gate/setup-app.json` exists), approve
+   the app on GitHub, then install it as the command prints. Note whether **Enable Device Flow** was
+   already ticked.
 
 Expect: `Registered <slug>.`, the install link, and the Device Flow reminder.
 `~/.config/git-gate/setup-app.json` holds only `client_id`, `slug` and `owner`. A second
@@ -249,39 +252,60 @@ Expect: `Registered <slug>.`, the install link, and the Device Flow reminder.
 
 Expect: step 3 needs no further install step.
 
-3. Agent: `repo_setup(<scratch>, "Scratch repo", ["smoke"], "<abs>/.tmp/ruleset.json")`. User: run the
-   `gitgatesetup <id>` it names.
+3. Agent: `repo_setup(<scratch>, "Scratch repo", ["smoke"], "<abs>/.tmp/ruleset.json",
+   bundle="<abs>/.tmp/main.bundle", secrets=["RELEASE_TOKEN"])`.
 
-Expect: the reply `Setup <id> recorded for <scratch>.` with `gitgatesetup <id>`. The run prints the
-device code and URL, then `repository: absent → create public <scratch>`, the other items, and
-`ruleset: deferred: main does not exist yet; push it (gitgatepush), then re-run gitgatesetup <id>`.
-After `y`, the repo exists (created by `POST /user/repos` with the app's user token) and the run ends
-`Not done yet:` with the ruleset line, exit status 1. `gitgatesetup` with no id lists the setup.
+Expect: the reply `Setup <id> recorded for <scratch>.` with `gitgatesetup <id>`, then `It includes
+the first push of main (handover <h>).` and `It reminds the user to add the Actions secrets:
+RELEASE_TOKEN.` `gitgatesetup` with no id lists the setup. `gitgatepush` with no id lists handover
+`<h>`. A bundle with prerequisites (made with `--not`) is refused with `The first-push bundle must
+hold main's complete history; make it with: git bundle create <dir>/.tmp/main.bundle main`.
 
-4. Agent: push `main` to `<scratch>` (the user runs the `gitgatepush` handover). User: run
-   `gitgatesetup <id>` again.
+4. User: run `gitgatesetup <id>` once and answer `y` at the prompt.
 
-Expect: only the ruleset is left to apply (if step 5 found the status unreadable, the
-`dependency graph: unknown → enabled` line shows again and is applied too); after `y` the run ends `Done. Setup <id> is closed.` with
-exit status 0. The ruleset shows under the repo's Settings, Rules.
+Expect, in this order:
+   - one sign-in: `Open <uri> and enter the code <code>.`, then `Waiting for approval...`; approve it
+     in the browser;
+   - `Setup <id>: <scratch>`, then the plan:
+     `  repository: absent (or not visible to the setup app) → create public <scratch>`,
+     `  description: (none) → "Scratch repo"`, `  Issues: off → on`, `  topics: ...`,
+     `  dependency graph: ...`,
+     `  main: absent → push <sha12> (handover <h>; shown below)`, and
+     `  ruleset: absent → "<name>" after main is pushed; rules: ...`;
+   - the kept screen, which lists `.github/workflows/ci.yml` under
+     `Files under handover paths (1):`, followed by the `Run: git ... push` line;
+   - one `Apply?` prompt: `Apply? [y/N]`;
+   - git's push output, then `Done. Setup <id> is closed.`;
+   - the secrets reminder:
+     `Add these Actions secrets yourself on GitHub (gitgatesetup cannot check them):` and
+     `  RELEASE_TOKEN: https://github.com/<scratch>/settings/secrets/actions/new`;
+   - `Signed out: GitHub revoked this run's token.`
 
-5. User: note the `dependency graph` line of the first and second runs.
+Exit status is 0. GitHub sends a notification that a credential was revoked. The repo exists with
+`main` at the pushed commit and the ruleset under Settings, Rules, and its default branch is `main`.
+`gitgatepush` with no id lists no handover for the pushed `main`.
+
+5. User: note the `dependency graph` line of the run.
 
 Expect: record whether the status was readable with this token (`disabled → enabled`) or not
 (`unknown → enabled`), and whether the PATCH took (no `Applying dependency graph failed`).
 
 6. User: run `gitgatesetup <id>` once more. Then Agent: send a new `repo_setup` for `<scratch>` with
-   the same values and the user runs its id.
+   the same values, with `secrets` but without `bundle`, and the user runs its id.
 
-Expect: the first gives `No open setup <id>.` and a non-zero status. The second lists every item as
-`already set`, no `Apply?` prompt, and closes. If step 5 found the status unreadable, the
-`dependency graph` line shows `unknown → enabled` on every run, `Apply?` is asked for it alone, and the
-setup closes in that run because GitHub accepted the PATCH.
+Expect: the first gives `No open setup <id>.` and a non-zero status, and since it never signed in it
+prints no `Signed out` line. The second signs in, lists every item as `already set`, asks no
+`Apply?`, prints `Done. Setup <id> is closed.`, the secrets reminder, and `Signed out: ...` again.
+If step 5 found the status unreadable, the `dependency graph` line shows `unknown → enabled` on every
+run, `Apply?` is asked for it alone, and the setup closes in that run because GitHub accepted the
+PATCH.
 
-7. User: the token expires after 8 hours but is kept nowhere, so it cannot be tried. Run
-   `grep -r ghu_ ~/.config/git-gate ~/.local/state/git-gate` after a run.
+7. User: the token is revoked at the end of each run and kept nowhere. Run
+   `grep -r ghu_ ~/.config/git-gate ~/.local/state/git-gate` after a run, and check that the token
+   no longer works.
 
-Expect: no match. After 8 hours a later `gitgatesetup <id>` signs in again.
+Expect: no match. A later `gitgatesetup <id>` signs in again. The `audit.log` line for each run holds
+no token.
 
 8. User: check three things GitHub does that the code assumes. Record each answer.
    a. `GET /repos/<scratch>/rulesets/<id>` with the app's token: does it return `bypass_actors`? If it does not,
