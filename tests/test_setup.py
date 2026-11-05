@@ -4,10 +4,10 @@ import stat
 
 import pytest
 
-from conftest import call
+from conftest import call, commit, git, make_bundle
 from git_gate import Refused
-from git_gate.handover import EXPIRES
-from git_gate.setup import Setups, check_description, check_ruleset, check_topics
+from git_gate.handover import EXPIRES, Handovers
+from git_gate.setup import Setups, check_description, check_ruleset, check_secrets, check_topics
 
 TEMPLATE = json.loads("""
 {
@@ -217,3 +217,89 @@ def test_repo_setup_checks_arguments(env):
         call(env, "repo_setup", **_request(env, topics=["Bad Topic"]))
     with pytest.raises(Refused):
         call(env, "repo_setup", **_request(env, description="two\nlines"))
+
+
+def test_check_secrets():
+    assert check_secrets(None) == ()
+    assert check_secrets(["release_token"]) == ("RELEASE_TOKEN",)
+    for bad, fragment in [
+        ([], "1 to 10"),
+        ([f"S{i}" for i in range(11)], "1 to 10"),
+        (["GITHUB_X"], "GITHUB_"),
+        (["github_x"], "GITHUB_"),
+        (["9X"], "letters, digits and underscores"),
+        (["A", "a"], "repeat"),
+    ]:
+        with pytest.raises(Refused, match=fragment):
+            check_secrets(bad)
+
+
+def test_old_records_still_parse(tmp_path):
+    setups = Setups(tmp_path)
+    s = setups.create("me/app", "A thing", ("a",), TEMPLATE)
+    path = setups.dir / f"{s.id}.json"
+    data = json.loads(path.read_text())
+    del data["handover"], data["secrets"]
+    path.write_text(json.dumps(data))
+    old = setups.get(s.id)
+    assert old.handover is None
+    assert old.secrets == ()
+
+
+# --- the first push --------------------------------------------------------------------------
+
+
+def _first_push(env, *exclude, branch="main"):
+    """A fresh repo in the workspace whose branch is bundled; returns the bundle path and the commits."""
+    src = env.ws / "fresh"
+    src.mkdir(exist_ok=True)
+    git("init", "-q", cwd=src)
+    if branch != "main":
+        git("switch", "-q", "-c", branch, cwd=src)
+    first = commit(src, "README.md", "hello")
+    second = commit(src, ".github/workflows/ci.yml", "on: push")
+    out = env.ws / "first.bundle"
+    make_bundle(src, out, branch, *[{"first": first}.get(x, x) for x in exclude])
+    return out, first, second
+
+
+def _no_github(env):
+    def no_github(token):
+        raise AssertionError("repo_setup must not call GitHub")
+
+    env.gate.github = no_github
+
+
+def test_repo_setup_keeps_the_first_push(env):
+    _no_github(env)
+    bundle, _, tip = _first_push(env)
+    out = env.gate.dispatch("repo_setup", _request(env, bundle=str(bundle)))
+    assert "It includes the first push of main (handover 1)." in out
+    assert Setups(env.gate.state).get(1).handover == 1
+    h = Handovers(env.gate.state).get(1)
+    assert (h.branch, h.base, h.sha) == ("main", None, tip)
+    assert h.protected == (".github/workflows/ci.yml",)
+    ref = git("--git-dir", str(env.gate.mirror.path("me/app")), "rev-parse", "refs/gate/handover/1", cwd=env.tmp)
+    assert ref == tip
+
+
+def test_repo_setup_bundle_needs_complete_history(env):
+    bundle, _, _ = _first_push(env, "first")
+    with pytest.raises(Refused, match="complete history"):
+        call(env, "repo_setup", **_request(env, bundle=str(bundle)))
+    assert not list((env.gate.state / "setups").glob("*.json"))
+    assert Handovers(env.gate.state).open() == []
+
+
+def test_repo_setup_bundle_must_hold_main(env):
+    bundle, _, _ = _first_push(env, branch="feat")
+    with pytest.raises(Refused, match="refs/heads/main"):
+        call(env, "repo_setup", **_request(env, bundle=str(bundle)))
+    assert not list((env.gate.state / "setups").glob("*.json"))
+    assert Handovers(env.gate.state).open() == []
+
+
+def test_repo_setup_records_secrets(env):
+    out = env.gate.dispatch("repo_setup", _request(env, secrets=["release_token"]))
+    assert Setups(env.gate.state).get(1).secrets == ("RELEASE_TOKEN",)
+    assert "It reminds the user to add the Actions secrets: RELEASE_TOKEN." in out

@@ -510,19 +510,62 @@ class Gate:
         return writes.label(self._writes(rules, token), repo, action, name, color, description, new_name)
 
     def repo_setup(
-        self, rules: Rules, token: str, repo: str, description: str, topics: list[str], ruleset_file: str
-    ) -> str:
-        """Record a repository's settings for the user to apply with `gitgatesetup <id>`; no GitHub call."""
+        self, rules: Rules, token: str, repo: str, description: str, topics: list[str], ruleset_file: str,
+        bundle: str | None = None, secrets: list[str] | None = None,
+    ) -> str:  # fmt: skip
+        """Record a repository's settings for the user to apply with `gitgatesetup <id>`; no GitHub call.
+
+        With a bundle, the first `main` is kept as an ordinary push handover, as `push` keeps a refused one.
+        """
         rules.require_write(repo)
         description = setup.check_description(description)
         topic_tuple = setup.check_topics(topics)
+        secret_names = setup.check_secrets(secrets)
         ruleset = setup.check_ruleset(read_workspace_file(rules, ruleset_file, "ruleset"), ruleset_file)
-        request = Setups(self.state, self.clock).create(repo, description, topic_tuple, ruleset)
-        return (
+        handover = None
+        if bundle is not None:
+            handover = self._keep_first_push(rules, repo, bundle).id
+        request = Setups(self.state, self.clock).create(
+            repo, description, topic_tuple, ruleset, handover=handover, secrets=secret_names
+        )
+        answer = (
             f"Setup {request.id} recorded for {repo}. Ask the user to run, in their own terminal:\n\n"
             f"gitgatesetup {request.id}\n\n"
             "It signs them in to GitHub in the browser, shows what will change, and applies it. Do not retry."
         )
+        if handover is not None:
+            answer += f" It includes the first push of main (handover {handover})."
+        if secret_names:
+            answer += f" It reminds the user to add the Actions secrets: {', '.join(secret_names)}."
+        return answer
+
+    def _keep_first_push(self, rules: Rules, repo: str, bundle: str):
+        """Keep the bundle's `main` as a handover; the repo may not exist on GitHub, so nothing is synced."""
+        howto = "git bundle create <dir>/.tmp/main.bundle main"
+        with self._staged("setup") as staged:
+            copy_in(rules, bundle, staged, MAX_BUNDLE, "bundle")
+            with self.mirror.lock(repo):
+                verify = self.git.run(
+                    ["bundle", "verify", str(staged)], timeout=rules.git_timeout,
+                    git_dir=self.mirror.path(repo), check=False,
+                )  # fmt: skip
+                said = verify.stdout + verify.stderr
+                # Anything else that fails to verify is not a bundle at all; import_bundle says why.
+                if "complete history" not in said and (verify.returncode == 0 or "prerequisite" in said):
+                    raise Refused(f"The first-push bundle must hold main's complete history; make it with: {howto}")
+                sha = self.mirror.import_bundle(repo, staged, "main", rules)
+                patterns = rules.repo(repo).handover_paths
+                found = self.mirror.protected_changes(repo, sha, None, None, patterns, rules)
+                h = self.handovers.create(
+                    repo, "main", sha, None, None, "first push of main, part of a repo setup",
+                    patterns=patterns, protected=found.files, exclude=(),
+                )  # fmt: skip
+                try:
+                    self.mirror.keep(repo, h.ref, sha, rules)
+                except BaseException:
+                    self.handovers.close(h.id)
+                    raise
+        return h
 
     # --- CI status (the reading lives in ci.py) -----------------------------------------
 

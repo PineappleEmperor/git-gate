@@ -118,8 +118,8 @@ Pushing:
 Writing to GitHub, one typed tool each: pr, issue, triage (labels, assignees, reviewers), label, and
 workflow_run (rerun or cancel, never on the default or a protected branch). Titles and bodies are checked;
 a body goes in a file: write it first, then pass `body_file`.
-Repository settings (create, description, topics, Issues, ruleset): repo_setup, then hand the user
-`gitgatesetup <id>`.
+Repository settings (create, description, topics, Issues, ruleset, first push of main, Actions secret
+reminders): repo_setup, then hand the user `gitgatesetup <id>`.
 
 Files you hand the gate (regular files, inside a workspace, which with sessions is the session's folder;
 <dir>/.tmp/ is the place for them):
@@ -391,7 +391,10 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
                          new_name=new_name)  # fmt: skip
 
     @server.tool()
-    async def repo_setup(repo: str, description: str, topics: list[str], ruleset_file: str) -> str:
+    async def repo_setup(
+        repo: str, description: str, topics: list[str], ruleset_file: str,
+        bundle: str | None = None, secrets: list[str] | None = None,
+    ) -> str:  # fmt: skip
         """Ask for a repository's GitHub settings: create it if needed, description, topics, Issues, ruleset.
 
         Nothing is applied by this call, and the repository need not exist yet. It is recorded, and the
@@ -402,9 +405,15 @@ def build(gate: Gate | None = None, relay: Relay | None = None) -> MCPServer:
         - ruleset_file: absolute path of a *.json repository ruleset you wrote, in a workspace and outside
           dot directories (except .tmp). No bypass_actors, enforcement active, and its required status
           checks apply to ~DEFAULT_BRANCH.
+        - bundle: optional absolute path of a *.bundle holding the first main, made in the sandbox with
+          `git bundle create <dir>/.tmp/main.bundle main`: branch main only, complete history. The gate
+          keeps it for the user's `gitgatesetup <id>` to push; nothing is pushed by this call.
+        - secrets: optional names of Actions secrets the user must add, 1 to 10 unique names of letters,
+          digits and underscores (not starting with GITHUB_); only the names, never values. The user is
+          reminded of them.
         """
         return await run("repo_setup", repo=repo, description=description, topics=topics,
-                         ruleset_file=ruleset_file)  # fmt: skip
+                         ruleset_file=ruleset_file, bundle=bundle, secrets=secrets)  # fmt: skip
 
     return server
 

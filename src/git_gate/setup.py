@@ -23,6 +23,8 @@ MAX_RULESET = 64 * 1024
 MAX_RULESET_NAME = 100
 RULESET_KEYS = {"name", "target", "enforcement", "conditions", "rules", "bypass_actors"}
 REQUIRED_RULES = ("deletion", "non_fast_forward")
+MAX_SECRETS = 10
+SECRET_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,99}")  # fullmatch only
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,8 @@ class SetupRequest:
     topics: tuple[str, ...]
     ruleset: dict
     created: float
+    handover: int | None = None
+    secrets: tuple[str, ...] = ()
 
 
 def check_description(value: object) -> str:
@@ -54,6 +58,29 @@ def check_topics(value: object) -> tuple[str, ...]:
     if len(set(value)) != len(value):
         raise Refused("topics must not repeat a name.")
     return tuple(value)
+
+
+def check_secrets(value: object) -> tuple[str, ...]:
+    """The Actions secret names to remind the user of, upper-cased as GitHub stores them."""
+    if value is None:
+        return ()
+    if not isinstance(value, list | tuple):
+        raise Refused(f"secrets must be a list of names, not {_show(value)}.")
+    if not 1 <= len(value) <= MAX_SECRETS:
+        raise Refused(f"secrets must hold 1 to {MAX_SECRETS} names, not {len(value)}.")
+    names = []
+    for name in value:
+        if not isinstance(name, str) or not SECRET_RE.fullmatch(name):
+            raise Refused(
+                f"secret name {_show(name)} must use letters, digits and underscores, "
+                "not start with a digit, and be at most 100 characters."
+            )
+        if name.upper().startswith("GITHUB_"):
+            raise Refused(f"secret name {_show(name)} must not start with GITHUB_; GitHub reserves that prefix.")
+        names.append(name.upper())
+    if len(set(names)) != len(names):
+        raise Refused("secrets must not repeat a name.")
+    return tuple(names)
 
 
 def check_ruleset(data: bytes, path: str) -> dict:
@@ -104,9 +131,12 @@ class Setups:
         self.dir = state / "setups"
         self.clock = clock
 
-    def create(self, repo: str, description: str, topics: tuple[str, ...], ruleset: dict) -> SetupRequest:
+    def create(
+        self, repo: str, description: str, topics: tuple[str, ...], ruleset: dict, *,
+        handover: int | None = None, secrets: tuple[str, ...] = (),
+    ) -> SetupRequest:  # fmt: skip
         with allocate_id(self.dir, self._highest) as number:
-            s = SetupRequest(number, repo, description, tuple(topics), ruleset, self.clock())
+            s = SetupRequest(number, repo, description, tuple(topics), ruleset, self.clock(), handover, tuple(secrets))
             self._write(s)
             self._purge()
         return s
@@ -179,6 +209,8 @@ def _parse(text: str, id: int) -> SetupRequest | None:
             return None
         if isinstance(data.get("topics"), list):
             data["topics"] = tuple(data["topics"])
+        if isinstance(data.get("secrets"), list):
+            data["secrets"] = tuple(data["secrets"])
         s = SetupRequest(**data)
     except ValueError, TypeError:
         return None
@@ -190,5 +222,8 @@ def _parse(text: str, id: int) -> SetupRequest | None:
         and all(isinstance(t, str) for t in s.topics)
         and isinstance(s.ruleset, dict)
         and isinstance(s.created, int | float)
+        and (s.handover is None or (isinstance(s.handover, int) and not isinstance(s.handover, bool)))
+        and isinstance(s.secrets, tuple)
+        and all(isinstance(n, str) for n in s.secrets)
     )
     return s if ok else None
