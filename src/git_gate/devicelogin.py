@@ -74,7 +74,7 @@ def _post_json(url: str, body: dict) -> int:
             return answer.status
     except urllib.error.HTTPError as e:
         return e.code
-    except (urllib.error.URLError, OSError, TimeoutError) as e:
+    except (urllib.error.URLError, OSError) as e:
         raise Refused(f"Could not reach GitHub to revoke ({type(e).__name__}).") from None
 
 
@@ -109,7 +109,9 @@ def revoke(
     except Refused as e:
         say(str(e))
     except KeyboardInterrupt:
-        pass
+        say("")
+    except Exception as e:  # whatever the check hit: the text may echo a token, so only the class is shown
+        say(f"Could not confirm the revocation ({type(e).__name__}).")
     say(NOT_CONFIRMED)
     return False
 

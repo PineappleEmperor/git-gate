@@ -272,3 +272,19 @@ def test_revoke_interrupted_warns():
     r = Revoking()
     assert r.run(sleep=interrupt) is False
     assert r.said[-1] == NOT_CONFIRMED
+
+
+def test_revoke_unexpected_error_is_not_confirmed_and_hides_its_text():
+    r = Revoking()
+    r.alive = lambda token: (_ for _ in ()).throw(ValueError("secret ghu_x"))
+    assert r.run() is False
+    assert r.said == ["Could not confirm the revocation (ValueError).", NOT_CONFIRMED]
+
+
+def test_revoke_interrupted_ends_the_line_first():
+    def interrupt(seconds):
+        raise KeyboardInterrupt
+
+    r = Revoking()
+    r.run(sleep=interrupt)
+    assert r.said == ["", NOT_CONFIRMED]

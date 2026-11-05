@@ -143,9 +143,14 @@ def _run(state: Path, id: int, stdin, say, login, github, kept: KeptPushes, secr
         return 0 if outcome == "closed" else 1
     finally:
         revoked = None
-        if signed_in:
-            revoked = revoke(signed_in[0], alive=functools.partial(_alive, github), say=say)
-        _audit(state, id, repo, outcome, revoked, say)
+        try:
+            if signed_in:
+                revoked = revoke(signed_in[0], alive=functools.partial(_alive, github), say=say)
+        except Exception as e:  # revoke never ends the run itself: the run's own outcome stays
+            revoked = False
+            say(f"Could not confirm the revocation ({type(e).__name__}).")
+        finally:
+            _audit(state, id, repo, outcome, revoked, say)
 
 
 def _alive(github, token: str) -> bool:
@@ -153,8 +158,9 @@ def _alive(github, token: str) -> bool:
     try:
         github(token).viewer()
     except GitHubError as e:
-        if e.status == 401:
-            return False
+        return e.status != 401
+    except Refused:  # a network blip or an answer without a message: not proof either way
+        return True
     return True
 
 

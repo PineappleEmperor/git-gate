@@ -928,3 +928,64 @@ def test_alive_is_false_only_for_a_401():
     assert alive(None) is True
     assert alive(GitHubError("x", 401, {})) is False
     assert alive(GitHubError("x", 500, {})) is True
+
+
+def test_alive_counts_a_plain_refusal_as_alive_so_the_loop_goes_on():
+    from git_gate.devicelogin import revoke as real_revoke
+
+    answers = [Refused("blip"), Refused("blip"), GitHubError("x", 401, {})]
+
+    class Gh:
+        def viewer(self):
+            raise answers.pop(0)
+
+    said = []
+    ok = real_revoke(
+        Tokens("ghu_x", None),
+        alive=lambda t: setupcli._alive(lambda token: Gh(), t),
+        post=lambda url, body: 202,
+        sleep=lambda s: None,
+        say=said.append,
+    )
+    assert ok is True and said == ["Signed out: GitHub revoked this run's token."]
+
+
+def test_a_revoke_that_raises_still_audits_and_keeps_the_runs_outcome(setups, dirs):
+    create(setups)
+
+    def boom(login, *, alive, say):
+        raise RuntimeError("bad")
+
+    code, out = run(["1"], all_set(), revoke=boom)
+    assert code == 0 and "Could not confirm the revocation (RuntimeError)." in out
+    assert audit_lines(dirs)[-1]["outcome"] == "closed" and audit_lines(dirs)[-1]["revoked"] is False
+
+
+def test_a_revoke_that_raises_does_not_replace_the_runs_error(setups, dirs):
+    create(setups)
+
+    def boom(login, *, alive, say):
+        raise RuntimeError("bad")
+
+    code, out = run(["1"], FakeGitHub(repo=None, login="other"), revoke=boom)
+    assert code == 1 and "not under your account" in out.splitlines()[-1]
+    assert audit_lines(dirs)[-1]["outcome"] == "refused"
+
+
+def test_interrupted_run_revokes_audits_and_ends_on_interrupted(setups, dirs):
+    create(setups)
+    gh = FakeGitHub(repo=None)
+    gh.fail["create_user_repo"] = KeyboardInterrupt()
+    revoke = Revoke()
+    code, out = run(["1"], gh, revoke=revoke)
+    assert code == 1 and len(revoke.calls) == 1
+    assert audit_lines(dirs)[-1]["revoked"] is True
+    assert out.splitlines()[-1] == "Interrupted."
+
+
+def test_refresh_token_echoed_in_a_failure_is_redacted(setups):
+    create(setups)
+    gh = all_set(graph=False)
+    gh.fail["enable_dependency_graph"] = Refused(f"echo {REFRESH}")
+    code, out = run(["1"], gh)
+    assert REFRESH not in out and "[token]" in out
