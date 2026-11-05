@@ -23,7 +23,8 @@ from git_gate import Refused
 from git_gate.appreg import load_app, register
 from git_gate.call import audit
 from git_gate.config import state_dir, valid_repo
-from git_gate.devicelogin import device_login
+from git_gate.devicelogin import Login, device_login
+from git_gate.devicelogin import revoke as revoke_tokens
 from git_gate.github import GitHub, GitHubError
 from git_gate.gitops import Git
 from git_gate.handover import ID_RE, RULES, Handovers, _clean, push_kept, screen
@@ -91,7 +92,7 @@ class _Kept:
 
 def main(
     argv: list[str], *, stdin=sys.stdin, stdout=sys.stdout, login=device_login, github=GitHub,
-    kept: KeptPushes | None = None,
+    kept: KeptPushes | None = None, revoke=revoke_tokens,
 ) -> int:  # fmt: skip
     secrets: list[str] = []
 
@@ -111,7 +112,7 @@ def main(
         if len(argv) != 1 or not ID_RE.fullmatch(argv[0]):
             say(USAGE)
             return 2
-        return _run(state, int(argv[0]), stdin, say, login, github, kept or _Kept(state), secrets)
+        return _run(state, int(argv[0]), stdin, say, login, github, kept or _Kept(state), secrets, revoke)
     except Refused as e:
         say(str(e), lines=True)
         return 1
@@ -130,26 +131,42 @@ def _list(setups: Setups, say) -> int:
     return 0
 
 
-def _run(state: Path, id: int, stdin, say, login, github, kept: KeptPushes, secrets: list[str]) -> int:
-    """One run of `gitgatesetup <id>`, audited whatever its end."""
+def _run(state: Path, id: int, stdin, say, login, github, kept: KeptPushes, secrets: list[str], revoke) -> int:
+    """One run of `gitgatesetup <id>`, audited whatever its end. A completed sign-in is revoked at the
+    end, after the run's last GitHub call."""
     setups = Setups(state)
-    repo, outcome = None, "refused"
+    repo, outcome, signed_in = None, "refused", []
     try:
         s = setups.get(id)
         repo = s.repo
-        outcome = _setup(setups, s, stdin, say, login, github, kept, secrets)
+        outcome = _setup(setups, s, stdin, say, login, github, kept, secrets, signed_in)
         return 0 if outcome == "closed" else 1
     finally:
-        _audit(state, id, repo, outcome, say)
+        revoked = None
+        if signed_in:
+            revoked = revoke(signed_in[0], alive=functools.partial(_alive, github), say=say)
+        _audit(state, id, repo, outcome, revoked, say)
 
 
-def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, kept: KeptPushes, secrets: list[str]) -> str:
+def _alive(github, token: str) -> bool:
+    """Whether GitHub still accepts `token`; only a 401 says it does not."""
+    try:
+        github(token).viewer()
+    except GitHubError as e:
+        if e.status == 401:
+            return False
+    return True
+
+
+def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, kept: KeptPushes, secrets: list[str],
+           signed_in: list[Login]) -> str:  # fmt: skip
     if not valid_repo(s.repo):
         raise Refused(f"Setup {s.id} names a bad repository.")
     app = load_app()
-    token = login(app.client_id, say=say)
-    secrets.append(token)
-    gh = github(token)
+    done = login(app.client_id, say=say)
+    signed_in.append(done)
+    secrets.extend([done.token] + ([done.refresh] if done.refresh else []))
+    gh = github(done.token)
     me = str(gh.viewer())
     if s.repo.split("/")[0].lower() != me.lower():
         raise Refused(
@@ -463,11 +480,11 @@ def _names(names) -> str:
     return ", ".join(_clean(str(n)) for n in names) or "(none)"
 
 
-def _audit(state: Path, id: int, repo: str | None, outcome: str, say) -> None:
+def _audit(state: Path, id: int, repo: str | None, outcome: str, revoked: bool | None, say) -> None:
     """One audit.log line per `gitgatesetup <id>` run. The id says which request; no description, no token."""
     line = json.dumps({
         "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": "gitgatesetup", "id": id, "repo": repo,
-        "outcome": outcome,
+        "outcome": outcome, "revoked": revoked,
     })  # fmt: skip
     try:
         audit(state, line)

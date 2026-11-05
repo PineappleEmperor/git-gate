@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from git_gate import Refused, setupcli
+from git_gate.devicelogin import Login as Tokens
 from git_gate.github import GitHubError
 from git_gate.handover import Handovers
 from git_gate.setup import Setups
@@ -20,6 +21,8 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 
 BIN = Path(__file__).resolve().parents[1] / "bin/gitgatesetup"
 TOKEN = "ghu_test"
+REFRESH = "ghr_test"
+SIGNED_OUT = "Signed out: GitHub revoked this run's token.\n"
 SLUG = "git-gate-setup-abc123"
 REPO = "me/app"
 DESCRIPTION = "An app"
@@ -218,14 +221,33 @@ class Login:
     def __call__(self, client_id, *, say):
         self.calls.append(client_id)
         say("Open https://github.com/login/device and enter ABCD-1234")
-        return self.token
+        return Tokens(self.token, REFRESH)
 
 
-def run(argv, gh=None, answer="y\n", login=None, kept=None):
+class Revoke:
+    def __init__(self, result=True):
+        self.result = result
+        self.calls = []
+
+    def __call__(self, login, *, alive, say):
+        self.calls.append(login)
+        say("Signed out: GitHub revoked this run's token." if self.result else "Warning: not confirmed")
+        return self.result
+
+
+def run(argv, gh=None, answer="y\n", login=None, kept=None, revoke=None):
     out = io.StringIO()
     stdin = answer if hasattr(answer, "readline") else io.StringIO(answer)
     gh = gh or FakeGitHub()
-    code = setupcli.main(argv, stdin=stdin, stdout=out, login=login or Login(), github=gh, kept=kept or FakeKept(gh))
+    code = setupcli.main(
+        argv,
+        stdin=stdin,
+        stdout=out,
+        login=login or Login(),
+        github=gh,
+        kept=kept or FakeKept(gh),
+        revoke=revoke or Revoke(),
+    )
     return code, out.getvalue()
 
 
@@ -494,7 +516,7 @@ def test_token_never_printed(setups, dirs):
     code, out2 = run(["1"], gh)
     assert code == 1
     for text in (out, out2, (dirs[0] / "audit.log").read_text()):
-        assert TOKEN not in text
+        assert TOKEN not in text and REFRESH not in text
     assert "[token]" in out2
 
 
@@ -526,7 +548,7 @@ def test_fresh_repo_with_first_push_closes_in_one_run(setups, dirs):
         ("create_ruleset", REPO, RULESET),
     ]
     assert kept.screens == [7]
-    assert out.endswith("Done. Setup 1 is closed.\n")
+    assert out.removesuffix(SIGNED_OUT).endswith("Done. Setup 1 is closed.\n")
     assert setups.open() == []
     assert audit_lines(dirs)[-1]["outcome"] == "closed"
 
@@ -593,7 +615,7 @@ def test_existing_empty_repo_with_first_push_closes_in_one_run(setups):
     assert f"  main: absent → push {KEPT_SHA[:12]} (handover 7; shown below)" in shown
     assert '  ruleset: absent → "Protect main" after main is pushed; rules: deletion, non_fast_forward, ' in shown
     assert [c for c in gh.calls if c[0] in WRITES | {"push"}] == [("push", 7), ("create_ruleset", REPO, RULESET)]
-    assert out.endswith("Done. Setup 1 is closed.\n")
+    assert out.removesuffix(SIGNED_OUT).endswith("Done. Setup 1 is closed.\n")
 
 
 def test_existing_empty_repo_with_first_push_shows_the_ruleset_it_replaces(setups):
@@ -609,7 +631,7 @@ def test_existing_empty_repo_with_first_push_shows_the_ruleset_it_replaces(setup
     assert "    removes: pull_request" in shown
     assert "absent →" not in shown.split("  ruleset:")[1]
     assert [c for c in gh.calls if c[0] in WRITES | {"push"}] == [("push", 7), ("update_ruleset", REPO, 9, RULESET)]
-    assert out.endswith("Done. Setup 1 is closed.\n")
+    assert out.removesuffix(SIGNED_OUT).endswith("Done. Setup 1 is closed.\n")
 
 
 def test_known_other_default_branch_does_not_promise_the_ruleset(setups):
@@ -636,12 +658,12 @@ def test_secrets_are_reminded_at_the_end(setups):
     create(setups, secrets=("RELEASE_TOKEN",))
     code, out = run(["1"], all_set())
     assert code == 0, out
-    assert out.splitlines()[-3:] == ["Done. Setup 1 is closed.", *reminder]
+    assert out.splitlines()[-4:-1] == ["Done. Setup 1 is closed.", *reminder]
 
     create(setups, secrets=("RELEASE_TOKEN",))
     code, out = run(["2"], FakeGitHub(repo=None), answer="n\n")
     assert code == 1
-    assert out.splitlines()[-3:] == ["Apply? [y/N] Not applied. Setup 2 stays open.", *reminder]
+    assert out.splitlines()[-4:-1] == ["Apply? [y/N] Not applied. Setup 2 stays open.", *reminder]
 
     create(setups)
     code, out = run(["3"], all_set())
@@ -849,3 +871,60 @@ def test_the_launcher_runs_the_releases_python_isolated(tmp_path):
     env = {"PATH": "/usr/bin:/bin", "GIT_GATE_ROOT": str(tmp_path)}
     subprocess.run([str(release / "bin/gitgatesetup"), "1"], env=env, check=True)
     assert (tmp_path / "args").read_text().splitlines() == ["-I", "-m", "git_gate", "setup", "1"]
+
+
+def test_every_run_revokes(setups, dirs):
+    cases = [
+        (all_set(), "y\n"),  # closing
+        (FakeGitHub(repo=None), "n\n"),  # declined
+        (FakeGitHub(repo=None, login="other"), "y\n"),  # refused after login: owner mismatch
+    ]
+    failing = all_set(graph=False)
+    failing.fail["enable_dependency_graph"] = Refused("nope")
+    cases.append((failing, "y\n"))  # failed write
+    for n, (gh, answer) in enumerate(cases, 1):
+        create(setups)
+        revoke = Revoke()
+        _, out = run([str(n)], gh, answer=answer, revoke=revoke)
+        assert [(c.token, c.refresh) for c in revoke.calls] == [(TOKEN, REFRESH)]
+        assert "Signed out:" in out
+    assert [line["revoked"] for line in audit_lines(dirs)] == [True] * 4
+
+
+def test_revoke_comes_after_the_run_and_the_error_line_last(setups):
+    create(setups)
+    code, out = run(["1"], FakeGitHub(repo=None, login="other"))
+    lines = out.splitlines()
+    assert code == 1
+    assert lines[-2].startswith("Signed out:") and "not under your account" in lines[-1]
+
+
+def test_an_unconfirmed_revoke_is_audited_false(setups, dirs):
+    create(setups)
+    run(["1"], all_set(), revoke=Revoke(result=False))
+    assert audit_lines(dirs)[-1]["revoked"] is False
+
+
+def test_no_login_no_revoke(dirs):
+    revoke = Revoke()
+    run(["7"], revoke=revoke)
+    assert revoke.calls == []
+    assert audit_lines(dirs)[-1]["revoked"] is None
+
+
+def test_alive_is_false_only_for_a_401():
+    class Gh:
+        def __init__(self, error=None):
+            self.error = error
+
+        def viewer(self):
+            if self.error:
+                raise self.error
+            return "me"
+
+    def alive(error):
+        return setupcli._alive(lambda token: Gh(error), "t")
+
+    assert alive(None) is True
+    assert alive(GitHubError("x", 401, {})) is False
+    assert alive(GitHubError("x", 500, {})) is True

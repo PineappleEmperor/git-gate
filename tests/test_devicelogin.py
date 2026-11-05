@@ -7,7 +7,7 @@ from urllib.parse import parse_qs
 import pytest
 
 from git_gate import Refused
-from git_gate.devicelogin import _post, device_login
+from git_gate.devicelogin import NOT_CONFIRMED, REVOKED, Login, _post, _post_json, device_login, revoke
 
 URI = "https://github.com/login/device"
 FIRST = {
@@ -47,7 +47,7 @@ class Harness:
 
 def test_happy_path():
     h = Harness([{"error": "authorization_pending"}, {"access_token": "ghu_x", "token_type": "bearer"}])
-    assert h.run() == "ghu_x"
+    assert h.run() == Login("ghu_x", None)
     text = "\n".join(h.said)
     assert "ABCD-1234" in text and URI in text
     assert h.opened == [URI]
@@ -98,7 +98,7 @@ def test_open_url_failure_is_not_fatal():
         raise webbrowser.Error("no browser")
 
     h = Harness([{"access_token": "ghu_x"}])
-    assert h.run(open_url=boom) == "ghu_x"
+    assert h.run(open_url=boom).token == "ghu_x"
 
 
 def test_ctrl_c_is_a_refusal():
@@ -193,3 +193,82 @@ def test_post_json_list_is_refused(server):
     base, _ = server(_reply(200, json.dumps([1, 2]).encode()))
     with pytest.raises(Refused, match="unexpected"):
         _post(base + "/t", {})
+
+
+def test_login_keeps_the_refresh_token():
+    h = Harness([{"access_token": "ghu_x", "refresh_token": "ghr_x"}])
+    login = h.run()
+    assert login == Login("ghu_x", "ghr_x")
+    assert "ghu_x" not in repr(login) and "ghr_x" not in repr(login)
+
+
+class Revoking:
+    def __init__(self, alive=(False,), status=202):
+        self.alive_answers = list(alive)
+        self.status = status
+        self.said, self.posts, self.checks, self.sleeps = [], [], [], []
+
+    def post(self, url, body):
+        self.posts.append((url, body))
+        return self.status
+
+    def alive(self, token):
+        self.checks.append(token)
+        return self.alive_answers.pop(0) if len(self.alive_answers) > 1 else self.alive_answers[0]
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+
+    def run(self, sleep=None):
+        return revoke(
+            Login("ghu_x", "ghr_x"), alive=self.alive, post=self.post, sleep=sleep or self.sleep, say=self.said.append
+        )
+
+
+def test_revoke_posts_both_without_auth(server):
+    r = Revoking()
+    assert r.run() is True
+    assert r.posts == [("https://api.github.com/credentials/revoke", {"credentials": ["ghu_x", "ghr_x"]})]
+    assert r.checks == ["ghu_x"] and r.sleeps == [5]
+    assert r.said == [REVOKED]
+    base, seen = server(_reply(202, b""))
+    assert _post_json(base + "/credentials/revoke", {"credentials": ["a"]}) == 202
+    _, path, headers, body, _ = seen[0]
+    assert path == "/credentials/revoke" and json.loads(body) == {"credentials": ["a"]}
+    assert "Authorization" not in headers
+    assert headers["Content-Type"] == "application/json" and headers["Accept"] == "application/vnd.github+json"
+
+
+def test_post_json_reports_an_error_status(server):
+    base, _ = server(_reply(422, b'{"message": "x"}'))
+    assert _post_json(base + "/t", {}) == 422
+
+
+def test_revoke_without_refresh_sends_only_the_token():
+    r = Revoking()
+    revoke(Login("ghu_x", None), alive=r.alive, post=r.post, sleep=r.sleep, say=r.said.append)
+    assert r.posts[0][1] == {"credentials": ["ghu_x"]}
+
+
+def test_revoke_still_alive_warns():
+    r = Revoking(alive=(True,))
+    assert r.run() is False
+    assert len(r.checks) == 6 and r.sleeps == [5] * 6
+    assert r.said == [NOT_CONFIRMED]
+    assert NOT_CONFIRMED.startswith("Warning: GitHub has not confirmed this run's token is revoked. Revoke it at ")
+
+
+def test_revoke_refused_warns_with_cause():
+    r = Revoking(status=422)
+    assert r.run() is False
+    assert r.said == ["GitHub refused the revocation (422).", NOT_CONFIRMED]
+    assert r.checks == []
+
+
+def test_revoke_interrupted_warns():
+    def interrupt(seconds):
+        raise KeyboardInterrupt
+
+    r = Revoking()
+    assert r.run(sleep=interrupt) is False
+    assert r.said[-1] == NOT_CONFIRMED
