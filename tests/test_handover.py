@@ -11,7 +11,7 @@ from conftest import TOKEN, commit, git, push
 from git_gate import Refused
 from git_gate.call import MAX_AUDIT
 from git_gate.config import DEFAULT_HANDOVER_PATHS, Rules
-from git_gate.handover import EXPIRES, Handover, Handovers, main, push_command
+from git_gate.handover import EXPIRES, Handover, Handovers, main, push_command, push_kept, screen
 from git_gate.mirror import Mirror, comparison
 
 REPO = "me/app"
@@ -850,3 +850,33 @@ def test_main_rolls_the_audit_log_over(env, m, rules, checkout):
     assert old.read_text() == "x" * MAX_AUDIT
     assert [line["outcome"] for line in audit_lines(env)] == ["pushed"]
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
+
+
+# --- the shared screen and push ------------------------------------------------------------
+
+
+def test_push_kept_pushes_and_closes(env, hs, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    said: list[str] = []
+    push_kept(hs, h.id, m, rules, lambda text="", end="\n", **kw: said.append(text))
+    assert remote_has(env, "feat") == h.sha
+    assert hs.open() == []
+    assert audit_lines(env)[-1]["outcome"] == "pushed"
+    assert said[-1] == f"Pushed. Handover {h.id} is closed."
+
+
+def test_push_kept_failure_raises_and_keeps_open(env, hs, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    seed = env.tmp / "seed"
+    git("push", "-q", env.url, f"{commit(seed, 'moved.txt')}:refs/heads/feat", cwd=seed)
+    with pytest.raises(Refused, match="is still open"):
+        push_kept(hs, h.id, m, rules, lambda *a, **kw: None)
+    assert hs.open() == [h]
+    assert audit_lines(env)[-1]["outcome"] == "failed"
+
+
+def test_screen_matches_the_gitgatepush_screen(env, hs, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    _, out = run(env, [str(h.id)], "n\n")
+    before = out.split("Push it?")[0]
+    assert before == screen(h, m, rules) + "\n"

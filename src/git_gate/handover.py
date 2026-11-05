@@ -254,29 +254,56 @@ def _list(handovers: Handovers, say) -> int:
     return 0
 
 
+class PushFailed(Refused):
+    """The kept push ran and git refused it; `code` is git's exit status."""
+
+    def __init__(self, message: str, code: int):
+        super().__init__(message)
+        self.code = code
+
+
 def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
     rules = RULES
     h = handovers.get(id)
-    _check(h, mirror.git, rules)
-    url = mirror.git.user_push_url(h.repo)
-
-    with mirror.lock(h.repo):
-        mirror_dir = mirror.path(h.repo)
-        _require_commit(mirror, h, mirror_dir, rules)
-        screen = _show(mirror, h, mirror_dir, url, rules)
-    say(screen, lines=True)
-    say()
-    say("Run: " + shlex.join(push_command(h, mirror_dir, url)))
+    say(screen(h, mirror, rules), lines=True)
     say("Push it? [y/N] ", end="")
     if stdin.readline().strip().lower() not in ("y", "yes"):
         say(f"Not pushed. Handover {h.id} stays open.")
         return 1
+    try:
+        push_kept(handovers, id, mirror, rules, say, shown=h)
+    except PushFailed as e:
+        say(str(e))
+        return e.code or 1
+    return 0
 
+
+def screen(h: Handover, mirror: Mirror, rules: Rules) -> str:
+    """Everything gitgatepush prints before its prompt: the confirmation screen and the command to run."""
+    _check(h, mirror.git, rules)
+    url = mirror.git.user_push_url(h.repo)
     with mirror.lock(h.repo):
-        again = handovers.get(id)  # another gitgatepush may have finished it while we waited
-        if again != h:
-            raise Refused(f"Handover {id} changed while waiting; run it again.")
-        _check(again, mirror.git, rules)
+        mirror_dir = mirror.path(h.repo)
+        _require_commit(mirror, h, mirror_dir, rules)
+        shown = _show(mirror, h, mirror_dir, url, rules)
+    return f"{shown}\n\nRun: {shlex.join(push_command(h, mirror_dir, url))}"
+
+
+def push_kept(
+    handovers: Handovers, id: int, mirror: Mirror, rules: Rules, say, *, shown: Handover | None = None
+) -> None:
+    """Push a kept handover once the user has said yes; `shown` is the record they were shown, if known.
+
+    Raises Refused when the record changed or went away, and PushFailed (a Refused) when git refused the push.
+    """
+    again = handovers.get(id)  # another gitgatepush may have finished it while we waited
+    if shown is not None and again != shown:
+        raise Refused(f"Handover {id} changed while waiting; run it again.")
+    h = again
+    _check(h, mirror.git, rules)
+    url = mirror.git.user_push_url(h.repo)
+    with mirror.lock(h.repo):
+        mirror_dir = mirror.path(h.repo)
         _require_commit(mirror, h, mirror_dir, rules)
         proc = subprocess.run(
             push_command(h, mirror_dir, url), stdin=subprocess.DEVNULL, capture_output=True, text=True,
@@ -287,17 +314,16 @@ def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
             say(output, lines=True)
         if proc.returncode != 0:
             _audit(mirror.state, h, "failed", say)
-            say(f"git push failed (exit {proc.returncode}). Handover {h.id} is still open.")
-            return proc.returncode or 1
+            failed = f"git push failed (exit {proc.returncode}). Handover {h.id} is still open."
+            raise PushFailed(failed, proc.returncode)
         handovers.close(h.id)
         _audit(mirror.state, h, "pushed", say)
         try:
             mirror.drop(h.repo, h.ref, rules)
         except Refused as e:
             say(f"Pushed, but the gate's mirror could not drop {h.ref}: {e}")
-            return 0
+            return
     say(f"Pushed. Handover {h.id} is closed.")
-    return 0
 
 
 def _audit(state: Path, h: Handover, outcome: str, say) -> None:
