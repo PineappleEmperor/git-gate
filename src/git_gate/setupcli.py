@@ -311,26 +311,33 @@ def _apply_ruleset(gh: GitHub, s: SetupRequest) -> None:
 
 
 def _ruleset(gh: GitHub, s: SetupRequest, live: dict | None, out: Survey, *, pending: bool = False) -> Item:
-    """The ruleset; `pending` when a first push of main is applied before it in this run."""
+    """The ruleset; `pending` when a first push of main is applied before it in this run. Then the
+    ruleset is applied after the push (by `_apply_ruleset`), but only when main is or may be the
+    default branch: a push of main does not give another default branch its first commit."""
     name = s.ruleset.get("name")
     default, exists = _default(gh, s, live)
-    if not exists and pending:
-        line = f"absent → {_quote(str(name))} after main is pushed; rules: {_rules(s.ruleset)}"
-        return Item("ruleset", line, lambda: _apply_ruleset(gh, s))
+    after = ""
     if not exists:
-        branch = _clean(default) if default else "the default branch"
-        return Item("ruleset", f"deferred: {branch} does not exist yet; push it (gitgatepush), "
-                               f"then re-run gitgatesetup {s.id}")  # fmt: skip
-    out.default = default
+        if not pending or (default is not None and default != FIRST):
+            branch = _clean(default) if default else "the default branch"
+            return Item("ruleset", f"deferred: {branch} does not exist yet; push it (gitgatepush), "
+                                   f"then re-run gitgatesetup {s.id}")  # fmt: skip
+        after = f" after {FIRST} is pushed"
+        if live is None:  # a repository created in this run has no rulesets
+            line = f"absent → {_quote(str(name))}{after}; rules: {_rules(s.ruleset)}"
+            return Item("ruleset", line, lambda: _apply_ruleset(gh, s))
+    else:
+        out.default = default
     id = _same_name(gh, s)
     if id is None:
-        line = f"absent → {_quote(str(name))}; rules: {_rules(s.ruleset)}"
-        return Item("ruleset", line, lambda: gh.create_ruleset(s.repo, s.ruleset))
+        line = f"absent → {_quote(str(name))}{after}; rules: {_rules(s.ruleset)}"
+        create = (lambda: _apply_ruleset(gh, s)) if after else (lambda: gh.create_ruleset(s.repo, s.ruleset))
+        return Item("ruleset", line, create)
     have = gh.ruleset(s.repo, id)
     if _subset(s.ruleset, have):
         out.ruleset_id = id
         return Item("ruleset", SET)
-    line = f"{_quote(str(name))} (id {id}) differs → replace it. rules: {_rules(have)} → {_rules(s.ruleset)}"
+    line = f"{_quote(str(name))} (id {id}) differs → replace it{after}. rules: {_rules(have)} → {_rules(s.ruleset)}"
     if _scope(have) != _scope(s.ruleset):
         line += f"\n    branches: {_scope(have)} → {_scope(s.ruleset)}"
     if have.get("enforcement") != s.ruleset.get("enforcement"):
@@ -341,7 +348,8 @@ def _ruleset(gh: GitHub, s: SetupRequest, live: dict | None, out: Survey, *, pen
         line += f"\n    bypass actors: {bypass} → {_bypass(s.ruleset) or 'none'}"
     if lost := _removed(have, s.ruleset):
         line += f"\n    removes: {lost}"
-    return Item("ruleset", line, lambda: gh.update_ruleset(s.repo, id, s.ruleset))
+    replace = (lambda: _apply_ruleset(gh, s)) if after else (lambda: gh.update_ruleset(s.repo, id, s.ruleset))
+    return Item("ruleset", line, replace)
 
 
 def _others(gh: GitHub, s: SetupRequest, plan: Survey, say) -> None:

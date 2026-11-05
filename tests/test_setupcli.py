@@ -583,6 +583,51 @@ def test_gone_handover_falls_back_to_deferred(setups):
     assert kept.pushes == [] and kept.screens == []
 
 
+def test_existing_empty_repo_with_first_push_closes_in_one_run(setups):
+    create(setups, handover=7)
+    gh = all_set(rulesets=[], branch=False)
+    kept = FakeKept(gh)
+    code, out = run(["1"], gh, kept=kept)
+    assert code == 0, out
+    shown = out.split("Apply? [y/N]")[0]
+    assert f"  main: absent → push {KEPT_SHA[:12]} (handover 7; shown below)" in shown
+    assert '  ruleset: absent → "Protect main" after main is pushed; rules: deletion, non_fast_forward, ' in shown
+    assert [c for c in gh.calls if c[0] in WRITES | {"push"}] == [("push", 7), ("create_ruleset", REPO, RULESET)]
+    assert out.endswith("Done. Setup 1 is closed.\n")
+
+
+def test_existing_empty_repo_with_first_push_shows_the_ruleset_it_replaces(setups):
+    create(setups, handover=7)
+    strict = copy.deepcopy(RULESET)
+    strict["rules"].append({"type": "pull_request", "parameters": {}})
+    gh = all_set(rulesets=[live_ruleset(strict, 9)], branch=False)
+    kept = FakeKept(gh)
+    code, out = run(["1"], gh, kept=kept)
+    assert code == 0, out
+    shown = out.split("Apply? [y/N]")[0]
+    assert '  ruleset: "Protect main" (id 9) differs → replace it after main is pushed. rules: ' in shown
+    assert "    removes: pull_request" in shown
+    assert "absent →" not in shown.split("  ruleset:")[1]
+    assert [c for c in gh.calls if c[0] in WRITES | {"push"}] == [("push", 7), ("update_ruleset", REPO, 9, RULESET)]
+    assert out.endswith("Done. Setup 1 is closed.\n")
+
+
+def test_known_other_default_branch_does_not_promise_the_ruleset(setups):
+    create(setups, handover=7)
+    gh = all_set(rulesets=[], branch=False)
+    gh.default_branch = "master"
+    kept = FakeKept(gh)
+    code, out = run(["1"], gh, kept=kept)
+    assert code == 1
+    deferred = "  ruleset: deferred: master does not exist yet; push it (gitgatepush), then re-run gitgatesetup 1"
+    assert deferred in out.split("Apply? [y/N]")[0]
+    assert "after main is pushed" not in out
+    assert kept.pushes == [7]
+    assert not [c for c in gh.writes() if c[0] in ("create_ruleset", "update_ruleset")]
+    assert deferred in out.split("Not done yet:")[1]
+    setups.get(1)
+
+
 def test_secrets_are_reminded_at_the_end(setups):
     reminder = [
         "Add these Actions secrets yourself on GitHub (gitgatesetup cannot check them):",
