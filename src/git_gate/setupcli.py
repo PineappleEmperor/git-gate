@@ -24,12 +24,12 @@ from typing import Protocol
 from git_gate import Refused
 from git_gate.appreg import load_app, register
 from git_gate.call import audit
-from git_gate.config import state_dir, valid_repo
+from git_gate.config import state_dir
 from git_gate.devicelogin import NOT_CONFIRMED, Login, device_login
 from git_gate.devicelogin import revoke as revoke_tokens
 from git_gate.github import GitHub, GitHubError
 from git_gate.gitops import Git
-from git_gate.handover import ID_RE, RULES, Gone, Handover, Handovers, _clean, push_kept, screen
+from git_gate.handover import EXPIRES, ID_RE, RULES, Gone, Handover, Handovers, _clean, push_kept, screen
 from git_gate.mirror import Mirror
 from git_gate.setup import SetupRequest, Setups
 
@@ -38,6 +38,8 @@ SET = "already set"
 NOT_INSTALLED = (403, 404)  # a write the app may not make: not installed on the repo, or lacking a permission
 FIRST = "main"  # the branch a kept first push creates
 HANGUPS = (signal.SIGHUP, signal.SIGTERM)  # end a run as Ctrl-C does
+SWAPPING = {*HANGUPS, signal.SIGINT}  # held back while the hangup handlers go in or come out
+LAPSE = 300  # seconds before a setup's expiry from which its gone handover counts as expired, not pushed
 
 
 @dataclass
@@ -71,7 +73,8 @@ class KeptPushes(Protocol):
         its record is gone; Refused, with the reason, when it is unreadable or is not that push."""
 
     def pushed(self, id: int) -> bool:
-        """Whether handover `id` was pushed: its record is gone."""
+        """Whether handover `id` was pushed: its record is gone. A record purged on expiry is gone too;
+        the survey tells that apart by the setup's own age, since a setup expires with its handover."""
 
     def screen(self, id: int) -> str:
         """What gitgatepush shows for handover `id` before its prompt."""
@@ -124,33 +127,49 @@ def main(
     argv: list[str], *, stdin=sys.stdin, stdout=sys.stdout, login=device_login, github=GitHub,
     kept: KeptPushes | None = None, revoke=revoke_tokens,
 ) -> int:  # fmt: skip
-    secrets: list[str] = []
+    signed_in: list[Login] = []  # every sign-in of this run, handed over the moment it exists
 
     def say(text: str = "", end: str = "\n", *, lines: bool = False) -> None:
-        for secret in secrets:
-            text = text.replace(secret, "[token]")
-        stdout.write(_clean(text, lines=lines) + end)
-        stdout.flush()
-
-    with _hangups_interrupt():
+        for done in signed_in:
+            for secret in filter(None, (done.token, done.refresh)):
+                text = text.replace(secret, "[token]")
         try:
-            state = state_dir()
-            if not argv:
-                return _list(Setups(state), say)
-            if argv == ["--register"]:
-                register(say=say)
-                return 0
-            if len(argv) != 1 or not ID_RE.fullmatch(argv[0]):
-                say(USAGE)
-                return 2
-            return _run(state, int(argv[0]), stdin, say, login, github, kept or _Kept(state), secrets, revoke)
-        except Refused as e:
-            say(str(e), lines=True)
-            return 1
-        except KeyboardInterrupt:
+            stdout.write(_clean(text, lines=lines) + end)
+            stdout.flush()
+        except OSError, ValueError:  # a hung-up terminal or a closed stdout: the run still revokes and audits
+            pass
+
+    code = None
+    try:
+        with _hangups_interrupt():
+            code = _main(argv, stdin, say, login, github, kept, revoke, signed_in)
+    except KeyboardInterrupt:  # while the hangup handlers went in or came out, outside the run's own handling
+        if code is None:
             say()
             say("Interrupted.")
             return 1
+    return code
+
+
+def _main(argv: list[str], stdin, say, login, github, kept: KeptPushes | None, revoke, signed_in: list[Login]) -> int:
+    try:
+        state = state_dir()
+        if not argv:
+            return _list(Setups(state), say)
+        if argv == ["--register"]:
+            register(say=say)
+            return 0
+        if len(argv) != 1 or not ID_RE.fullmatch(argv[0]):
+            say(USAGE)
+            return 2
+        return _run(state, int(argv[0]), stdin, say, login, github, kept or _Kept(state), signed_in, revoke)
+    except Refused as e:
+        say(str(e), lines=True)
+        return 1
+    except KeyboardInterrupt:
+        say()
+        say("Interrupted.")
+        return 1
 
 
 def _interrupt(signum, frame) -> None:
@@ -160,16 +179,28 @@ def _interrupt(signum, frame) -> None:
 @contextlib.contextmanager
 def _hangups_interrupt():
     """While a run lasts, SIGHUP (a closed terminal) and SIGTERM raise KeyboardInterrupt, so the run's
-    finally blocks still revoke its token and audit it. The previous handlers come back on the way out."""
+    finally blocks still revoke its token and audit it. A signal already ignored (nohup) stays ignored.
+    The previous handlers come back on the way out. Hangups and Ctrl-C are held back while handlers
+    are swapped: one that comes while they go in interrupts once all are in, and one that comes while
+    they come out reaches the handler put back, so no handler is left behind."""
     previous = {}
-    with contextlib.suppress(ValueError):  # not the main thread: signals stay as they are
-        for signum in HANGUPS:
-            previous[signum] = signal.signal(signum, _interrupt)
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, SWAPPING)
     try:
+        try:
+            with contextlib.suppress(ValueError):  # not the main thread: signals stay as they are
+                for signum in HANGUPS:
+                    if signal.getsignal(signum) is not signal.SIG_IGN:
+                        previous[signum] = signal.signal(signum, _interrupt)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)
         yield
     finally:
-        for signum, handler in previous.items():
-            signal.signal(signum, signal.SIG_DFL if handler is None else handler)
+        signal.pthread_sigmask(signal.SIG_BLOCK, SWAPPING)
+        try:
+            for signum, handler in previous.items():
+                signal.signal(signum, signal.SIG_DFL if handler is None else handler)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)
 
 
 def _list(setups: Setups, say) -> int:
@@ -181,28 +212,30 @@ def _list(setups: Setups, say) -> int:
     return 0
 
 
-def _run(state: Path, id: int, stdin, say, login, github, kept: KeptPushes, secrets: list[str], revoke) -> int:
-    """One run of `gitgatesetup <id>`, audited whatever its end. A completed sign-in is revoked at the
-    end, after the run's last GitHub call."""
+def _run(state: Path, id: int, stdin, say, login, github, kept: KeptPushes, signed_in: list[Login], revoke) -> int:
+    """One run of `gitgatesetup <id>`, audited whatever its end, holding the setup's lock throughout.
+    Every sign-in is revoked at the end, after the run's last GitHub call."""
     setups = Setups(state)
-    repo, outcome, signed_in = None, "refused", []
-    try:
-        s = setups.get(id)
-        repo = s.repo
-        outcome = _setup(setups, s, stdin, say, login, github, kept, secrets, signed_in)
-        return 0 if outcome == "closed" else 1
-    finally:
-        revoked = None
+    repo, outcome = None, "refused"
+    with contextlib.ExitStack() as held:
         try:
-            if signed_in:
-                revoked = False  # until revoke says otherwise: never null after a sign-in
-                revoked = revoke(signed_in[0], alive=functools.partial(_alive, github), say=say)
-        except BaseException as e:  # revoke never ends the run itself, Ctrl-C included: the run's own outcome stays
-            revoked = False
-            say(f"Could not confirm the revocation ({type(e).__name__}).")
-            say(NOT_CONFIRMED)
+            repo = setups.get(id).repo  # an unknown id is refused before a lock file is made for it
+            held.enter_context(setups.running(id))
+            s = setups.get(id)  # read again under the lock: a run that just ended may have closed it
+            outcome = _setup(setups, s, stdin, say, login, github, kept, signed_in)
+            return 0 if outcome == "closed" else 1
         finally:
-            _audit(state, id, repo, outcome, revoked, say)
+            revoked = None
+            try:
+                if signed_in:
+                    revoked = False  # until revoke says otherwise: never null after a sign-in
+                    revoked = revoke(signed_in[0], alive=functools.partial(_alive, github), say=say)
+            except BaseException as e:  # revoke never ends the run itself, Ctrl-C included: its outcome stays
+                revoked = False
+                say(f"Could not confirm the revocation ({type(e).__name__}).")
+                say(NOT_CONFIRMED)
+            finally:
+                _audit(state, id, repo, outcome, revoked, say)
 
 
 def _alive(github, token: str) -> bool:
@@ -216,14 +249,12 @@ def _alive(github, token: str) -> bool:
     return True
 
 
-def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, kept: KeptPushes, secrets: list[str],
+def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, kept: KeptPushes,
            signed_in: list[Login]) -> str:  # fmt: skip
-    if not valid_repo(s.repo):
-        raise Refused(f"Setup {s.id} names a bad repository.")
     app = load_app()
-    done = login(app.client_id, say=say)
-    signed_in.append(done)
-    secrets.extend([done.token] + ([done.refresh] if done.refresh else []))
+    done = login(app.client_id, say=say, got=signed_in.append)  # handed over before login returns
+    if done not in signed_in:
+        signed_in.append(done)
     gh = github(done.token)
     me = str(gh.viewer())
     if s.repo.split("/")[0].lower() != me.lower():
@@ -235,11 +266,12 @@ def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, kept: Kep
     try:
         return _apply(setups, s, gh, kept, plan, stdin, say, app.slug)
     finally:
-        _secrets(s, say)
+        _remind(s, say)
 
 
 def _apply(setups: Setups, s: SetupRequest, gh: GitHub, kept: KeptPushes, plan: Survey, stdin, say, slug: str) -> str:
-    """Show the plan, ask, apply, survey again, and close the request when nothing is left."""
+    """Show the plan, ask, apply, survey again, and close the request when nothing is left. Once the
+    first change has started, an interrupt ends the run "interrupted", with the setup open."""
     say(f"Setup {s.id}: {s.repo}")
     for item in plan.items:
         say(f"  {item.name}: {item.line}", lines=True)  # every live value in a line is cleaned already
@@ -253,31 +285,35 @@ def _apply(setups: Setups, s: SetupRequest, gh: GitHub, kept: KeptPushes, plan: 
             say(f"Not applied. Setup {s.id} stays open.")
             return "declined"
         accepted: set[str] = set()
-        started = False  # whether GitHub may hold a change from this run
-        for item in todo:
-            try:
-                started = started or item.name == FIRST  # a push interrupted part-way may still have gone out
-                item.apply()
-                accepted.add(item.name)
-                started = True
-            except KeyboardInterrupt:
-                if not started:
-                    raise
-                say()
-                say("Interrupted.")
-                say(f"Re-run: gitgatesetup {s.id}")
-                return "open"
-            except Refused as e:
-                if isinstance(e, GitHubError) and (e.status in NOT_INSTALLED or _name_taken(item, e)):
-                    say(f"GitHub refused {item.name} ({e.status}). The app may not be installed on this repository "
-                        f"or may lack a permission; install it on all repositories: "
-                        f"https://github.com/apps/{slug}/installations/new")  # fmt: skip
-                else:
-                    say(f"Applying {item.name} failed: {e}")
-                say(f"Setup {s.id} stays open. Re-run: gitgatesetup {s.id}")
-                return "open"
-        plan = _survey(gh, s, kept, say, frozenset(accepted))
+        closed: list[int] = []  # the setup's id once _verify has closed it
+        try:  # GitHub may hold a change from here on, even from an item interrupted part-way
+            for item in todo:
+                try:
+                    item.apply()
+                    accepted.add(item.name)
+                except Refused as e:
+                    if isinstance(e, GitHubError) and (e.status in NOT_INSTALLED or _name_taken(item, e)):
+                        say(f"GitHub refused {item.name} ({e.status}). The app may not be installed on this "
+                            f"repository or may lack a permission; install it on all repositories: "
+                            f"https://github.com/apps/{slug}/installations/new")  # fmt: skip
+                    else:
+                        say(f"Applying {item.name} failed: {e}")
+                    say(f"Setup {s.id} stays open. Re-run: gitgatesetup {s.id}")
+                    return "open"
+            plan = _survey(gh, s, kept, say, frozenset(accepted))
+            return _verify(setups, s, gh, plan, say, closed)
+        except KeyboardInterrupt:
+            say()
+            say("Interrupted.")
+            if closed:  # everything verified and the setup closed just before the interrupt
+                return "closed"
+            say(f"Re-run: gitgatesetup {s.id}")
+            return "interrupted"
+    return _verify(setups, s, gh, plan, say, [])
 
+
+def _verify(setups: Setups, s: SetupRequest, gh: GitHub, plan: Survey, say, closed: list[int]) -> str:
+    """Name what is left, or close the request when nothing is; `closed` gets its id once it is."""
     _others(gh, s, plan, say)
     left = [item for item in plan.items if item.line != SET]
     if left:
@@ -287,6 +323,7 @@ def _apply(setups: Setups, s: SetupRequest, gh: GitHub, kept: KeptPushes, plan: 
         say(f"Re-run: gitgatesetup {s.id}")
         return "open"
     setups.close(s.id)
+    closed.append(s.id)
     say(f"Done. Setup {s.id} is closed.")
     return "closed"
 
@@ -336,8 +373,10 @@ def _survey(gh: GitHub, s: SetupRequest, kept: KeptPushes, say, accepted: frozen
     first = _first_push(gh, s, live, kept, say, out)
     if first:
         out.items.append(first)
-    pushed = first is None and s.handover is not None and kept.pushed(s.handover)
-    out.items.append(_ruleset(gh, s, live, out, pending=bool(first and first.apply), pushed=pushed))
+    # A setup expires with its handover, so a gone handover of a setup about to expire may have expired.
+    lapsed = first is None and s.handover is not None and time.time() - s.created > EXPIRES - LAPSE
+    pushed = first is None and s.handover is not None and not lapsed and kept.pushed(s.handover)
+    out.items.append(_ruleset(gh, s, live, out, pending=bool(first and first.apply), pushed=pushed, lapsed=lapsed))
     return out
 
 
@@ -393,18 +432,22 @@ def _apply_ruleset(gh: GitHub, s: SetupRequest) -> None:
 
 
 def _ruleset(
-    gh: GitHub, s: SetupRequest, live: dict | None, out: Survey, *, pending: bool = False, pushed: bool = False
-) -> Item:
+    gh: GitHub, s: SetupRequest, live: dict | None, out: Survey, *, pending: bool = False, pushed: bool = False,
+    lapsed: bool = False,
+) -> Item:  # fmt: skip
     """The ruleset; `pending` when a first push of main is applied before it in this run. Then the
     ruleset is applied after the push (by `_apply_ruleset`), but only when main is or may be the
     default branch: a push of main does not give another default branch its first commit. `pushed`
     when the request's first push already went out (its handover is closed), though GitHub may not
-    show main yet."""
+    show main yet; `lapsed` when its handover is gone and has, or may have, expired unpushed."""
     name = s.ruleset.get("name")
     default, exists = _default(gh, s, live, out)
     out.default = default
     after = ""
     if not exists:
+        if lapsed and default in (None, FIRST):
+            return Item("ruleset", f"deferred: {FIRST} does not exist yet, and handover {s.handover} with its first "
+                                   f"push has expired; ask the agent for a new repo_setup")  # fmt: skip
         if pushed and default == FIRST:
             return Item("ruleset", f"deferred: {FIRST} was pushed; GitHub does not show it yet. "
                                    f"Re-run in a moment: gitgatesetup {s.id}")  # fmt: skip
@@ -422,6 +465,11 @@ def _ruleset(
         create = (lambda: _apply_ruleset(gh, s)) if after else (lambda: gh.create_ruleset(s.repo, s.ruleset))
         return Item("ruleset", line, create)
     have = gh.ruleset(s.repo, id)
+    replace = (lambda: _apply_ruleset(gh, s)) if after else (lambda: gh.update_ruleset(s.repo, id, s.ruleset))
+    if not _readable(have):
+        line = f"{_quote(str(name))} (id {id}) differs → replace it{after}. rules: unreadable → {_rules(s.ruleset)}"
+        line += "\n    GitHub's copy has an unexpected shape; it is replaced whole."
+        return Item("ruleset", line, replace)
     if _subset(s.ruleset, have):
         out.ruleset_id = id
         return Item("ruleset", SET)
@@ -436,8 +484,35 @@ def _ruleset(
         line += f"\n    bypass actors: {bypass} → {_bypass(s.ruleset) or 'none'}"
     if lost := _removed(have, s.ruleset):
         line += f"\n    removes: {lost}"
-    replace = (lambda: _apply_ruleset(gh, s)) if after else (lambda: gh.update_ruleset(s.repo, id, s.ruleset))
     return Item("ruleset", line, replace)
+
+
+def _readable(ruleset: object) -> bool:
+    """Whether a ruleset GitHub answered has the shape gitgatesetup compares and shows: rules a list of
+    objects with a text type, parameters an object, required checks a list of objects with a text
+    context, conditions.ref_name an object whose include and exclude are lists of text, and
+    bypass_actors a list of objects. Absent parameters, patterns and bypass_actors are fine."""
+    if not isinstance(ruleset, dict):
+        return False
+    rules = ruleset.get("rules")
+    if not isinstance(rules, list) or not all(isinstance(r, dict) and isinstance(r.get("type"), str) for r in rules):
+        return False
+    for rule in rules:
+        params = rule.get("parameters", {})
+        checks = params.get("required_status_checks", []) if isinstance(params, dict) else None
+        if not isinstance(checks, list) or not all(isinstance(c, dict) and isinstance(c.get("context"), str)
+                                                   for c in checks):  # fmt: skip
+            return False
+    conditions = ruleset.get("conditions")
+    ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
+    if not isinstance(ref_name, dict):
+        return False
+    for key in ("include", "exclude"):
+        refs = ref_name.get(key, [])
+        if not isinstance(refs, list) or not all(isinstance(r, str) for r in refs):
+            return False
+    actors = ruleset.get("bypass_actors", [])
+    return isinstance(actors, list) and all(isinstance(a, dict) for a in actors)
 
 
 def _others(gh: GitHub, s: SetupRequest, plan: Survey, say) -> None:
@@ -517,6 +592,15 @@ def _removed(have: object, want: object) -> str:
     gone += [f'branches "{_clean(r)}"' for r in _refs(have, "include") if r not in included]
     gone += [f'branches "{_clean(r)}" (newly excluded)' for r in _refs(want, "exclude") if r not in excluded]
     return ", ".join(gone)
+
+
+def _remind(s: SetupRequest, say) -> None:
+    """The secrets reminder. An interrupt cuts it short but leaves the run's outcome as it was."""
+    try:
+        _secrets(s, say)
+    except KeyboardInterrupt:
+        say()
+        say("Interrupted.")
 
 
 def _secrets(s: SetupRequest, say) -> None:
