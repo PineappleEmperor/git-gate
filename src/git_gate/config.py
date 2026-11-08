@@ -141,13 +141,15 @@ class Rules:
     options: dict[str, RepoOptions] = field(default_factory=dict)  # v2 [repos], lower-case "owner/name"
     session: Session | None = None  # the calling session, once `scoped`
 
-    def repo(self, repo: str) -> RepoRules:
+    def repo(self, repo: str, need: str = "read") -> RepoRules:
+        """The rules for `repo`; refused when the session has no access to it. `need` is the access
+        the calling tool needs, which the refusal's grant command names."""
         if not valid_repo(repo):
             raise Refused(f"'{repo}' is not an owner/name repository.")
         rules = self.repos.get(repo.lower())
         if rules is None:
             if self.version == 2:
-                raise Refused(self._denied(repo, "has no access to", "read"))
+                raise Refused(self._denied(repo, "has no access to", need))
             raise Refused(f"{repo} is not on the git-gate repo allowlist (rules.toml [repos]).")
         return rules
 
@@ -155,7 +157,7 @@ class Rules:
         return self.repo(repo).access
 
     def require_write(self, repo: str) -> None:
-        if self.access(repo) != "write":
+        if self.repo(repo, "write").access != "write":
             if self.version == 2:
                 raise Refused(self._denied(repo, "can only read", "write"))
             raise Refused(f"{repo} is read-only in rules.toml; this call needs write access.")
