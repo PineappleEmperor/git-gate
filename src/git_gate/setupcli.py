@@ -108,7 +108,7 @@ class _Kept:
         return screen(self._record(id), self.mirror, RULES)
 
     def push(self, id: int, say) -> None:
-        push_kept(self.handovers, id, self.mirror, RULES, say, shown=self._record(id))
+        push_kept(self.handovers, id, self.mirror, RULES, say, shown=self._record(id), tool="gitgatesetup")
 
 
 def main(

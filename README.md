@@ -311,7 +311,8 @@ call's line:
   for the state, and the seconds it slept between those polls.
 
 A `gitgatepush` line has `time`, `tool` (`gitgatepush`), `id`, `repo`, `branch`, `sha` and `outcome`
-(`pushed` or `failed`). A `gitgatesetup` line has `time`, `tool` (`gitgatesetup`), `id`, `repo`,
+(`pushed` or `failed`). When `gitgatesetup` pushes a kept first `main`, that push is logged the same way with `tool`
+`gitgatesetup`, beside the run's own line. A `gitgatesetup` line has `time`, `tool` (`gitgatesetup`), `id`, `repo`,
 `outcome` (`closed`, `open`, `declined` or `refused`) and `revoked`: `true` once GitHub confirmed the
 token dead, `false` when it did not, `null` when the run never signed in. Lines from older releases
 lack the newer fields.

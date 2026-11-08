@@ -1,8 +1,11 @@
+import contextlib
 import io
 import json
 import re
 import shlex
 import stat
+import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -883,9 +886,30 @@ def test_screen_matches_the_gitgatepush_screen(env, hs, m, rules, checkout):
     assert before == screen(h, m, rules) + "\n"
 
 
-def test_push_kept_twice_pushes_once(env, hs, m, rules, checkout):
+def test_push_kept_twice_pushes_once(env, hs, m, rules, checkout, monkeypatch):
     h = stage(env, m, rules, checkout)
-    outcomes = []
+    # Force the interleaving: the caller that holds the mirror lock does not push until the other one
+    # has asked for the lock, so the second always waits and then finds the record gone.
+    asked = []
+    second_asked = threading.Event()
+    real_lock = Mirror.lock
+
+    @contextlib.contextmanager
+    def counted_lock(self, repo):
+        asked.append(repo)
+        if len(asked) == 2:
+            second_asked.set()
+        with real_lock(self, repo):
+            yield
+
+    real_run = subprocess.run
+
+    def held_push(*args, **kwargs):
+        assert second_asked.wait(10), "the second caller never asked for the lock"
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(Mirror, "lock", counted_lock)
+    monkeypatch.setattr("git_gate.handover.subprocess.run", held_push)
 
     def one(_):
         try:
@@ -899,3 +923,10 @@ def test_push_kept_twice_pushes_once(env, hs, m, rules, checkout):
     assert sorted(outcomes) == [f"No open handover {h.id}.", "pushed"]
     assert [line["outcome"] for line in audit_lines(env) if line["tool"] == "gitgatepush"] == ["pushed"]
     assert remote_has(env, "feat") == h.sha
+
+
+def test_push_kept_audits_under_the_tool_the_caller_names(env, hs, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    push_kept(Handovers(env.state), h.id, m, rules, lambda *a, **kw: None, tool="gitgatesetup")
+    last = audit_lines(env)[-1]
+    assert (last["tool"], last["outcome"], last["id"], last["sha"]) == ("gitgatesetup", "pushed", h.id, h.sha)

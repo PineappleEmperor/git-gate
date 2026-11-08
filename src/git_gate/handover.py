@@ -290,9 +290,11 @@ def screen(h: Handover, mirror: Mirror, rules: Rules) -> str:
 
 
 def push_kept(
-    handovers: Handovers, id: int, mirror: Mirror, rules: Rules, say, *, shown: Handover | None = None
-) -> None:
+    handovers: Handovers, id: int, mirror: Mirror, rules: Rules, say, *, shown: Handover | None = None,
+    tool: str = "gitgatepush",
+) -> None:  # fmt: skip
     """Push a kept handover once the user has said yes; `shown` is the record they were shown, if known.
+    The audit line names `tool`, the command the user ran.
 
     Raises Refused when the record changed or went away, and PushFailed (a Refused) when git refused the push.
     """
@@ -315,23 +317,23 @@ def push_kept(
         if output:
             say(output, lines=True)
         if proc.returncode != 0:
-            _audit(mirror.state, h, "failed", say)
+            _audit(mirror.state, h, "failed", say, tool)
             failed = f"git push failed (exit {proc.returncode}). Handover {h.id} is still open."
             raise PushFailed(failed, proc.returncode)
         handovers.close(h.id)
-        _audit(mirror.state, h, "pushed", say)
+        _audit(mirror.state, h, "pushed", say, tool)
         try:
             mirror.drop(h.repo, h.ref, rules)
         except Refused as e:
             say(f"Pushed, but the gate's mirror could not drop {h.ref}: {e}")
-            return
-    say(f"Pushed. Handover {h.id} is closed.")
+        else:
+            say(f"Pushed. Handover {h.id} is closed.")
 
 
-def _audit(state: Path, h: Handover, outcome: str, say) -> None:
+def _audit(state: Path, h: Handover, outcome: str, say, tool: str) -> None:
     """One audit.log line per handover push, beside the gate's own lines for the tool calls."""
     line = json.dumps({
-        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": "gitgatepush", "id": h.id, "repo": h.repo,
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "id": h.id, "repo": h.repo,
         "branch": h.branch, "sha": h.sha, "outcome": outcome,
     })  # fmt: skip
     try:
