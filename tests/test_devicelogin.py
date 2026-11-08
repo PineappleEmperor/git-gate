@@ -195,6 +195,28 @@ def test_post_json_list_is_refused(server):
         _post(base + "/t", {})
 
 
+def test_the_login_is_handed_over_before_it_returns():
+    h = Harness([{"access_token": "ghu_x", "refresh_token": "ghr_x"}])
+    got = []
+    assert device_login("Iv1.abc", say=h.said.append, open_url=h.opened.append, post=h.post, sleep=h.sleep,
+                        clock=lambda: h.now, got=got.append) == Login("ghu_x", "ghr_x")  # fmt: skip
+    assert got == [Login("ghu_x", "ghr_x")]
+
+
+def test_an_interrupt_right_after_the_token_still_hands_it_over():
+    h = Harness([{"access_token": "ghu_x", "refresh_token": "ghr_x"}])
+    got = []
+
+    def keep_then_interrupt(login):
+        got.append(login)
+        raise KeyboardInterrupt
+
+    with pytest.raises(Refused, match="Sign-in cancelled."):
+        device_login("Iv1.abc", say=h.said.append, open_url=h.opened.append, post=h.post, sleep=h.sleep,
+                     clock=lambda: h.now, got=keep_then_interrupt)  # fmt: skip
+    assert got == [Login("ghu_x", "ghr_x")]
+
+
 def test_login_keeps_the_refresh_token():
     h = Harness([{"access_token": "ghu_x", "refresh_token": "ghr_x"}])
     login = h.run()
@@ -225,10 +247,13 @@ class Revoking:
         )
 
 
-def test_revoke_posts_both_without_auth(server):
+def test_revoke_posts_each_token_on_its_own_without_auth(server):
     r = Revoking()
     assert r.run() is True
-    assert r.posts == [("https://api.github.com/credentials/revoke", {"credentials": ["ghu_x", "ghr_x"]})]
+    assert r.posts == [
+        ("https://api.github.com/credentials/revoke", {"credentials": ["ghu_x"]}),
+        ("https://api.github.com/credentials/revoke", {"credentials": ["ghr_x"]}),
+    ]
     assert r.checks == ["ghu_x"] and r.sleeps == [5]
     assert r.said == [REVOKED]
     base, seen = server(_reply(202, b""))
@@ -261,20 +286,37 @@ def test_revoke_still_alive_warns():
 def test_revoke_refused_warns_with_cause():
     r = Revoking(status=422)
     assert r.run() is False
-    assert [body for _, body in r.posts] == [{"credentials": ["ghu_x", "ghr_x"]}, {"credentials": ["ghu_x"]}]
+    assert [body for _, body in r.posts] == [{"credentials": ["ghu_x"]}, {"credentials": ["ghr_x"]}]
+    assert r.said == [
+        "GitHub refused the revocation (422).",
+        "GitHub refused the refresh token's revocation (422).",
+        NOT_CONFIRMED,
+    ]
+    assert r.checks == []
+
+
+def test_a_refused_refresh_revocation_is_not_confirmed():
+    r = Revoking(status=[202, 404])
+    assert r.run() is False
+    assert [body for _, body in r.posts] == [{"credentials": ["ghu_x"]}, {"credentials": ["ghr_x"]}]
+    assert r.said == ["GitHub refused the refresh token's revocation (404).", NOT_CONFIRMED]
+    assert r.checks == []
+
+
+def test_a_refused_access_revocation_still_revokes_the_refresh_token_once():
+    r = Revoking(status=[422, 202])
+    assert r.run() is False
+    assert [body for _, body in r.posts] == [{"credentials": ["ghu_x"]}, {"credentials": ["ghr_x"]}]
     assert r.said == ["GitHub refused the revocation (422).", NOT_CONFIRMED]
     assert r.checks == []
 
 
-def test_a_refused_revoke_is_retried_with_only_the_access_token():
-    r = Revoking(status=[422, 202])
-    assert r.run() is True
-    assert r.posts == [
-        ("https://api.github.com/credentials/revoke", {"credentials": ["ghu_x", "ghr_x"]}),
-        ("https://api.github.com/credentials/revoke", {"credentials": ["ghu_x"]}),
-    ]
-    assert r.checks == ["ghu_x"] and r.sleeps == [5]
-    assert r.said == [REVOKED]
+def test_the_refresh_token_is_only_ever_revoked():
+    r = Revoking(alive=(True,))
+    r.run()
+    assert {url for url, _ in r.posts} == {"https://api.github.com/credentials/revoke"}
+    assert [body for _, body in r.posts if "ghr_x" in json.dumps(body)] == [{"credentials": ["ghr_x"]}]
+    assert "ghr_x" not in r.checks
 
 
 def test_a_refused_revoke_without_refresh_is_not_sent_again():
