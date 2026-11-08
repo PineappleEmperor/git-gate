@@ -272,7 +272,10 @@ def _run(
                         say()
                         say("Interrupted.")
                 finally:
-                    signal.pthread_sigmask(signal.SIG_SETMASK, mask)  # one held meanwhile lands now; main drops it
+                    # One held meanwhile lands here, after the mask is back; dropping it keeps the run's own
+                    # return or error (a Refused on its way out still prints its line).
+                    with contextlib.suppress(KeyboardInterrupt):
+                        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
 
 def _alive(github, token: str) -> bool:

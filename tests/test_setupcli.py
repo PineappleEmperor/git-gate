@@ -1777,3 +1777,23 @@ def test_a_hangup_during_the_audit_cannot_cut_the_line_off(setups, dirs, monkeyp
     assert code == 0, out
     assert "Interrupted." not in out
     assert audit_lines(dirs)[-1]["outcome"] == "closed"
+
+
+def test_a_ctrl_c_during_a_refused_runs_audit_keeps_its_error_line(dirs, monkeypatch):
+    real = setupcli.audit
+
+    def ctrl_c(state, line):
+        os.kill(os.getpid(), signal.SIGINT)  # held while the line is written, lands as the mask comes back
+        real(state, line)
+
+    mask = blocked_now()
+    monkeypatch.setattr(setupcli, "audit", ctrl_c)
+    try:
+        code, out = run(["7"])
+    finally:
+        left_blocked = blocked_now()
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+    assert left_blocked == mask
+    assert code == 1
+    assert out.splitlines()[-1] == "No open setup 7."
+    assert audit_lines(dirs)[-1]["outcome"] == "refused"
