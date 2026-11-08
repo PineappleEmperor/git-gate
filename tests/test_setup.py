@@ -439,3 +439,22 @@ def test_listed_names_unreadable_records_by_id(tmp_path):
     (setups.dir / "9.json").write_text("[]")
     (setups.dir / "notes.json").write_text("{}")
     assert setups.listed() == [(good.id, good), (bad.id, None), (9, None)]
+
+
+def test_an_unparseable_record_is_purged_once_its_file_is_older_than_the_expiry(tmp_path):
+    import os
+
+    now = 2_000_000.0
+    setups = Setups(tmp_path, clock=lambda: now)
+    kept = setups.create("me/app", "A thing", ("a",), TEMPLATE)
+    old, young = setups.dir / "5.json", setups.dir / "6.json"
+    for path in (old, young):
+        path.write_text("{not json")
+        path.with_suffix(".lock").write_text("")
+    os.utime(old, (now - EXPIRES - 10, now - EXPIRES - 10))
+    os.utime(young, (now - EXPIRES + 10, now - EXPIRES + 10))
+    setups.create("me/app", "A thing", ("a",), TEMPLATE)  # creating purges
+    assert not old.exists() and not old.with_suffix(".lock").exists()
+    assert young.exists() and young.with_suffix(".lock").exists()
+    assert setups.get(kept.id) == kept
+    assert [id for id, _ in setups.listed()] == [kept.id, 6, 7]

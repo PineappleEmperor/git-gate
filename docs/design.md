@@ -89,7 +89,8 @@ Creating a repo and its settings needs administration rights the gate's token do
   topics, ruleset, secrets), and requires a `created` time that is finite and no more than 60 s in
   the future (so a tampered time cannot stop expiry); it refuses one that fails:
   `Setup <id> is unreadable: <reason>`. The id-less listing runs the same checks and shows such a
-  record as `<id>: (unreadable)`, without its contents.
+  record as `<id>: (unreadable)`, without its contents. A record that does not parse has no created time, so the
+  purge removes it, with its lock file, once the file's mtime is older than the 14-day expiry.
 - One run per setup: a run holds an exclusive, non-blocking `flock` on `<state>/setups/<id>.lock`
   (0600) from before sign-in until it has audited. A second run is refused before sign-in with
   `Setup <id> is already running.` Closing a setup removes its lock file.
