@@ -386,16 +386,19 @@ def test_a_run_holds_the_setups_lock(tmp_path):
 
 
 def test_a_run_lock_is_held_across_processes(tmp_path):
+    import os
     import subprocess
     import sys
+    from pathlib import Path
 
     setups = Setups(tmp_path)
     s = setups.create("me/app", "A thing", ("a",), TEMPLATE)
+    env = os.environ | {"PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}  # CI installs no package
     holder = subprocess.Popen(
         [sys.executable, "-c", "import sys, time\nfrom pathlib import Path\nfrom git_gate.setup import Setups\n"
          f"with Setups(Path({str(tmp_path)!r})).running({s.id}):\n    print('held', flush=True)\n"
          "    sys.stdin.readline()\n"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env,
     )  # fmt: skip
     try:
         assert holder.stdout.readline() == "held\n"
