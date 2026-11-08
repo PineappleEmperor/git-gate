@@ -328,3 +328,87 @@ def test_repo_setup_records_secrets(env):
     out = env.gate.dispatch("repo_setup", _request(env, secrets=["release_token"]))
     assert Setups(env.gate.state).get(1).secrets == ("RELEASE_TOKEN",)
     assert "It reminds the user to add the Actions secrets: RELEASE_TOKEN." in out
+
+
+# --- the record is checked again on load, and a run holds its lock -----------------------------
+
+
+def _tamper(setups, id, change):
+    path = setups.dir / f"{id}.json"
+    data = json.loads(path.read_text())
+    change(data)
+    path.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        (lambda d: d["ruleset"].update(bypass_actors=[{"actor_id": 1, "actor_type": "OrganizationAdmin"}]),
+         "Ruleset bypass_actors must be an empty list: nobody may bypass it."),
+        (lambda d: d["ruleset"].update(enforcement="evaluate"), "Ruleset enforcement must be 'active'"),
+        (lambda d: d["ruleset"].update(extra=1), "Ruleset has keys the gate does not set: 'extra'."),
+        (lambda d: d.update(topics=["Bad Topic"]), "topic 'Bad Topic' must be lowercase letters"),
+        (lambda d: d.update(topics=[]), "topics must hold 1 to 20 names, not 0."),
+        (lambda d: d.update(repo="me/app.git"), "'me/app.git' is not an owner/name repository."),
+        (lambda d: d.update(repo="../x"), "'../x' is not an owner/name repository."),
+        (lambda d: d.update(description="two\nlines"), "description must be one line of printable characters"),
+        (lambda d: d.update(description=" padded "), "description ' padded ' is not as repo_setup checks it."),
+        (lambda d: d.update(secrets=["GITHUB_X"]), "must not start with GITHUB_"),
+        (lambda d: d.update(secrets=["lower"]), "secret names ('lower',) are not as repo_setup checks them."),
+        (lambda d: d.update(handover=0), "handover 0 is not a handover id."),
+    ],
+    ids=["bypass actors", "enforcement", "extra key", "bad topic", "no topics", "repo .git", "repo dots",
+         "two-line description", "untrimmed description", "reserved secret", "lower-case secret", "handover 0"],
+)  # fmt: skip
+def test_a_tampered_record_is_refused_on_load(tmp_path, change, reason):
+    setups = Setups(tmp_path)
+    s = setups.create("me/app", "A thing", ("a",), TEMPLATE, secrets=("RELEASE_TOKEN",), handover=3)
+    assert setups.get(s.id) == s
+    _tamper(setups, s.id, change)
+    with pytest.raises(Refused) as e:
+        setups.get(s.id)
+    assert str(e.value).startswith(f"Setup {s.id} is unreadable: ")
+    assert reason in str(e.value)
+
+
+def test_a_run_holds_the_setups_lock(tmp_path):
+    setups = Setups(tmp_path)
+    s = setups.create("me/app", "A thing", ("a",), TEMPLATE)
+    lock = setups.dir / f"{s.id}.lock"
+    with setups.running(s.id):
+        assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+        with pytest.raises(Refused, match=f"^Setup {s.id} is already running.$"), Setups(tmp_path).running(s.id):
+            pass
+    with Setups(tmp_path).running(s.id):  # released on the way out
+        pass
+    setups.close(s.id)
+    assert not lock.exists()
+
+
+def test_a_run_lock_is_held_across_processes(tmp_path):
+    import subprocess
+    import sys
+
+    setups = Setups(tmp_path)
+    s = setups.create("me/app", "A thing", ("a",), TEMPLATE)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", "import sys, time\nfrom pathlib import Path\nfrom git_gate.setup import Setups\n"
+         f"with Setups(Path({str(tmp_path)!r})).running({s.id}):\n    print('held', flush=True)\n"
+         "    sys.stdin.readline()\n"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )  # fmt: skip
+    try:
+        assert holder.stdout.readline() == "held\n"
+        with pytest.raises(Refused, match="already running"), setups.running(s.id):
+            pass
+    finally:
+        holder.communicate("\n", timeout=10)
+    with setups.running(s.id):
+        pass
+
+
+def test_a_setup_with_a_first_push_expires_with_its_handover(env):
+    _no_github(env)
+    bundle, _, _ = _first_push(env)
+    env.gate.dispatch("repo_setup", _request(env, bundle=str(bundle)))
+    assert Setups(env.gate.state).get(1).created == Handovers(env.gate.state).get(1).created

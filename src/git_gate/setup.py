@@ -4,15 +4,18 @@ The agent proposes a description, topics and a ruleset file; this module checks 
 as a record under <state>/setups/<id>.json. Nothing here calls GitHub.
 """
 
+import contextlib
+import fcntl
 import json
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from git_gate import Refused
+from git_gate.config import valid_repo
 from git_gate.handover import EXPIRES, ID_RE, allocate_id
 from git_gate.writes import _line, _show
 
@@ -125,7 +128,8 @@ def check_ruleset(data: bytes, path: str) -> dict:
 
 
 class Setups:
-    """JSON records under <state>/setups/<id>.json, ids from the flock-guarded <state>/setups/next."""
+    """JSON records under <state>/setups/<id>.json, ids from the flock-guarded <state>/setups/next. A run
+    of `gitgatesetup <id>` holds the flock on <state>/setups/<id>.lock."""
 
     def __init__(self, state: Path, clock: Callable[[], float] = time.time):
         self.dir = state / "setups"
@@ -133,10 +137,13 @@ class Setups:
 
     def create(
         self, repo: str, description: str, topics: tuple[str, ...], ruleset: dict, *,
-        handover: int | None = None, secrets: tuple[str, ...] = (),
+        handover: int | None = None, secrets: tuple[str, ...] = (), created: float | None = None,
     ) -> SetupRequest:  # fmt: skip
+        """Record a request under the next free id. `created` is its handover's creation time when it has
+        one, so the request expires no later than the first push it holds."""
         with allocate_id(self.dir, self._highest) as number:
-            s = SetupRequest(number, repo, description, tuple(topics), ruleset, self.clock(), handover, tuple(secrets))
+            when = self.clock() if created is None else created
+            s = SetupRequest(number, repo, description, tuple(topics), ruleset, when, handover, tuple(secrets))
             self._write(s)
             self._purge()
         return s
@@ -154,13 +161,39 @@ class Setups:
             raise Refused(f"Setup {id} is unreadable: {path} is not a setup record.")
         if self._expired(s):
             raise Refused(f"No open setup {id}.")
+        try:
+            _recheck(s, path)
+        except Refused as e:
+            raise Refused(f"Setup {id} is unreadable: {e}") from None
         return s
+
+    @contextlib.contextmanager
+    def running(self, id: int) -> Iterator[None]:
+        """Hold the exclusive flock on <state>/setups/<id>.lock (0600) while the body runs; a second
+        holder, in this process or another, is refused at once."""
+        path = self._path(id).with_suffix(".lock")
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except FileNotFoundError:
+            raise Refused(f"No open setup {id}.") from None
+        except OSError as e:
+            raise Refused(f"Setup {id} is unreadable: {e.strerror}.") from None
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Refused(f"Setup {id} is already running.") from None
+            yield
+        finally:
+            os.close(fd)
 
     def open(self) -> list[SetupRequest]:
         return [s for s in self._all() if not self._expired(s)]
 
     def close(self, id: int) -> None:
-        self._path(id).unlink(missing_ok=True)
+        path = self._path(id)
+        path.unlink(missing_ok=True)
+        path.with_suffix(".lock").unlink(missing_ok=True)  # a later run finds no record, whatever lock it takes
 
     def _path(self, id: int) -> Path:
         if not isinstance(id, int) or isinstance(id, bool) or id < 1:
@@ -199,6 +232,20 @@ class Setups:
                 if s:
                     found.append(s)
         return sorted(found, key=lambda s: s.id)
+
+
+def _recheck(s: SetupRequest, path: Path) -> None:
+    """Refused unless the record passes, unchanged, the checks repo_setup ran before recording it."""
+    if not valid_repo(s.repo):
+        raise Refused(f"{_show(s.repo)} is not an owner/name repository.")
+    if check_description(s.description) != s.description:
+        raise Refused(f"description {_show(s.description)} is not as repo_setup checks it.")
+    check_topics(s.topics)
+    check_ruleset(json.dumps(s.ruleset).encode(), str(path))
+    if check_secrets(list(s.secrets) or None) != s.secrets:
+        raise Refused(f"secret names {_show(s.secrets)} are not as repo_setup checks them.")
+    if s.handover is not None and s.handover < 1:
+        raise Refused(f"handover {s.handover} is not a handover id.")
 
 
 def _parse(text: str, id: int) -> SetupRequest | None:
