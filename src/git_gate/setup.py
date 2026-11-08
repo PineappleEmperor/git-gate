@@ -7,6 +7,7 @@ as a record under <state>/setups/<id>.json. Nothing here calls GitHub.
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import time
@@ -28,6 +29,7 @@ RULESET_KEYS = {"name", "target", "enforcement", "conditions", "rules", "bypass_
 REQUIRED_RULES = ("deletion", "non_fast_forward")
 MAX_SECRETS = 10
 SECRET_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,99}")  # fullmatch only
+FUTURE_SLACK = 60  # seconds a record's created time may lie ahead of the clock (clock skew between writers)
 
 
 @dataclass(frozen=True)
@@ -162,7 +164,7 @@ class Setups:
         if self._expired(s):
             raise Refused(f"No open setup {id}.")
         try:
-            _recheck(s, path)
+            _recheck(s, path, self.clock())
         except Refused as e:
             raise Refused(f"Setup {id} is unreadable: {e}") from None
         return s
@@ -186,6 +188,29 @@ class Setups:
             yield
         finally:
             os.close(fd)
+
+    def listed(self) -> list[tuple[int, SetupRequest | None]]:
+        """Every record that has not expired, by id, with None for one that does not parse or fails the
+        checks `get` runs; a record that vanishes meanwhile is left out."""
+        found: list[tuple[int, SetupRequest | None]] = []
+        for path in self.dir.glob("*.json") if self.dir.is_dir() else ():
+            if not ID_RE.fullmatch(path.stem):
+                continue
+            try:
+                s = _parse(path.read_text(), int(path.stem))
+            except FileNotFoundError:
+                continue
+            except OSError:
+                s = None
+            if s is not None and self._expired(s):
+                continue
+            if s is not None:
+                try:
+                    _recheck(s, path, self.clock())
+                except Refused:
+                    s = None
+            found.append((int(path.stem), s))
+        return sorted(found, key=lambda pair: pair[0])
 
     def open(self) -> list[SetupRequest]:
         return [s for s in self._all() if not self._expired(s)]
@@ -234,8 +259,11 @@ class Setups:
         return sorted(found, key=lambda s: s.id)
 
 
-def _recheck(s: SetupRequest, path: Path) -> None:
-    """Refused unless the record passes, unchanged, the checks repo_setup ran before recording it."""
+def _recheck(s: SetupRequest, path: Path, now: float) -> None:
+    """Refused unless the record passes, unchanged, the checks repo_setup ran before recording it, and
+    its created time is a real one no later than `now` (with FUTURE_SLACK), so it cannot dodge expiry."""
+    if not math.isfinite(s.created) or s.created > now + FUTURE_SLACK:
+        raise Refused(f"created {_show(s.created)} is not a past time.")
     if not valid_repo(s.repo):
         raise Refused(f"{_show(s.repo)} is not an owner/name repository.")
     if check_description(s.description) != s.description:

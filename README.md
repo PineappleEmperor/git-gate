@@ -284,8 +284,11 @@ Once applying has started, Ctrl-C, a closed terminal or SIGTERM ends the run wit
 `nohup`, which ignores SIGHUP, a closed terminal does not end the run. A terminal that closes late in
 a run does not stop it revoking and logging. Only one run of a setup goes at a time: a second
 `gitgatesetup <id>` while one runs is refused before sign-in with `Setup <id> is already running.`
-Each run checks the stored request again as `repo_setup` did, and refuses one that no longer passes
-with `Setup <id> is unreadable: <reason>`.
+Each run checks the stored request again as `repo_setup` did (and that its creation time is not in
+the future), and refuses one that no longer passes with `Setup <id> is unreadable: <reason>`; the
+listing shows such a record as `<id>: (unreadable)`, without its contents. If
+reading the changes back fails after GitHub took some, the run prints `Reading the changes back
+failed: <reason>` and `Setup <id> stays open. Re-run: gitgatesetup <id>`.
 
 The ruleset goes on after `main` is pushed, since its required checks would refuse the push that
 creates it, so a new repo with a first push closes in one run. `main` is never pushed over: if it
@@ -331,8 +334,9 @@ A `gitgatepush` line has `time`, `tool` (`gitgatepush`), `id`, `repo`, `branch`,
 `outcome` (`closed`, `open`, `declined`, `interrupted` or `refused`) and `revoked`: `true` once GitHub
 confirmed the token dead, `false` when it did not, `null` when the run never signed in. `interrupted`
 means the run was stopped (Ctrl-C, a closed terminal or SIGTERM) after it had started applying, so
-GitHub may hold some of the changes; the setup stays open. A run stopped before it applied anything
-is `refused`, or `declined` at the prompt. Lines from older releases
+GitHub may hold some of the changes; the setup stays open. A run whose changes went in but whose
+read-back, or a write, was refused is `open`, with a `Re-run` line. A run stopped or refused before
+it applied anything is `refused`, or `declined` at the prompt. Lines from older releases
 lack the newer fields.
 
 At 8 MiB, `audit.log` is renamed to `audit.log.<YYYYmmddTHHMMSS>`, with `.<n>` added if that name is

@@ -412,3 +412,30 @@ def test_a_setup_with_a_first_push_expires_with_its_handover(env):
     bundle, _, _ = _first_push(env)
     env.gate.dispatch("repo_setup", _request(env, bundle=str(bundle)))
     assert Setups(env.gate.state).get(1).created == Handovers(env.gate.state).get(1).created
+
+
+@pytest.mark.parametrize(
+    ("created", "ok"),
+    [(3600.0, False), (61.0, False), (float("inf"), False), (float("nan"), False), (30.0, True), (-60.0, True)],
+    ids=["an hour ahead", "past the slack", "infinite", "nan", "within the slack", "past"],
+)
+def test_a_record_created_in_the_future_is_refused(tmp_path, created, ok):
+    now = 1_000_000.0
+    setups = Setups(tmp_path, clock=lambda: now)
+    s = setups.create("me/app", "A thing", ("a",), TEMPLATE)
+    _tamper(setups, s.id, lambda d: d.update(created=now + created))
+    if ok:
+        setups.get(s.id)
+    else:
+        with pytest.raises(Refused, match=f"^Setup {s.id} is unreadable: created .* is not a past time.$"):
+            setups.get(s.id)
+
+
+def test_listed_names_unreadable_records_by_id(tmp_path):
+    setups = Setups(tmp_path)
+    good = setups.create("me/app", "A thing", ("a",), TEMPLATE)
+    bad = setups.create("me/app", "A thing", ("a",), TEMPLATE)
+    _tamper(setups, bad.id, lambda d: d.update(topics=["Bad Topic"]))
+    (setups.dir / "9.json").write_text("[]")
+    (setups.dir / "notes.json").write_text("{}")
+    assert setups.listed() == [(good.id, good), (bad.id, None), (9, None)]

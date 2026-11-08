@@ -56,14 +56,21 @@ Creating a repo and its settings needs administration rights the gate's token do
   It is never written to disk, logged or printed, and expires after 8 hours. It is revoked at the end
   of every run that obtained one, however the run ends. `device_login` hands the tokens to the run
   the moment GitHub sends them, before it returns, so an interrupt in between still leaves them to
-  revoke. Revocation is two `POST https://api.github.com/credentials/revoke` requests with no
+  revoke; on the main thread, SIGINT, SIGHUP and SIGTERM are blocked from the token request until the
+  tokens are handed over (at most the 30 s request timeout), so an interrupt while GitHub's answer is
+  read lands after the hand-over. Revocation is two `POST https://api.github.com/credentials/revoke` requests with no
   `Authorization` header: `{"credentials": [<access token>]}`, then `{"credentials": [<refresh
   token>]}` once (the refresh token GitHub returns is never exchanged, only revoked). Each must
   answer 202; otherwise the run prints `GitHub refused the revocation (<status>).` or `GitHub refused
-  the refresh token's revocation (<status>).` and the warning. SIGHUP and SIGTERM end a run as Ctrl-C
-  does, so they revoke too, unless the signal was already ignored (`nohup`), which stays so; both,
-  and SIGINT, are blocked with `pthread_sigmask` while the handlers are swapped, so none is left
-  installed and none escapes after the run has audited. Once both POSTs answered 202, the run calls
+  the refresh token's revocation (<status>).` and the warning. When the first POST cannot reach
+  GitHub, the refresh token's POST is still sent, and nothing is confirmed. SIGHUP and SIGTERM end a
+  run as Ctrl-C does, so they revoke too, unless the signal was already ignored (`nohup`), which
+  stays so. Both, and SIGINT, are blocked with `pthread_sigmask` while the handlers go in and come
+  out. The restore's block is the first statement of the run's last `finally`, retried until it
+  holds, so a hangup that lands just before it (whose handler `pthread_sigmask` runs) cannot skip
+  it: the handlers always come back and the mask always returns to what it was. The run's exit
+  code is fixed before its audit line is written, and an interrupt after that is dropped, so none
+  escapes, or changes the exit code, after the run has audited. Once both POSTs answered 202, the run calls
   `GET /user` with the access token, up to 6 times 5 seconds apart, and says
   `Signed out: GitHub revoked this run's token.` only once that answers 401.
   Otherwise it prints a warning with the page to revoke it by hand. Neither token reaches stdout,
@@ -79,7 +86,10 @@ Creating a repo and its settings needs administration rights the gate's token do
   topics (1-20) and ruleset file (a plain branch ruleset for the default branch, at most 64 KiB). A
   request with a first push takes its handover's creation time, so it expires no later than the
   handover. `gitgatesetup` runs the same checks again on the stored record (repo name, description,
-  topics, ruleset, secrets) and refuses one that fails: `Setup <id> is unreadable: <reason>`.
+  topics, ruleset, secrets), and requires a `created` time that is finite and no more than 60 s in
+  the future (so a tampered time cannot stop expiry); it refuses one that fails:
+  `Setup <id> is unreadable: <reason>`. The id-less listing runs the same checks and shows such a
+  record as `<id>: (unreadable)`, without its contents.
 - One run per setup: a run holds an exclusive, non-blocking `flock` on `<state>/setups/<id>.lock`
   (0600) from before sign-in until it has audited. A second run is refused before sign-in with
   `Setup <id> is already running.` Closing a setup removes its lock file.
@@ -123,7 +133,9 @@ Creating a repo and its settings needs administration rights the gate's token do
   setup closes only when all of it verified. Exit 0 closed, 1 open, interrupted or refused, 2 usage.
   Each run writes one `audit.log` line (id, repo, outcome, revoked) and never the token. Outcomes:
   `closed`, `open`, `declined`, `interrupted` (stopped after applying had started: the run prints
-  `Re-run: gitgatesetup <id>` and the setup stays open) and `refused`.
+  `Re-run: gitgatesetup <id>` and the setup stays open) and `refused`. A refusal while reading the
+  changes back is `open`: the run prints `Reading the changes back failed: <reason>` and
+  `Setup <id> stays open. Re-run: gitgatesetup <id>`.
 - Personal account only: the repo owner must equal the signed-in user's `login`.
 - Out of scope: reading or writing secret values, and local clone settings such as `core.hooksPath`.
 - GitHub attributes changes to the user; the app's name appears only in their security log.

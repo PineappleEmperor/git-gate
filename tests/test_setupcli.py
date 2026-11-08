@@ -1598,3 +1598,142 @@ def test_an_interrupt_once_the_setup_has_closed_audits_closed(setups, dirs):
     assert "Re-run" not in out.getvalue()
     assert setups.open() == []
     assert audit_lines(dirs)[-1]["outcome"] == "closed"
+
+
+# --- fix round 1 -----------------------------------------------------------------------------------
+
+
+def blocked_now():
+    return signal.pthread_sigmask(signal.SIG_BLOCK, [])
+
+
+def test_a_hangup_just_before_the_restore_blocks_cannot_skip_it(setups, dirs, monkeypatch):
+    """The reviewer's probe: SIGHUP lands just before the restore's SIG_BLOCK, while our handler is in."""
+    create(setups)
+    real = signal.pthread_sigmask
+    sent = []
+
+    def probe(how, mask):
+        if (
+            how == signal.SIG_BLOCK
+            and set(mask)
+            and signal.getsignal(signal.SIGHUP) is setupcli._interrupt
+            and not sent
+        ):
+            sent.append(how)
+            os.kill(os.getpid(), signal.SIGHUP)  # its handler runs before the block below
+        return real(how, mask)
+
+    previous = {n: signal.getsignal(n) for n in setupcli.HANGUPS}
+    mask = blocked_now()
+    monkeypatch.setattr(signal, "pthread_sigmask", probe)
+    escaped = None
+    try:
+        try:
+            code, out = run(["1"], all_set())
+        except KeyboardInterrupt as e:
+            escaped = e
+    finally:
+        monkeypatch.undo()
+        after = {n: signal.getsignal(n) for n in setupcli.HANGUPS}
+        left_blocked = blocked_now()
+        for n, handler in previous.items():
+            signal.signal(n, handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+    assert sent and escaped is None
+    assert after == previous
+    assert left_blocked == mask
+    assert code == 0, out
+    assert "Interrupted." not in out
+    assert audit_lines(dirs)[-1]["outcome"] == "closed"
+
+
+def test_a_pending_ctrl_c_at_the_first_block_leaves_no_mask_and_no_handler(setups, dirs, monkeypatch):
+    create(setups)
+    real = signal.pthread_sigmask
+    raised = []
+
+    def pending(how, mask):
+        old = real(how, mask)
+        if how == signal.SIG_BLOCK and set(mask) and not raised:
+            raised.append(how)
+            raise KeyboardInterrupt  # as a Ctrl-C handler run by pthread_sigmask itself
+        return old
+
+    previous = {n: signal.getsignal(n) for n in setupcli.HANGUPS}
+    mask = blocked_now()
+    login = Login()
+    monkeypatch.setattr(signal, "pthread_sigmask", pending)
+    escaped = None
+    try:
+        try:
+            code, out = run(["1"], all_set(), login=login)
+        except KeyboardInterrupt as e:
+            escaped = e
+    finally:
+        monkeypatch.undo()
+        after = {n: signal.getsignal(n) for n in setupcli.HANGUPS}
+        left_blocked = blocked_now()
+        for n, handler in previous.items():
+            signal.signal(n, handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+    assert raised and escaped is None
+    assert after == previous and left_blocked == mask
+    assert code == 1 and out.endswith("Interrupted.\n") and login.calls == []
+
+
+def test_an_interrupt_once_the_run_has_returned_keeps_its_code(setups, dirs, monkeypatch):
+    create(setups)
+    real = setupcli._main
+
+    def then_interrupted(*args):
+        real(*args)
+        raise KeyboardInterrupt  # lands after the run audited, before main has its code
+
+    monkeypatch.setattr(setupcli, "_main", then_interrupted)
+    code, out = run(["1"], all_set())
+    assert code == 0, out
+    assert "Interrupted." not in out
+    assert audit_lines(dirs)[-1]["outcome"] == "closed"
+
+
+def test_a_refused_read_back_after_applying_says_rerun_and_stays_open(setups, dirs):
+    create(setups, secrets=("RELEASE_TOKEN",))
+    gh = FailsLater("topics", 2, GitHubError("GitHub GET repos/me/app/topics returned 502: bad gateway", 502, {}),
+                    repo=live_repo(), topics=(), graph=True, rulesets=[live_ruleset(RULESET, 9)])  # fmt: skip
+    code, out = run(["1"], gh)
+    assert code == 1
+    assert ("set_topics", REPO, TOPICS) in gh.writes()
+    assert out.splitlines()[-5:] == [
+        "Apply? [y/N] Reading the changes back failed: GitHub GET repos/me/app/topics returned 502: bad gateway",
+        "Setup 1 stays open. Re-run: gitgatesetup 1",
+        "Add these Actions secrets yourself on GitHub (gitgatesetup cannot check them):",
+        f"  RELEASE_TOKEN: https://github.com/{REPO}/settings/secrets/actions/new",
+        SIGNED_OUT.strip(),
+    ]
+    assert audit_lines(dirs)[-1]["outcome"] == "open"
+    setups.get(1)
+
+
+def test_the_survey_reads_the_setups_clock(setups):
+    s = create(setups, handover=7)
+    gh = all_set(rulesets=[], branch=False)
+    kept = FakeKept(gh, open=False, pushed=True)
+    late = setupcli._survey(gh, s, kept, print, clock=lambda: s.created + EXPIRES - 60)
+    assert EXPIRED.strip().removeprefix("ruleset: ") in [f"ruleset: {i.line}" for i in late.items][-1]
+    early = setupcli._survey(gh, s, kept, print, clock=lambda: s.created + 60)
+    assert "was pushed" in early.items[-1].line
+
+
+def test_the_listing_shows_an_unreadable_record_by_its_id_only(setups, dirs):
+    create(setups)
+    create(setups, repo="me/other", description="Other")
+    path = setups.dir / "2.json"
+    data = json.loads(path.read_text())
+    data["ruleset"]["bypass_actors"] = [{"actor_id": 1}]
+    data["description"] = "evil text"
+    path.write_text(json.dumps(data))
+    (setups.dir / "3.json").write_text("{not json")
+    code, out = run([])
+    assert code == 0
+    assert out.splitlines() == ["1  me/app  An app", "2: (unreadable)", "3: (unreadable)"]

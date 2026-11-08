@@ -139,19 +139,59 @@ def main(
         except OSError, ValueError:  # a hung-up terminal or a closed stdout: the run still revokes and audits
             pass
 
-    code = None
+    # While a run lasts, SIGHUP (a closed terminal) and SIGTERM raise KeyboardInterrupt, so the run's
+    # finally blocks still revoke its token and audit it; a signal already ignored (nohup) stays ignored.
+    # Hangups and Ctrl-C are held back (pthread_sigmask) while the handlers go in and come out: one that
+    # comes while they go in interrupts once all are in, and one that comes while they come out reaches
+    # the handler put back. The restore cannot be skipped: its block is retried until it holds.
+    ran: list[int] = []  # the run's exit code, fixed before it audits: an interrupt after that is dropped
+    previous: dict[int, object] = {}
     try:
-        with _hangups_interrupt():
-            code = _main(argv, stdin, say, login, github, kept, revoke, signed_in)
-    except KeyboardInterrupt:  # while the hangup handlers went in or came out, outside the run's own handling
-        if code is None:
-            say()
-            say("Interrupted.")
-            return 1
+        held = signal.pthread_sigmask(signal.SIG_BLOCK, ())  # the mask as it is; an interrupt here changes nothing
+        try:
+            try:
+                signal.pthread_sigmask(signal.SIG_BLOCK, SWAPPING)  # may run a pending Ctrl-C: the finally unmasks
+                _hangups_in(previous)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, held)  # one that came meanwhile interrupts now
+            code = _main(argv, stdin, say, login, github, kept, revoke, signed_in, ran)
+        finally:
+            while True:  # inline, first in the finally: nothing can interrupt before the retry loop starts
+                try:
+                    signal.pthread_sigmask(signal.SIG_BLOCK, SWAPPING)  # runs a pending handler, which may raise
+                    break
+                except KeyboardInterrupt:  # the run has ended, or never began: dropping it is right
+                    pass
+            _hangups_out(previous, held)
+    except KeyboardInterrupt:  # outside the run's own handling: before it began, or after its code was fixed
+        if ran:
+            return ran[0]
+        say()
+        say("Interrupted.")
+        return 1
     return code
 
 
-def _main(argv: list[str], stdin, say, login, github, kept: KeptPushes | None, revoke, signed_in: list[Login]) -> int:
+def _hangups_in(previous: dict[int, object]) -> None:
+    """Install the hangup handlers, with every signal in SWAPPING blocked; `previous` gets what they replace."""
+    with contextlib.suppress(ValueError):  # not the main thread: signals stay as they are
+        for signum in HANGUPS:
+            if signal.getsignal(signum) is not signal.SIG_IGN:  # nohup's ignored hangup stays ignored
+                previous[signum] = signal.signal(signum, _interrupt)
+
+
+def _hangups_out(previous: dict[int, object], held) -> None:
+    """Put the previous handlers back, with every signal in SWAPPING blocked, then the mask as it was."""
+    try:
+        for signum, handler in previous.items():
+            signal.signal(signum, signal.SIG_DFL if handler is None else handler)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)  # one that came meanwhile goes to the handler put back
+
+
+def _main(
+    argv: list[str], stdin, say, login, github, kept: KeptPushes | None, revoke, signed_in: list[Login], ran: list[int]
+) -> int:
     try:
         state = state_dir()
         if not argv:
@@ -162,7 +202,7 @@ def _main(argv: list[str], stdin, say, login, github, kept: KeptPushes | None, r
         if len(argv) != 1 or not ID_RE.fullmatch(argv[0]):
             say(USAGE)
             return 2
-        return _run(state, int(argv[0]), stdin, say, login, github, kept or _Kept(state), signed_in, revoke)
+        return _run(state, int(argv[0]), stdin, say, login, github, kept or _Kept(state), signed_in, revoke, ran)
     except Refused as e:
         say(str(e), lines=True)
         return 1
@@ -176,43 +216,19 @@ def _interrupt(signum, frame) -> None:
     raise KeyboardInterrupt
 
 
-@contextlib.contextmanager
-def _hangups_interrupt():
-    """While a run lasts, SIGHUP (a closed terminal) and SIGTERM raise KeyboardInterrupt, so the run's
-    finally blocks still revoke its token and audit it. A signal already ignored (nohup) stays ignored.
-    The previous handlers come back on the way out. Hangups and Ctrl-C are held back while handlers
-    are swapped: one that comes while they go in interrupts once all are in, and one that comes while
-    they come out reaches the handler put back, so no handler is left behind."""
-    previous = {}
-    held = signal.pthread_sigmask(signal.SIG_BLOCK, SWAPPING)
-    try:
-        try:
-            with contextlib.suppress(ValueError):  # not the main thread: signals stay as they are
-                for signum in HANGUPS:
-                    if signal.getsignal(signum) is not signal.SIG_IGN:
-                        previous[signum] = signal.signal(signum, _interrupt)
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, held)
-        yield
-    finally:
-        signal.pthread_sigmask(signal.SIG_BLOCK, SWAPPING)
-        try:
-            for signum, handler in previous.items():
-                signal.signal(signum, signal.SIG_DFL if handler is None else handler)
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, held)
-
-
 def _list(setups: Setups, say) -> int:
-    found = setups.open()
+    """The open setups; one whose record does not parse or fails its checks is named by id alone."""
+    found = setups.listed()
     if not found:
         say("no open setups")
-    for s in found:
-        say(f"{s.id}  {s.repo}  {s.description}")
+    for id, s in found:
+        say(f"{id}: (unreadable)" if s is None else f"{s.id}  {s.repo}  {s.description}")
     return 0
 
 
-def _run(state: Path, id: int, stdin, say, login, github, kept: KeptPushes, signed_in: list[Login], revoke) -> int:
+def _run(
+    state: Path, id: int, stdin, say, login, github, kept: KeptPushes, signed_in: list[Login], revoke, ran: list[int]
+) -> int:  # fmt: skip
     """One run of `gitgatesetup <id>`, audited whatever its end, holding the setup's lock throughout.
     Every sign-in is revoked at the end, after the run's last GitHub call."""
     setups = Setups(state)
@@ -235,6 +251,7 @@ def _run(state: Path, id: int, stdin, say, login, github, kept: KeptPushes, sign
                 say(f"Could not confirm the revocation ({type(e).__name__}).")
                 say(NOT_CONFIRMED)
             finally:
+                ran.append(0 if outcome == "closed" else 1)  # fixed before the audit line
                 _audit(state, id, repo, outcome, revoked, say)
 
 
@@ -262,7 +279,7 @@ def _setup(setups: Setups, s: SetupRequest, stdin, say, login, github, kept: Kep
             f"{s.repo} is not under your account ({_clean(me)}); gitgatesetup sets up only your own repositories."
         )
 
-    plan = _survey(gh, s, kept, say)
+    plan = _survey(gh, s, kept, say, clock=setups.clock)
     try:
         return _apply(setups, s, gh, kept, plan, stdin, say, app.slug)
     finally:
@@ -300,8 +317,12 @@ def _apply(setups: Setups, s: SetupRequest, gh: GitHub, kept: KeptPushes, plan: 
                         say(f"Applying {item.name} failed: {e}")
                     say(f"Setup {s.id} stays open. Re-run: gitgatesetup {s.id}")
                     return "open"
-            plan = _survey(gh, s, kept, say, frozenset(accepted))
+            plan = _survey(gh, s, kept, say, frozenset(accepted), clock=setups.clock)
             return _verify(setups, s, gh, plan, say, closed)
+        except Refused as e:  # the read-back failed after GitHub took changes: open, to re-run
+            say(f"Reading the changes back failed: {e}", lines=True)
+            say(f"Setup {s.id} stays open. Re-run: gitgatesetup {s.id}")
+            return "open"
         except KeyboardInterrupt:
             say()
             say("Interrupted.")
@@ -344,10 +365,14 @@ def _yes(stdin, say) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def _survey(gh: GitHub, s: SetupRequest, kept: KeptPushes, say, accepted: frozenset[str] = frozenset()) -> Survey:
+def _survey(
+    gh: GitHub, s: SetupRequest, kept: KeptPushes, say, accepted: frozenset[str] = frozenset(), *,
+    clock: Callable[[], float] = time.time,
+) -> Survey:  # fmt: skip
     """Read GitHub's live state for every item of `s`. Every value read from GitHub is cleaned before
     it is shown, and an item's `apply` is set only when it differs from the request. `accepted` names
-    the items GitHub took a change for in this run. An absent repository has no main."""
+    the items GitHub took a change for in this run. An absent repository has no main. `clock` is the
+    setups' clock, against which the setup's age is read."""
     repo, out = s.repo, Survey()
     live = gh.repo(repo)
     if live is None:
@@ -374,7 +399,7 @@ def _survey(gh: GitHub, s: SetupRequest, kept: KeptPushes, say, accepted: frozen
     if first:
         out.items.append(first)
     # A setup expires with its handover, so a gone handover of a setup about to expire may have expired.
-    lapsed = first is None and s.handover is not None and time.time() - s.created > EXPIRES - LAPSE
+    lapsed = first is None and s.handover is not None and clock() - s.created > EXPIRES - LAPSE
     pushed = first is None and s.handover is not None and not lapsed and kept.pushed(s.handover)
     out.items.append(_ruleset(gh, s, live, out, pending=bool(first and first.apply), pushed=pushed, lapsed=lapsed))
     return out
