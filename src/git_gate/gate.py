@@ -565,8 +565,9 @@ class Gate:
 
     def _discard_first_push(self, rules: Rules, repo: str, h: Handover) -> None:
         """Close a first push that kept but whose setup request was never recorded, and drop its ref."""
-        self.handovers.close(h.id)
         # A failed cleanup must not hide the error that made it necessary.
+        with contextlib.suppress(Refused, OSError):
+            self.handovers.close(h.id)
         with contextlib.suppress(Refused, OSError), self.mirror.lock(repo):
             self.mirror.drop(repo, h.ref, rules)
 

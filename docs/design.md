@@ -83,8 +83,9 @@ Creating a repo and its settings needs administration rights the gate's token do
   handover paths recorded; the setup records the handover id. The kept screen is shown before `Apply?`.
   `gitgatepush <id>` still works on it, and whichever runs first pushes it. `gitgatesetup` pushes it
   only while its record names the setup's repo, branch `main`, no base and no lease, and only the
-  record it showed: one that changes before the push is refused. A record that is unreadable, or is not that push, is named on the `main` line
-  (`the handover cannot be used: <reason>`) and left for `gitgatepush`; the ruleset is then deferred.
+  record it showed: one that changes before the push is refused. A record that is unreadable, or is
+  not that push, is named on the `main` line (`the handover cannot be used: <reason>`) and left for
+  `gitgatepush`; the ruleset is then deferred.
   The branch is always `main`, and the bundle must hold the complete history (no prerequisites), because the gate does not sync from a
   repo that may not exist yet.
 - `gitgatesetup` never overwrites a branch: if `main` exists on GitHub the push item is `already
