@@ -69,7 +69,8 @@ Creating a repo and its settings needs administration rights the gate's token do
   out. The restore's block is the first statement of the run's last `finally`, retried until it
   holds, so a hangup that lands just before it (whose handler `pthread_sigmask` runs) cannot skip
   it: the handlers always come back and the mask always returns to what it was. The run's exit
-  code is fixed before its audit line is written, and an interrupt after that is dropped, so none
+  code is fixed before its audit line is written, SIGHUP, SIGTERM and SIGINT are held back while
+  the line is written (so it cannot be cut off), and an interrupt after that is dropped, so none
   escapes, or changes the exit code, after the run has audited. Once both POSTs answered 202, the run calls
   `GET /user` with the access token, up to 6 times 5 seconds apart, and says
   `Signed out: GitHub revoked this run's token.` only once that answers 401.
@@ -89,8 +90,9 @@ Creating a repo and its settings needs administration rights the gate's token do
   topics, ruleset, secrets), and requires a `created` time that is finite and no more than 60 s in
   the future (so a tampered time cannot stop expiry); it refuses one that fails:
   `Setup <id> is unreadable: <reason>`. The id-less listing runs the same checks and shows such a
-  record as `<id>: (unreadable)`, without its contents. A record that does not parse has no created time, so the
-  purge removes it, with its lock file, once the file's mtime is older than the 14-day expiry.
+  record as `<id>: (unreadable)`, without its contents. A record that does not parse, or whose created time is NaN or
+  infinite, has no time to expire by, so the purge removes it, with its lock file, once the file's
+  mtime is older than the 14-day expiry.
 - One run per setup: a run holds an exclusive, non-blocking `flock` on `<state>/setups/<id>.lock`
   (0600) from before sign-in until it has audited. A second run is refused before sign-in with
   `Setup <id> is already running.` Closing a setup removes its lock file.

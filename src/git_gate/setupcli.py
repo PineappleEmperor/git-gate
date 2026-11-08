@@ -207,6 +207,8 @@ def _main(
         say(str(e), lines=True)
         return 1
     except KeyboardInterrupt:
+        if ran:  # the run's code was fixed before its audit line: an interrupt after that changes nothing
+            return ran[0]
         say()
         say("Interrupted.")
         return 1
@@ -232,13 +234,16 @@ def _run(
     """One run of `gitgatesetup <id>`, audited whatever its end, holding the setup's lock throughout.
     Every sign-in is revoked at the end, after the run's last GitHub call."""
     setups = Setups(state)
-    repo, outcome = None, "refused"
+    repo, outcome, interrupted = None, "refused", False
     with contextlib.ExitStack() as held:
         try:
             repo = setups.get(id).repo  # an unknown id is refused before a lock file is made for it
             held.enter_context(setups.running(id))
             s = setups.get(id)  # read again under the lock: a run that just ended may have closed it
             outcome = _setup(setups, s, stdin, say, login, github, kept, signed_in)
+            return 0 if outcome == "closed" else 1
+        except KeyboardInterrupt:  # the run's own end: said last, once it has revoked and audited
+            interrupted = outcome != "closed"  # one after the setup closed changes nothing
             return 0 if outcome == "closed" else 1
         finally:
             revoked = None
@@ -251,8 +256,23 @@ def _run(
                 say(f"Could not confirm the revocation ({type(e).__name__}).")
                 say(NOT_CONFIRMED)
             finally:
-                ran.append(0 if outcome == "closed" else 1)  # fixed before the audit line
-                _audit(state, id, repo, outcome, revoked, say)
+                mask = None  # inline, first in this finally: hangups and Ctrl-C are held while the line is written
+                while True:
+                    try:
+                        if mask is None:
+                            mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())  # the mask as it is
+                        signal.pthread_sigmask(signal.SIG_BLOCK, SWAPPING)  # may run a pending handler, which raises
+                        break
+                    except KeyboardInterrupt:  # the run's outcome is fixed: dropping it is right
+                        pass
+                try:
+                    ran.append(0 if outcome == "closed" else 1)  # fixed before the audit line
+                    _audit(state, id, repo, outcome, revoked, say)
+                    if interrupted:
+                        say()
+                        say("Interrupted.")
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, mask)  # one held meanwhile lands now; main drops it
 
 
 def _alive(github, token: str) -> bool:

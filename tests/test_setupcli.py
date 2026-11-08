@@ -1737,3 +1737,43 @@ def test_the_listing_shows_an_unreadable_record_by_its_id_only(setups, dirs):
     code, out = run([])
     assert code == 0
     assert out.splitlines() == ["1  me/app  An app", "2: (unreadable)", "3: (unreadable)"]
+
+
+def test_an_interrupt_just_after_the_audit_line_keeps_the_runs_code(setups, dirs, monkeypatch):
+    create(setups)
+    real = setupcli.audit
+
+    def then_interrupted(state, line):
+        real(state, line)
+        raise KeyboardInterrupt  # the reviewer's probe: the line is written, then an interrupt
+
+    monkeypatch.setattr(setupcli, "audit", then_interrupted)
+    code, out = run(["1"], all_set())
+    assert code == 0, out
+    assert "Interrupted." not in out
+    assert audit_lines(dirs)[-1]["outcome"] == "closed"
+
+
+@pytest.mark.parametrize("signum", [signal.SIGHUP, signal.SIGTERM], ids=["SIGHUP", "SIGTERM"])
+def test_a_hangup_during_the_audit_cannot_cut_the_line_off(setups, dirs, monkeypatch, signum):
+    create(setups)
+    real = setupcli.audit
+
+    def hung_up(state, line):
+        os.kill(os.getpid(), signum)  # while the run's handler is in
+        real(state, line)
+
+    mask = blocked_now()
+    monkeypatch.setattr(setupcli, "audit", hung_up)
+    escaped = None
+    try:
+        code, out = run(["1"], all_set())
+    except KeyboardInterrupt as e:
+        escaped = e
+    finally:
+        left_blocked = blocked_now()
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+    assert escaped is None and left_blocked == mask
+    assert code == 0, out
+    assert "Interrupted." not in out
+    assert audit_lines(dirs)[-1]["outcome"] == "closed"

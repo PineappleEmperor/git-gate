@@ -458,3 +458,21 @@ def test_an_unparseable_record_is_purged_once_its_file_is_older_than_the_expiry(
     assert young.exists() and young.with_suffix(".lock").exists()
     assert setups.get(kept.id) == kept
     assert [id for id, _ in setups.listed()] == [kept.id, 6, 7]
+
+
+@pytest.mark.parametrize("created", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"])
+def test_a_record_with_no_real_created_time_is_purged_by_its_files_age(tmp_path, created):
+    import os
+
+    now = 2_000_000.0
+    setups = Setups(tmp_path, clock=lambda: now)
+    old, young = setups.create("me/app", "A thing", ("a",), TEMPLATE), setups.create("me/app", "B", ("a",), TEMPLATE)
+    for s, age in ((old, EXPIRES + 10), (young, EXPIRES - 10)):
+        _tamper(setups, s.id, lambda d: d.update(created=created))
+        path = setups.dir / f"{s.id}.json"
+        path.with_suffix(".lock").write_text("")
+        os.utime(path, (now - age, now - age))
+    setups.create("me/app", "C", ("a",), TEMPLATE)  # creating purges
+    gone = setups.dir / f"{old.id}.json"
+    assert not gone.exists() and not gone.with_suffix(".lock").exists()
+    assert (setups.dir / f"{young.id}.json").exists() or created == float("-inf")  # -inf already reads as expired

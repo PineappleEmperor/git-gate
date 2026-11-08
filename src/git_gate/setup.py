@@ -240,12 +240,15 @@ class Setups:
         for s in self._all():
             if self._expired(s):
                 self.close(s.id)
-        # A record that does not parse has no created time to expire by: its file's age stands in for it.
+        # A record that does not parse, or whose created time is not a real one (NaN, infinite), has no
+        # time to expire by: its file's age stands in for it.
         for path in self.dir.glob("*.json") if self.dir.is_dir() else ():
             if not ID_RE.fullmatch(path.stem):
                 continue
             try:
-                if _parse(path.read_text(), int(path.stem)) is None and self.clock() - path.stat().st_mtime > EXPIRES:
+                s = _parse(path.read_text(), int(path.stem))
+                timeless = s is None or not math.isfinite(s.created)
+                if timeless and self.clock() - path.stat().st_mtime > EXPIRES:
                     self.close(int(path.stem))
             except OSError:  # unreadable or gone meanwhile: left for a later purge
                 continue
