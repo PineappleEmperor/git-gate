@@ -29,7 +29,7 @@ from git_gate.devicelogin import NOT_CONFIRMED, Login, device_login
 from git_gate.devicelogin import revoke as revoke_tokens
 from git_gate.github import GitHub, GitHubError
 from git_gate.gitops import Git
-from git_gate.handover import ID_RE, RULES, Handover, Handovers, _clean, push_kept, screen
+from git_gate.handover import ID_RE, RULES, Gone, Handover, Handovers, _clean, push_kept, screen
 from git_gate.mirror import Mirror
 from git_gate.setup import SetupRequest, Setups
 
@@ -52,15 +52,23 @@ class Survey:
     """GitHub's live state against the request, one item per setting, in the order they are applied."""
 
     items: list[Item] = field(default_factory=list)
-    default: str | None = None  # the default branch, when it exists
+    default: str | None = None  # the repository's default branch, once the repository has been read
     ruleset_id: int | None = None  # the requested ruleset's id, when it is already set
+    seen: dict[str, bool] = field(default_factory=dict)  # branches read from GitHub in this survey
+
+    def has_branch(self, gh: GitHub, repo: str, name: str) -> bool:
+        """Whether `name` has commits on GitHub; read once per survey."""
+        if name not in self.seen:
+            self.seen[name] = gh.branch(repo, name) is not None
+        return self.seen[name]
 
 
 class KeptPushes(Protocol):
     """The push handovers `repo_setup` kept for a request's first push of main."""
 
     def open(self, id: int, repo: str) -> str | None:
-        """The kept commit when handover `id` is still open and is a first push of main to `repo`, else None."""
+        """The kept commit when handover `id` is still open and is a first push of main to `repo`. None when
+        its record is gone; Refused, with the reason, when it is unreadable or is not that push."""
 
     def pushed(self, id: int) -> bool:
         """Whether handover `id` was pushed: its record is gone."""
@@ -89,10 +97,11 @@ class _Kept:
         self.records.pop(id, None)
         try:
             h = self.handovers.get(id)
-        except Refused:
+        except Gone:
             return None
         if (h.repo, h.branch, h.base, h.lease) != (repo, FIRST, None, None):
-            return None  # not the first push repo_setup keeps: gitgatepush's to show and run
+            # Not the first push repo_setup keeps: gitgatepush's to show and run.
+            raise Refused(f"Handover {id} is not a first push of {FIRST} to {repo}.")
         self.records[id] = h
         return h.sha
 
@@ -324,7 +333,7 @@ def _survey(gh: GitHub, s: SetupRequest, kept: KeptPushes, say, accepted: frozen
     out.items.append(_item("topics", set(topics) == set(s.topics), _names(topics), _names(s.topics),
                            lambda: gh.set_topics(repo, s.topics)))  # fmt: skip
     out.items.append(_graph(gh, repo, graph, accepted))
-    first = _first_push(gh, s, live, kept, say)
+    first = _first_push(gh, s, live, kept, say, out)
     if first:
         out.items.append(first)
     pushed = first is None and s.handover is not None and kept.pushed(s.handover)
@@ -341,24 +350,27 @@ def _graph(gh: GitHub, repo: str, on: bool | None, accepted: frozenset[str]) -> 
     return Item("dependency graph", f"{current} → enabled", lambda: gh.enable_dependency_graph(repo))
 
 
-def _first_push(gh: GitHub, s: SetupRequest, live: dict | None, kept: KeptPushes, say) -> Item | None:
+def _first_push(gh: GitHub, s: SetupRequest, live: dict | None, kept: KeptPushes, say, seen: Survey) -> Item | None:
     """The kept first push of main. A main that exists is never pushed over, whatever its commit; a
     handover that is gone (pushed by gitgatepush, or expired) leaves no item."""
     if s.handover is None:
         return None
-    if live is not None and gh.branch(s.repo, FIRST) is not None:
+    if live is not None and seen.has_branch(gh, s.repo, FIRST):
         return Item(FIRST, SET)
-    sha = kept.open(s.handover, s.repo)
+    try:
+        sha = kept.open(s.handover, s.repo)
+    except Refused as e:  # unreadable or not this setup's push: named, and left for gitgatepush
+        return Item(FIRST, f"the handover cannot be used: {_clean(str(e))}")
     if not sha:
         return None
     line = f"absent → push {_clean(sha[:12])} (handover {s.handover}; shown below)"
     return Item(FIRST, line, functools.partial(kept.push, s.handover, say))
 
 
-def _default(gh: GitHub, s: SetupRequest, live: dict | None) -> tuple[str | None, bool]:
+def _default(gh: GitHub, s: SetupRequest, live: dict | None, seen: Survey) -> tuple[str | None, bool]:
     """The repository's default branch (None when there is no repository) and whether it has commits."""
-    default = str(live.get("default_branch") or "main") if live else None
-    return default, default is not None and gh.branch(s.repo, default) is not None
+    default = str(live.get("default_branch") or FIRST) if live else None
+    return default, default is not None and seen.has_branch(gh, s.repo, default)
 
 
 def _same_name(gh: GitHub, s: SetupRequest) -> int | None:
@@ -371,7 +383,7 @@ def _same_name(gh: GitHub, s: SetupRequest) -> int | None:
 def _apply_ruleset(gh: GitHub, s: SetupRequest) -> None:
     """Apply the ruleset once the first push has landed. It writes nothing when the default branch
     still has no commits (it is not main); the survey after applying then shows it deferred."""
-    if not _default(gh, s, gh.repo(s.repo))[1]:
+    if not _default(gh, s, gh.repo(s.repo), Survey())[1]:  # read afresh: the push has just landed
         return
     id = _same_name(gh, s)
     if id is None:
@@ -389,7 +401,8 @@ def _ruleset(
     when the request's first push already went out (its handover is closed), though GitHub may not
     show main yet."""
     name = s.ruleset.get("name")
-    default, exists = _default(gh, s, live)
+    default, exists = _default(gh, s, live, out)
+    out.default = default
     after = ""
     if not exists:
         if pushed and default == FIRST:
@@ -403,8 +416,6 @@ def _ruleset(
         if live is None:  # a repository created in this run has no rulesets
             line = f"absent → {_quote(str(name))}{after}; rules: {_rules(s.ruleset)}"
             return Item("ruleset", line, lambda: _apply_ruleset(gh, s))
-    else:
-        out.default = default
     id = _same_name(gh, s)
     if id is None:
         line = f"absent → {_quote(str(name))}{after}; rules: {_rules(s.ruleset)}"

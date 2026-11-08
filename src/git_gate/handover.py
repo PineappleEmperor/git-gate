@@ -38,6 +38,10 @@ LINK_KIND = dict(zip(LINK_MODES, ("symlink", "submodule"), strict=True))
 RULES = Rules(workspaces=(), repos={})
 
 
+class Gone(Refused):
+    """No open handover: its record is gone (pushed, closed or expired), as opposed to unreadable."""
+
+
 @dataclass(frozen=True)
 class Handover:
     id: int
@@ -123,14 +127,14 @@ class Handovers:
         try:
             data = path.read_text()
         except FileNotFoundError:
-            raise Refused(f"No open handover {id}.") from None
+            raise Gone(f"No open handover {id}.") from None
         except OSError as e:
             raise Refused(f"Handover {id} is unreadable: {e.strerror}.") from None
         h = _parse(data, id)
         if h is None:
             raise Refused(f"Handover {id} is unreadable: {path} is not a handover record.")
         if self._expired(h):
-            raise Refused(f"No open handover {id}.")
+            raise Gone(f"No open handover {id}.")
         return h
 
     def open(self) -> list[Handover]:

@@ -193,8 +193,9 @@ KEPT_SHA = "b" * 40
 class FakeKept:
     """Stands in for the kept first push: `push` records itself in the fake GitHub's calls and creates main."""
 
-    def __init__(self, gh, *, open=True, fail=None, pushed=False, lag=False):
+    def __init__(self, gh, *, open=True, fail=None, pushed=False, lag=False, screen_fail=None):
         self.gh = gh
+        self.screen_fail = screen_fail
         self.is_open = open
         self.fail = fail
         self.closed = pushed  # whether the handover was pushed (its record is gone)
@@ -212,6 +213,8 @@ class FakeKept:
 
     def screen(self, id):
         self.screens.append(id)
+        if self.screen_fail:
+            raise self.screen_fail
         return f"Handover {id} screen\n\nRun: git push {id}"
 
     def push(self, id, say):
@@ -706,14 +709,71 @@ def first_push_record(dirs, **kw):
 def test_a_handover_that_is_not_this_setups_first_push_is_not_pushed(setups, dirs, record):
     h = first_push_record(dirs, **record)
     kept = setupcli._Kept(dirs[0])
-    assert kept.open(h.id, REPO) is None
+    reason = f"Handover {h.id} is not a first push of main to {REPO}."
+    with pytest.raises(Refused) as e:
+        kept.open(h.id, REPO)
+    assert str(e.value) == reason
     create(setups, handover=h.id)
     gh = FakeGitHub(repo=None)
     code, out = run(["1"], gh, kept=kept)
     assert code == 1
-    assert "  main:" not in out and "Pushed." not in out
+    assert f"  main: the handover cannot be used: {reason}\n" in out.split("Apply?")[0]
+    assert "Pushed." not in out and "→ push" not in out
     assert "ruleset: deferred: main does not exist yet; push it (gitgatepush), then re-run gitgatesetup 1" in out
     Handovers(dirs[0]).get(h.id)  # left for gitgatepush
+
+
+def test_an_unreadable_handover_record_is_named(setups, dirs):
+    create(setups, handover=7)
+    handovers = Handovers(dirs[0])
+    handovers.dir.mkdir(parents=True, exist_ok=True)
+    (handovers.dir / "7.json").write_text("{not json")
+    kept = setupcli._Kept(dirs[0])
+    with pytest.raises(Refused, match="Handover 7 is unreadable"):
+        kept.open(7, REPO)
+    gh = FakeGitHub(repo=None)
+    code, out = run(["1"], gh, kept=kept)
+    assert code == 1
+    line = next(x for x in out.splitlines() if x.startswith("  main:"))
+    assert line.startswith("  main: the handover cannot be used: Handover 7 is unreadable: ")
+    assert line.endswith("is not a handover record.")
+    assert "Not done yet:" in out and "  main: the handover cannot be used" in out.split("Not done yet:")[1]
+    assert "ruleset: deferred: main does not exist yet; push it (gitgatepush), then re-run gitgatesetup 1" in out
+    assert not gh.writes()[3:]  # the repository, topics and graph only: nothing pushed
+    assert (handovers.dir / "7.json").exists()
+
+
+def test_a_screen_that_fails_ends_the_run_before_the_prompt(setups, dirs):
+    create(setups, handover=7, secrets=("RELEASE_TOKEN",))
+    gh = FakeGitHub(repo=None)
+    kept = FakeKept(gh, screen_fail=Refused("Handover 7 changed while waiting; run it again."))
+    revoke = Revoke()
+    code, out = run(["1"], gh, kept=kept, revoke=revoke)
+    assert code == 1
+    assert "Apply?" not in out
+    assert kept.pushes == [] and not gh.writes()
+    assert revoke.calls == [Tokens(TOKEN, REFRESH)]
+    assert out.splitlines()[-1] == "Handover 7 changed while waiting; run it again."
+    assert "RELEASE_TOKEN" in out
+    assert out.index("Signed out") < out.index("Handover 7 changed while waiting")
+    assert (audit_lines(dirs)[-1]["outcome"], audit_lines(dirs)[-1]["revoked"]) == ("refused", True)
+    setups.get(1)
+
+
+def test_main_is_read_once_per_survey(setups):
+    create(setups, handover=7)
+    gh = all_set(rulesets=[], branch=False)
+    code, _ = run(["1"], gh, answer="n\n")
+    assert code == 1
+    assert [c for c in gh.calls if c[0] == "branch"] == [("branch", REPO, "main")]
+
+
+def test_a_pending_ruleset_survey_still_knows_the_default_branch(setups):
+    s = create(setups, handover=7)
+    gh = all_set(rulesets=[], branch=False)
+    plan = setupcli._survey(gh, s, FakeKept(gh), print)
+    assert any(item.name == "ruleset" and "after main is pushed" in item.line for item in plan.items)
+    assert plan.default == "main"
 
 
 def test_default_kept_pushes_only_the_record_it_showed(dirs):
@@ -728,7 +788,8 @@ def test_default_kept_pushes_only_the_record_it_showed(dirs):
 def test_default_kept_pushes_nothing_it_did_not_open(dirs):
     h = first_push_record(dirs, repo="me/other")
     kept = setupcli._Kept(dirs[0])
-    assert kept.open(h.id, REPO) is None
+    with pytest.raises(Refused, match="not a first push"):
+        kept.open(h.id, REPO)
     with pytest.raises(Refused, match=f"No open handover {h.id}"):
         kept.push(h.id, print)
 
