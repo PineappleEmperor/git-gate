@@ -27,6 +27,8 @@ OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 LINK_MODES = ("120000", "160000")  # symlink, gitlink
 MISSING_PREREQS = ("lacks these prerequisite commits", "Repository lacks")
 BUNDLE_HOWTO = "git bundle create <file> {branch} --not --remotes=origin"
+FIRST_PUSH_HOWTO = "The first-push bundle must hold {branch}'s complete history; make it with: {command}"
+FIRST_PUSH_COMMAND = "git bundle create <dir>/.tmp/{branch}.bundle {branch}"
 
 
 @dataclass(frozen=True)
@@ -115,8 +117,11 @@ class Mirror:
 
     # --- bundles ------------------------------------------------------------------------
 
-    def import_bundle(self, repo: str, bundle: Path, branch: str, rules: Rules) -> str:
+    def import_bundle(self, repo: str, bundle: Path, branch: str, rules: Rules, *, complete: bool = False) -> str:
         """Unbundle refs/heads/<branch> into refs/gate/incoming/<branch>; return its commit.
+
+        With `complete`, the bundle must hold the branch's whole history (a repo's first push): one that
+        builds on other commits is refused, even when this mirror happens to hold them.
 
         Call after `sync`, so prerequisites the bundle needs from GitHub are already here. The
         bundle must be a regular file in gate storage: git would read a directory as a repository.
@@ -137,6 +142,11 @@ class Mirror:
         sha = _oid(heads[0][0])
 
         verify = self._git(repo, rules, ["bundle", "verify", str(bundle)], check=False)
+        said = verify.stdout + verify.stderr
+        # Anything else that fails to verify is not a bundle at all; the refusals below say why.
+        if complete and "complete history" not in said and (verify.returncode == 0 or "prerequisite" in said):
+            command = FIRST_PUSH_COMMAND.format(branch=branch)
+            raise Refused(FIRST_PUSH_HOWTO.format(branch=branch, command=command))
         if verify.returncode != 0:
             if any(s in verify.stderr for s in MISSING_PREREQS):
                 missing = re.findall(r"\b[0-9a-f]{40,64}\b", verify.stderr)

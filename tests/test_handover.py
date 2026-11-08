@@ -1,8 +1,11 @@
+import contextlib
 import io
 import json
 import re
 import shlex
 import stat
+import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -11,7 +14,7 @@ from conftest import TOKEN, commit, git, push
 from git_gate import Refused
 from git_gate.call import MAX_AUDIT
 from git_gate.config import DEFAULT_HANDOVER_PATHS, Rules
-from git_gate.handover import EXPIRES, Handover, Handovers, main, push_command
+from git_gate.handover import EXPIRES, Handover, Handovers, main, push_command, push_kept, screen
 from git_gate.mirror import Mirror, comparison
 
 REPO = "me/app"
@@ -850,3 +853,80 @@ def test_main_rolls_the_audit_log_over(env, m, rules, checkout):
     assert old.read_text() == "x" * MAX_AUDIT
     assert [line["outcome"] for line in audit_lines(env)] == ["pushed"]
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
+
+
+# --- the shared screen and push ------------------------------------------------------------
+
+
+def test_push_kept_pushes_and_closes(env, hs, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    said: list[str] = []
+    push_kept(hs, h.id, m, rules, lambda text="", end="\n", **kw: said.append(text))
+    assert remote_has(env, "feat") == h.sha
+    assert hs.open() == []
+    assert audit_lines(env)[-1]["outcome"] == "pushed"
+    assert said[-1] == f"Pushed. Handover {h.id} is closed."
+
+
+def test_push_kept_failure_raises_and_keeps_open(env, hs, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    seed = env.tmp / "seed"
+    git("push", "-q", env.url, f"{commit(seed, 'moved.txt')}:refs/heads/feat", cwd=seed)
+    with pytest.raises(Refused, match="is still open") as failed:
+        push_kept(hs, h.id, m, rules, lambda *a, **kw: None)
+    assert failed.value.code == 1  # git push's exit status for a rejected push
+    assert hs.open() == [h]
+    assert audit_lines(env)[-1]["outcome"] == "failed"
+
+
+def test_screen_matches_the_gitgatepush_screen(env, hs, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    _, out = run(env, [str(h.id)], "n\n")
+    before = out.split("Push it?")[0]
+    assert before == screen(h, m, rules) + "\n"
+
+
+def test_push_kept_twice_pushes_once(env, hs, m, rules, checkout, monkeypatch):
+    h = stage(env, m, rules, checkout)
+    # Force the interleaving: the caller that holds the mirror lock does not push until the other one
+    # has asked for the lock, so the second always waits and then finds the record gone.
+    asked = []
+    second_asked = threading.Event()
+    real_lock = Mirror.lock
+
+    @contextlib.contextmanager
+    def counted_lock(self, repo):
+        asked.append(repo)
+        if len(asked) == 2:
+            second_asked.set()
+        with real_lock(self, repo):
+            yield
+
+    real_run = subprocess.run
+
+    def held_push(*args, **kwargs):
+        assert second_asked.wait(10), "the second caller never asked for the lock"
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(Mirror, "lock", counted_lock)
+    monkeypatch.setattr("git_gate.handover.subprocess.run", held_push)
+
+    def one(_):
+        try:
+            push_kept(Handovers(env.state), h.id, Mirror(env.gate.git, env.state), rules, lambda *a, **kw: None)
+            return "pushed"
+        except Refused as e:
+            return str(e)
+
+    with ThreadPoolExecutor(2) as pool:
+        outcomes = list(pool.map(one, range(2)))
+    assert sorted(outcomes) == [f"No open handover {h.id}.", "pushed"]
+    assert [line["outcome"] for line in audit_lines(env) if line["tool"] == "gitgatepush"] == ["pushed"]
+    assert remote_has(env, "feat") == h.sha
+
+
+def test_push_kept_audits_under_the_tool_the_caller_names(env, hs, m, rules, checkout):
+    h = stage(env, m, rules, checkout)
+    push_kept(Handovers(env.state), h.id, m, rules, lambda *a, **kw: None, tool="gitgatesetup")
+    last = audit_lines(env)[-1]
+    assert (last["tool"], last["outcome"], last["id"], last["sha"]) == ("gitgatesetup", "pushed", h.id, h.sha)

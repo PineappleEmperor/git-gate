@@ -20,7 +20,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 
 TOOLS = {
     "clone", "fetch", "push", "prune", "pr", "issue", "triage", "workflow_run", "label",
-    "checks", "run", "runs", "release", "file", "api_get",
+    "checks", "run", "runs", "release", "file", "api_get", "repo_setup",
 }  # fmt: skip
 
 

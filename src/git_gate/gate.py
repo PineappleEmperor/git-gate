@@ -1,5 +1,6 @@
 """The gate's tools. Each call re-reads rules and token."""
 
+import contextlib
 import fcntl
 import functools
 import hashlib
@@ -19,14 +20,15 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import NoReturn
 
-from git_gate import Refused, ci, ghpolicy, reads, writes
+from git_gate import Refused, ci, ghpolicy, reads, setup, writes
 from git_gate.call import RETIRED, TOOLS, audit, log_error
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import FromGitHub, GitHub
 from git_gate.gitops import MAX_STDERR, Git
-from git_gate.handover import Handovers
+from git_gate.handover import Handover, Handovers
 from git_gate.mirror import MAX_HAVE, Mirror, Protected, comparison
-from git_gate.paths import copy_in, open_dir, require_absolute, write_out
+from git_gate.paths import copy_in, open_dir, read_workspace_file, require_absolute, write_out
+from git_gate.setup import Setups
 
 MAX_OUTPUT = 200_000
 MAX_BUNDLE = 512 << 20
@@ -507,6 +509,67 @@ class Gate:
         new_name: str | None = None,
     ) -> str:
         return writes.label(self._writes(rules, token), repo, action, name, color, description, new_name)
+
+    def repo_setup(
+        self, rules: Rules, token: str, repo: str, description: str, topics: list[str], ruleset_file: str,
+        bundle: str | None = None, secrets: list[str] | None = None,
+    ) -> str:  # fmt: skip
+        """Record a repository's settings for the user to apply with `gitgatesetup <id>`; no GitHub call.
+
+        With a bundle, the first `main` is kept as an ordinary push handover, as `push` keeps a refused one.
+        """
+        rules.require_write(repo)
+        description = setup.check_description(description)
+        topic_tuple = setup.check_topics(topics)
+        secret_names = setup.check_secrets(secrets)
+        ruleset = setup.check_ruleset(read_workspace_file(rules, ruleset_file, "ruleset"), ruleset_file)
+        kept = self._keep_first_push(rules, repo, bundle) if bundle is not None else None
+        handover = kept.id if kept else None
+        try:
+            request = Setups(self.state, self.clock).create(
+                repo, description, topic_tuple, ruleset, handover=handover, secrets=secret_names
+            )
+        except BaseException:
+            if kept:
+                self._discard_first_push(rules, repo, kept)
+            raise
+        answer = (
+            f"Setup {request.id} recorded for {repo}. Ask the user to run, in their own terminal:\n\n"
+            f"gitgatesetup {request.id}\n\n"
+            "It signs them in to GitHub in the browser, shows what will change, and applies it. Do not retry."
+        )
+        if handover is not None:
+            answer += f" It includes the first push of main (handover {handover})."
+        if secret_names:
+            answer += f" It reminds the user to add the Actions secrets: {', '.join(secret_names)}."
+        return answer
+
+    def _keep_first_push(self, rules: Rules, repo: str, bundle: str) -> Handover:
+        """Keep the bundle's `main` as a handover; the repo may not exist on GitHub, so nothing is synced."""
+        with self._staged("setup") as staged:
+            copy_in(rules, bundle, staged, MAX_BUNDLE, "bundle")
+            with self.mirror.lock(repo):
+                sha = self.mirror.import_bundle(repo, staged, "main", rules, complete=True)
+                patterns = rules.repo(repo).handover_paths
+                found = self.mirror.protected_changes(repo, sha, None, None, patterns, rules)
+                h = self.handovers.create(
+                    repo, "main", sha, None, None, "first push of main, part of a repo setup",
+                    patterns=patterns, protected=found.files, exclude=(),
+                )  # fmt: skip
+                try:
+                    self.mirror.keep(repo, h.ref, sha, rules)
+                except BaseException:
+                    self.handovers.close(h.id)
+                    raise
+        return h
+
+    def _discard_first_push(self, rules: Rules, repo: str, h: Handover) -> None:
+        """Close a first push that kept but whose setup request was never recorded, and drop its ref."""
+        # A failed cleanup must not hide the error that made it necessary.
+        with contextlib.suppress(Refused, OSError):
+            self.handovers.close(h.id)
+        with contextlib.suppress(Refused, OSError), self.mirror.lock(repo):
+            self.mirror.drop(repo, h.ref, rules)
 
     # --- CI status (the reading lives in ci.py) -----------------------------------------
 

@@ -14,8 +14,8 @@ import shlex
 import subprocess
 import sys
 import time
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -38,6 +38,10 @@ LINK_KIND = dict(zip(LINK_MODES, ("symlink", "submodule"), strict=True))
 RULES = Rules(workspaces=(), repos={})
 
 
+class Gone(Refused):
+    """No open handover: its record is gone (pushed, closed or expired), as opposed to unreadable."""
+
+
 @dataclass(frozen=True)
 class Handover:
     id: int
@@ -55,6 +59,33 @@ class Handover:
     @property
     def ref(self) -> str:
         return f"refs/gate/handover/{self.id}"
+
+
+@contextmanager
+def allocate_id(dir: Path, highest: Callable[[], int]) -> Iterator[int]:
+    """Yield the next free id for the records in `dir`, holding the flock on <dir>/next.
+
+    `highest()` is the highest id with a record file, read under the lock. The id is the larger of
+    the counter and one past it, so a lost, stale or corrupt counter can never reuse an id. The
+    counter is advanced before the id is yielded, so a crash before the record is written spends an
+    id rather than reusing it. The lock is held until the caller's `with` body returns, so the
+    record is written before another creator can compute its id.
+    """
+    dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(dir / "next", os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+") as counter:
+        fcntl.flock(counter, fcntl.LOCK_EX)
+        try:
+            stored = int(counter.read().strip())
+        except ValueError:
+            stored = 0
+        number = max(stored if 0 < stored <= MAX_ID else 0, highest() + 1, 1)
+        counter.seek(0)
+        counter.truncate()
+        counter.write(f"{number + 1}\n")
+        counter.flush()
+        os.fsync(counter.fileno())
+        yield number
 
 
 class Handovers:
@@ -79,20 +110,7 @@ class Handovers:
         or corrupt counter can never reuse an id, and the counter is advanced before the record is
         written, so a crash between the two spends an id rather than reusing it.
         """
-        self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(self.dir / "next", os.O_RDWR | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "r+") as counter:
-            fcntl.flock(counter, fcntl.LOCK_EX)
-            try:
-                stored = int(counter.read().strip())
-            except ValueError:
-                stored = 0
-            number = max(stored if 0 < stored <= MAX_ID else 0, self._highest() + 1, 1)
-            counter.seek(0)
-            counter.truncate()
-            counter.write(f"{number + 1}\n")
-            counter.flush()
-            os.fsync(counter.fileno())
+        with allocate_id(self.dir, self._highest) as number:
             h = Handover(
                 number, repo, branch, sha, base, lease, reason, self.clock(),
                 tuple(patterns), tuple(protected), tuple(exclude),
@@ -109,14 +127,14 @@ class Handovers:
         try:
             data = path.read_text()
         except FileNotFoundError:
-            raise Refused(f"No open handover {id}.") from None
+            raise Gone(f"No open handover {id}.") from None
         except OSError as e:
             raise Refused(f"Handover {id} is unreadable: {e.strerror}.") from None
         h = _parse(data, id)
         if h is None:
             raise Refused(f"Handover {id} is unreadable: {path} is not a handover record.")
         if self._expired(h):
-            raise Refused(f"No open handover {id}.")
+            raise Gone(f"No open handover {id}.")
         return h
 
     def open(self) -> list[Handover]:
@@ -240,29 +258,60 @@ def _list(handovers: Handovers, say) -> int:
     return 0
 
 
+class PushFailed(Refused):
+    """The kept push ran and git refused it; `code` is git's exit status."""
+
+    def __init__(self, message: str, code: int):
+        super().__init__(message)
+        self.code = code
+
+
 def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
     rules = RULES
     h = handovers.get(id)
-    _check(h, mirror.git, rules)
-    url = mirror.git.user_push_url(h.repo)
-
-    with mirror.lock(h.repo):
-        mirror_dir = mirror.path(h.repo)
-        _require_commit(mirror, h, mirror_dir, rules)
-        screen = _show(mirror, h, mirror_dir, url, rules)
-    say(screen, lines=True)
-    say()
-    say("Run: " + shlex.join(push_command(h, mirror_dir, url)))
+    say(screen(h, mirror, rules), lines=True)
     say("Push it? [y/N] ", end="")
     if stdin.readline().strip().lower() not in ("y", "yes"):
         say(f"Not pushed. Handover {h.id} stays open.")
         return 1
+    try:
+        push_kept(handovers, id, mirror, rules, say, shown=h)
+    except PushFailed as e:
+        say(str(e))
+        return e.code or 1
+    return 0
 
+
+def screen(h: Handover, mirror: Mirror, rules: Rules) -> str:
+    """Everything gitgatepush prints before its prompt: the confirmation screen and the command to run."""
+    _check(h, mirror.git, rules)
+    url = mirror.git.user_push_url(h.repo)
     with mirror.lock(h.repo):
-        again = handovers.get(id)  # another gitgatepush may have finished it while we waited
-        if again != h:
+        mirror_dir = mirror.path(h.repo)
+        _require_commit(mirror, h, mirror_dir, rules)
+        shown = _show(mirror, h, mirror_dir, url, rules)
+    return f"{shown}\n\nRun: {shlex.join(push_command(h, mirror_dir, url))}"
+
+
+def push_kept(
+    handovers: Handovers, id: int, mirror: Mirror, rules: Rules, say, *, shown: Handover | None = None,
+    tool: str = "gitgatepush",
+) -> None:  # fmt: skip
+    """Push a kept handover once the user has said yes; `shown` is the record they were shown, if known.
+    The audit line names `tool`, the command the user ran.
+
+    Raises Refused when the record changed or went away, and PushFailed (a Refused) when git refused the push.
+    """
+    first = shown or handovers.get(id)  # only names the repo to lock; the record is re-read under the lock
+    url = mirror.git.user_push_url(first.repo)
+    with mirror.lock(first.repo):
+        h = handovers.get(id)  # another gitgatepush may have finished it while we waited for the lock
+        if shown is not None and h != shown:
             raise Refused(f"Handover {id} changed while waiting; run it again.")
-        _check(again, mirror.git, rules)
+        if h.repo != first.repo:
+            raise Refused(f"Handover {id} changed while waiting; run it again.")
+        _check(h, mirror.git, rules)
+        mirror_dir = mirror.path(h.repo)
         _require_commit(mirror, h, mirror_dir, rules)
         proc = subprocess.run(
             push_command(h, mirror_dir, url), stdin=subprocess.DEVNULL, capture_output=True, text=True,
@@ -272,24 +321,23 @@ def _run(handovers: Handovers, id: int, mirror: Mirror, stdin, say) -> int:
         if output:
             say(output, lines=True)
         if proc.returncode != 0:
-            _audit(mirror.state, h, "failed", say)
-            say(f"git push failed (exit {proc.returncode}). Handover {h.id} is still open.")
-            return proc.returncode or 1
+            _audit(mirror.state, h, "failed", say, tool)
+            failed = f"git push failed (exit {proc.returncode}). Handover {h.id} is still open."
+            raise PushFailed(failed, proc.returncode)
         handovers.close(h.id)
-        _audit(mirror.state, h, "pushed", say)
+        _audit(mirror.state, h, "pushed", say, tool)
         try:
             mirror.drop(h.repo, h.ref, rules)
         except Refused as e:
             say(f"Pushed, but the gate's mirror could not drop {h.ref}: {e}")
-            return 0
-    say(f"Pushed. Handover {h.id} is closed.")
-    return 0
+        else:
+            say(f"Pushed. Handover {h.id} is closed.")
 
 
-def _audit(state: Path, h: Handover, outcome: str, say) -> None:
+def _audit(state: Path, h: Handover, outcome: str, say, tool: str) -> None:
     """One audit.log line per handover push, beside the gate's own lines for the tool calls."""
     line = json.dumps({
-        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": "gitgatepush", "id": h.id, "repo": h.repo,
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "id": h.id, "repo": h.repo,
         "branch": h.branch, "sha": h.sha, "outcome": outcome,
     })  # fmt: skip
     try:

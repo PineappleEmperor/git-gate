@@ -73,6 +73,11 @@ escapes and control characters.
   pretty-printed. No other host, no `..`, no GraphQL, no jq.
 - `triage`, `label`, `workflow_run`: labels, assignees and reviewers; label definitions; rerun or
   cancel a run off the default and protected branches.
+- `repo_setup(repo, description, topics, ruleset_file, bundle?, secrets?)`: records how a repository
+  should be set up (a description, topics, a branch ruleset read from a `*.json` file in the
+  workspace; optionally the first `main` as a bundle, kept as a push handover, and the names of
+  Actions secrets it needs) and answers with `gitgatesetup <id>` for the user. It never calls GitHub.
+  See [Repo setup](#repo-setup).
 
 With `wait=true`, `checks` and `run` poll GitHub inside the one call: every 15 s, then 30 s, then
 every 60 s, until nothing is queued or in progress. A rate limit is waited out rather than failing:
@@ -115,8 +120,8 @@ upgrade, run the new release's steps yourself:
 
 Or upgrade with the extracted script, as for a first install, which needs no extra step.
 
-Each install and rollback also links `/usr/local/bin/gitgatepush` and `/usr/local/bin/gitgaterules`
-to the same names in `/opt/git-gate/current/bin/` (override the directory with `GIT_GATE_BIN_DIR`),
+Each install and rollback also links `/usr/local/bin/gitgatepush`, `/usr/local/bin/gitgaterules` and
+`/usr/local/bin/gitgatesetup` to the same names in `/opt/git-gate/current/bin/` (override the directory with `GIT_GATE_BIN_DIR`),
 then checks that each name in your shell resolves to its link and warns, naming the other path, if
 it does not. The launchers refuse to run from anywhere but `/opt/git-gate/releases/`.
 
@@ -230,9 +235,60 @@ delete old ones yourself.
 Releases from before session rules refuse every call while `rules.toml` is v2. To roll back to one,
 restore the v1 backup first.
 
+## Repo setup
+
+`repo_setup` only records a request. `gitgatesetup`, run in your own terminal, applies it as you,
+with a GitHub App you own; the gate's own token is not involved. There is no `gh`.
+
+Once, register the app:
+
+```bash
+gitgatesetup --register
+```
+
+It opens GitHub, where you confirm the app's creation (a private app, Administration write and
+Metadata read, no webhook). It saves only `client_id`, `slug` and `owner` to
+`~/.config/git-gate/setup-app.json`; the app's secrets are dropped unread. Then install the app on
+**All repositories** (the command prints the link) and make sure **Enable Device Flow** is ticked in
+the app's settings.
+
+For each request:
+
+```bash
+gitgatesetup <id>      # an id from the repo_setup reply; with no id, lists open setups
+```
+
+1. It signs you in through GitHub's device flow in the browser. The token stays in memory and is
+   never printed or stored.
+2. The repo must be under your personal account; organisation repos are refused.
+3. It shows one `current → wanted` line per item, then the kept first push of `main`, if the
+   request has one, as `gitgatepush` would show it, and asks `Apply? [y/N]` once.
+4. It applies, in order: the repository (created public if absent), description, Issues, topics,
+   dependency graph, the first push of `main` over your own SSH key, and the ruleset. Then it reads
+   every item back.
+5. It reminds you of each Actions secret the request named, with its link,
+   `https://github.com/<repo>/settings/secrets/actions/new`; it cannot read secrets, so you add them
+   yourself and they never keep a setup open.
+6. It revokes its token at GitHub, however the run ends (Ctrl-C, a closed terminal or SIGTERM
+   included), and says `Signed out: GitHub revoked this run's token.` once GitHub confirms it. If
+   GitHub does not, it prints a warning with the page to revoke it by hand; the token expires after
+   8 hours anyway.
+
+The setup closes only when everything verified; otherwise it stays open and says what is left.
+Exit status is 0 when closed, 1 when still open or refused, 2 for usage.
+
+The ruleset goes on after `main` is pushed, since its required checks would refuse the push that
+creates it, so a new repo with a first push closes in one run. `main` is never pushed over: if it
+already exists on GitHub, the push is `already set` and the handover stays for `gitgatepush`. Only
+when the request has no bundle and `main` does not exist yet is the ruleset deferred: push `main`
+with `gitgatepush`, then run `gitgatesetup <id>` again. If GitHub does not show a `main` that was
+just pushed yet, the run says so and asks you to re-run in a moment. GitHub records the changes as
+made by you; the app's name shows only in your security log. Local clone settings such as
+`core.hooksPath` are left alone.
+
 ## Audit log
 
-Every tool call, and every `gitgatepush` push, appends one JSON line to
+Every tool call, every `gitgatepush` push and every `gitgatesetup <id>` run appends one JSON line to
 `~/.local/state/git-gate/audit.log` (mode 0600). The token never appears in it. A tool call never
 fails over its audit line: if the line cannot be written, `errors.log` beside it says so. A tool
 call's line:
@@ -255,7 +311,11 @@ call's line:
   for the state, and the seconds it slept between those polls.
 
 A `gitgatepush` line has `time`, `tool` (`gitgatepush`), `id`, `repo`, `branch`, `sha` and `outcome`
-(`pushed` or `failed`). Lines from older releases lack the newer fields.
+(`pushed` or `failed`). When `gitgatesetup` pushes a kept first `main`, that push is logged the same way with `tool`
+`gitgatesetup`, beside the run's own line. A `gitgatesetup` line has `time`, `tool` (`gitgatesetup`), `id`, `repo`,
+`outcome` (`closed`, `open`, `declined` or `refused`) and `revoked`: `true` once GitHub confirmed the
+token dead, `false` when it did not, `null` when the run never signed in. Lines from older releases
+lack the newer fields.
 
 At 8 MiB, `audit.log` is renamed to `audit.log.<YYYYmmddTHHMMSS>`, with `.<n>` added if that name is
 taken. The gate never deletes these files: remove old ones yourself.

@@ -504,3 +504,130 @@ def test_a_missing_log_is_githubs_answer():
     with pytest.raises(GitHubError) as e:
         gh.job_log("me/app", 9)
     assert e.value.status == 410
+
+
+# --- the repository admin calls gitgatesetup makes -------------------------------------------------
+
+RULESET = {"name": "Protect main", "target": "branch", "enforcement": "active", "rules": [{"type": "deletion"}]}
+
+
+def test_viewer_is_the_users_login():
+    gh = make({("GET", "user"): {"login": "me"}})
+    assert gh.viewer() == "me"
+    assert gh._opener.calls == [("GET", "user", None)]
+
+
+def test_repo_reads_the_repository_and_404_is_none():
+    gh = make({("GET", "repos/me/app"): {"full_name": "me/app", "default_branch": "main"}})
+    assert gh.repo("me/app")["default_branch"] == "main"
+    assert make({("GET", "repos/me/gone"): 404}).repo("me/gone") is None
+
+
+def test_repo_other_errors_refuse():
+    with pytest.raises(Refused, match="500"):
+        make({("GET", "repos/me/app"): 500}).repo("me/app")
+
+
+ADMIN_CASES = [
+    (
+        lambda g: g.create_user_repo("app", "An app"),
+        [
+            (
+                "POST",
+                "user/repos",
+                {"name": "app", "description": "An app", "has_issues": True, "auto_init": False, "private": False},
+            )
+        ],
+    ),
+    (lambda g: g.edit_repo("me/app", description="d"), [("PATCH", "repos/me/app", {"description": "d"})]),
+    (lambda g: g.edit_repo("me/app", has_issues=True), [("PATCH", "repos/me/app", {"has_issues": True})]),
+    (
+        lambda g: g.edit_repo("me/app", description="", has_issues=False),
+        [("PATCH", "repos/me/app", {"description": "", "has_issues": False})],
+    ),
+    (lambda g: g.set_topics("me/app", ("a", "b")), [("PUT", "repos/me/app/topics", {"names": ["a", "b"]})]),
+    (
+        lambda g: g.enable_dependency_graph("me/app"),
+        [("PATCH", "repos/me/app", {"security_and_analysis": {"dependency_graph": {"status": "enabled"}}})],
+    ),
+    (lambda g: g.update_ruleset("me/app", 42, RULESET), [("PUT", "repos/me/app/rulesets/42", RULESET)]),
+]
+
+
+@pytest.mark.parametrize(("act", "expected"), ADMIN_CASES)
+def test_admin_write_endpoints(act, expected):
+    gh = make()
+    act(gh)
+    assert gh._opener.calls == expected
+
+
+def test_topics_are_the_names():
+    gh = make({("GET", "repos/me/app/topics"): {"names": ["a", "b"]}})
+    assert gh.topics("me/app") == ["a", "b"]
+    assert gh._opener.calls == [("GET", "repos/me/app/topics", None)]
+
+
+SBOM = ("GET", "repos/me/app/dependency-graph/sbom")
+
+
+@pytest.mark.parametrize(("status", "on"), [("enabled", True), ("disabled", False)])
+def test_dependency_graph_status_comes_from_security_and_analysis(status, on):
+    live = {"security_and_analysis": {"dependency_graph": {"status": status}}}
+    gh = make({("GET", "repos/me/app"): live})
+    assert gh.dependency_graph_on("me/app") is on
+    assert gh._opener.calls == [("GET", "repos/me/app", None)]  # no SBOM read
+    gh = make()
+    assert gh.dependency_graph_on("me/app", live) is on
+    assert gh._opener.calls == []  # the repository object the caller already holds
+
+
+@pytest.mark.parametrize(
+    ("reply", "on"),
+    [(b'{"sbom": {}}', True), (404, None), ((403, "Resource not accessible by integration", {}), None)],
+)
+def test_dependency_graph_without_a_status_reads_the_sbom(reply, on):
+    gh = make({SBOM: reply})
+    assert gh.dependency_graph_on("me/app", {"security_and_analysis": {"advanced_security": {}}}) is on
+    assert gh._opener.calls == [(*SBOM, None)]
+
+
+def test_dependency_graph_rate_limit_still_refuses():
+    gh = make({SBOM: (403, "API rate limit exceeded", {})})
+    with pytest.raises(RateLimited):
+        gh.dependency_graph_on("me/app", {})
+
+
+def test_rulesets_lists_the_repositorys_own_page_by_page():
+    first = [{"id": n, "name": f"r{n}", "target": "branch"} for n in range(100)]
+    gh = make({
+        ("GET", "repos/me/app/rulesets?includes_parents=false&per_page=100&page=1"): first,
+        ("GET", "repos/me/app/rulesets?includes_parents=false&per_page=100&page=2"): [{"id": 100}],
+    })  # fmt: skip
+    assert [r["id"] for r in gh.rulesets("me/app")] == list(range(101))
+    assert len(gh._opener.calls) == 2
+
+
+def test_ruleset_reads_one_in_full():
+    gh = make({("GET", "repos/me/app/rulesets/42"): {"id": 42, **RULESET}})
+    assert gh.ruleset("me/app", 42)["rules"] == RULESET["rules"]
+
+
+def test_create_ruleset_posts_and_returns_the_id():
+    gh = make({("POST", "repos/me/app/rulesets"): {"id": 7}})
+    assert gh.create_ruleset("me/app", RULESET) == 7
+    assert gh._opener.calls == [("POST", "repos/me/app/rulesets", RULESET)]
+
+
+def test_branch_rule_rulesets_keeps_the_required_checks():
+    checks = {"type": "required_status_checks", "ruleset_id": 9, "ruleset_source_type": "Repository"}
+    gh = make({("GET", "repos/me/app/rules/branches/main"): [{"type": "deletion", "ruleset_id": 9}, checks]})
+    assert gh.branch_rule_rulesets("me/app", "main") == [checks]
+    assert make({("GET", "repos/me/app/rules/branches/main"): 404}).branch_rule_rulesets("me/app", "main") == []
+
+
+def test_admin_errors_name_the_status_without_the_token():
+    gh = GitHub("ghu_secret")
+    gh._opener = FakeOpener({("PUT", "repos/me/app/topics"): (403, "nope ghu_secret", {})})
+    with pytest.raises(GitHubError) as e:
+        gh.set_topics("me/app", ["a"])
+    assert e.value.status == 403 and "ghu_secret" not in str(e.value)

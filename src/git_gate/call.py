@@ -20,7 +20,7 @@ from git_gate.config import state_dir
 # The only list of tool names: the server registers exactly these, and Gate.dispatch accepts only these.
 TOOLS = (
     "clone", "fetch", "push", "prune", "pr", "issue", "triage", "workflow_run", "label",
-    "checks", "run", "runs", "release", "file", "api_get",
+    "checks", "run", "runs", "release", "file", "api_get", "repo_setup",
 )  # fmt: skip
 # Tools older releases registered. Their conversations call them through this release's relay until
 # they end, so the gate still answers each call: with a refusal naming what replaces it.
