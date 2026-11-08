@@ -526,8 +526,9 @@ class Gate:
         kept = self._keep_first_push(rules, repo, bundle) if bundle is not None else None
         handover = kept.id if kept else None
         try:
+            created = kept.created if kept else None  # a request expires no later than its first push
             request = Setups(self.state, self.clock).create(
-                repo, description, topic_tuple, ruleset, handover=handover, secrets=secret_names
+                repo, description, topic_tuple, ruleset, handover=handover, secrets=secret_names, created=created
             )
         except BaseException:
             if kept:

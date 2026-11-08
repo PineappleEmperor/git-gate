@@ -145,6 +145,14 @@ def test_refusals_name_the_session_and_the_command(cfg):
     with pytest.raises(Refused) as e:
         a.require_write("up/core")
     assert f"gitgaterules grant {folder} write up/core" in str(e.value)
+    with pytest.raises(Refused) as e:
+        a.require_write("me/other")
+    assert f"This session ({folder}) has no access to me/other" in str(e.value)
+    assert f"gitgaterules grant {folder} write me/other" in str(e.value)
+    assert "grant read" not in str(e.value)
+    with pytest.raises(Refused) as e:
+        a.access("me/other")
+    assert f"gitgaterules grant {folder} read me/other" in str(e.value)
 
 
 def test_access_level_for_the_audit(cfg):

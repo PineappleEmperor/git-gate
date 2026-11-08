@@ -2,6 +2,8 @@
 
 import contextlib
 import json
+import signal
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -27,6 +29,7 @@ NOT_CONFIRMED = (
     "Revoke it at https://github.com/settings/apps/authorizations"
 )
 EXPIRED = "The sign-in code expired before it was approved. Run the command again."
+HELD = (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)  # held back while a token is requested and handed over
 
 
 def _snippet(raw: bytes) -> str:
@@ -94,16 +97,29 @@ def revoke(
     sleep: Callable[[float], None] = time.sleep,
     say: Callable[[str], None],
 ) -> bool:
-    """Revoke the run's tokens at GitHub, then confirm the access token is dead; say how it went. When
-    GitHub refuses the access and refresh tokens together, the access token is sent alone once more."""
-    credentials = [login.token] + ([login.refresh] if login.refresh else [])
+    """Revoke the run's tokens at GitHub, then confirm the access token is dead; say how it went. The
+    access token is sent on its own, then the refresh token on its own, once each; the refresh token is
+    never exchanged. Only a 202 for both lets the access token's death be checked."""
     try:
-        status = post(REVOKE_URL, {"credentials": credentials})
-        if status != 202 and login.refresh:  # GitHub may refuse the pair: the access token alone, once more
+        try:
             status = post(REVOKE_URL, {"credentials": [login.token]})
-        if status != 202:
-            say(f"GitHub refused the revocation ({status}).")
+        except Refused as e:  # unreachable: the refresh token is still sent, and nothing is confirmed
+            status = None
+            say(str(e))
         else:
+            if status != 202:
+                say(f"GitHub refused the revocation ({status}).")
+        refreshed = 202
+        if login.refresh:
+            try:
+                refreshed = post(REVOKE_URL, {"credentials": [login.refresh]})
+            except Refused as e:
+                refreshed = None
+                say(str(e))
+            else:
+                if refreshed != 202:
+                    say(f"GitHub refused the refresh token's revocation ({refreshed}).")
+        if status == 202 and refreshed == 202:
             for _ in range(CHECKS):
                 sleep(CHECK_GAP)
                 if not alive(login.token):
@@ -119,6 +135,21 @@ def revoke(
     return False
 
 
+@contextlib.contextmanager
+def _held():
+    """Hold back Ctrl-C and hangups while the body runs, so one that comes meanwhile lands after it;
+    on the main thread only (signals reach no other). The answer's TIMEOUT bounds the wait."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, ())  # the mask as it is; an interrupt here changes nothing
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, HELD)  # may run a pending handler: the finally unmasks
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)  # one that came meanwhile interrupts now
+
+
 def _number(value, default: float) -> float:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else default
 
@@ -131,8 +162,11 @@ def device_login(
     post: Callable[[str, dict], dict] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    got: Callable[[Login], object] = lambda login: None,
 ) -> Login:
-    """Run the device flow and return the user's tokens; raise Refused if it does not complete."""
+    """Run the device flow and return the user's tokens; raise Refused if it does not complete. `got`
+    is handed the tokens the moment GitHub sends them, before anything else can interrupt the
+    sign-in, so the caller can revoke them whatever happens next."""
     post = post or _post
     first = post(CODE_URL, {"client_id": client_id})
     if "error" in first:
@@ -151,11 +185,14 @@ def device_login(
             sleep(interval)
             if clock() >= deadline:
                 raise Refused(EXPIRED)
-            answer = post(TOKEN_URL, {"client_id": client_id, "device_code": device_code, "grant_type": GRANT})
-            token = answer.get("access_token")
-            if isinstance(token, str) and token:
-                refresh = answer.get("refresh_token")
-                return Login(token, refresh if isinstance(refresh, str) and refresh else None)
+            with _held():  # a token GitHub issues is handed over before an interrupt can land
+                answer = post(TOKEN_URL, {"client_id": client_id, "device_code": device_code, "grant_type": GRANT})
+                token = answer.get("access_token")
+                if isinstance(token, str) and token:
+                    refresh = answer.get("refresh_token")
+                    login = Login(token, refresh if isinstance(refresh, str) and refresh else None)
+                    got(login)
+                    return login
             error = answer.get("error")
             if error == "authorization_pending":
                 continue

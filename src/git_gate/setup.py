@@ -4,15 +4,19 @@ The agent proposes a description, topics and a ruleset file; this module checks 
 as a record under <state>/setups/<id>.json. Nothing here calls GitHub.
 """
 
+import contextlib
+import fcntl
 import json
+import math
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from git_gate import Refused
+from git_gate.config import valid_repo
 from git_gate.handover import EXPIRES, ID_RE, allocate_id
 from git_gate.writes import _line, _show
 
@@ -25,6 +29,7 @@ RULESET_KEYS = {"name", "target", "enforcement", "conditions", "rules", "bypass_
 REQUIRED_RULES = ("deletion", "non_fast_forward")
 MAX_SECRETS = 10
 SECRET_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,99}")  # fullmatch only
+FUTURE_SLACK = 60  # seconds a record's created time may lie ahead of the clock (clock skew between writers)
 
 
 @dataclass(frozen=True)
@@ -125,7 +130,8 @@ def check_ruleset(data: bytes, path: str) -> dict:
 
 
 class Setups:
-    """JSON records under <state>/setups/<id>.json, ids from the flock-guarded <state>/setups/next."""
+    """JSON records under <state>/setups/<id>.json, ids from the flock-guarded <state>/setups/next. A run
+    of `gitgatesetup <id>` holds the flock on <state>/setups/<id>.lock."""
 
     def __init__(self, state: Path, clock: Callable[[], float] = time.time):
         self.dir = state / "setups"
@@ -133,10 +139,13 @@ class Setups:
 
     def create(
         self, repo: str, description: str, topics: tuple[str, ...], ruleset: dict, *,
-        handover: int | None = None, secrets: tuple[str, ...] = (),
+        handover: int | None = None, secrets: tuple[str, ...] = (), created: float | None = None,
     ) -> SetupRequest:  # fmt: skip
+        """Record a request under the next free id. `created` is its handover's creation time when it has
+        one, so the request expires no later than the first push it holds."""
         with allocate_id(self.dir, self._highest) as number:
-            s = SetupRequest(number, repo, description, tuple(topics), ruleset, self.clock(), handover, tuple(secrets))
+            when = self.clock() if created is None else created
+            s = SetupRequest(number, repo, description, tuple(topics), ruleset, when, handover, tuple(secrets))
             self._write(s)
             self._purge()
         return s
@@ -154,13 +163,62 @@ class Setups:
             raise Refused(f"Setup {id} is unreadable: {path} is not a setup record.")
         if self._expired(s):
             raise Refused(f"No open setup {id}.")
+        try:
+            _recheck(s, path, self.clock())
+        except Refused as e:
+            raise Refused(f"Setup {id} is unreadable: {e}") from None
         return s
+
+    @contextlib.contextmanager
+    def running(self, id: int) -> Iterator[None]:
+        """Hold the exclusive flock on <state>/setups/<id>.lock (0600) while the body runs; a second
+        holder, in this process or another, is refused at once."""
+        path = self._path(id).with_suffix(".lock")
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except FileNotFoundError:
+            raise Refused(f"No open setup {id}.") from None
+        except OSError as e:
+            raise Refused(f"Setup {id} is unreadable: {e.strerror}.") from None
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Refused(f"Setup {id} is already running.") from None
+            yield
+        finally:
+            os.close(fd)
+
+    def listed(self) -> list[tuple[int, SetupRequest | None]]:
+        """Every record that has not expired, by id, with None for one that does not parse or fails the
+        checks `get` runs; a record that vanishes meanwhile is left out."""
+        found: list[tuple[int, SetupRequest | None]] = []
+        for path in self.dir.glob("*.json") if self.dir.is_dir() else ():
+            if not ID_RE.fullmatch(path.stem):
+                continue
+            try:
+                s = _parse(path.read_text(), int(path.stem))
+            except FileNotFoundError:
+                continue
+            except OSError:
+                s = None
+            if s is not None and self._expired(s):
+                continue
+            if s is not None:
+                try:
+                    _recheck(s, path, self.clock())
+                except Refused:
+                    s = None
+            found.append((int(path.stem), s))
+        return sorted(found, key=lambda pair: pair[0])
 
     def open(self) -> list[SetupRequest]:
         return [s for s in self._all() if not self._expired(s)]
 
     def close(self, id: int) -> None:
-        self._path(id).unlink(missing_ok=True)
+        path = self._path(id)
+        path.unlink(missing_ok=True)
+        path.with_suffix(".lock").unlink(missing_ok=True)  # a later run finds no record, whatever lock it takes
 
     def _path(self, id: int) -> Path:
         if not isinstance(id, int) or isinstance(id, bool) or id < 1:
@@ -182,6 +240,18 @@ class Setups:
         for s in self._all():
             if self._expired(s):
                 self.close(s.id)
+        # A record that does not parse, or whose created time is not a real one (NaN, infinite), has no
+        # time to expire by: its file's age stands in for it.
+        for path in self.dir.glob("*.json") if self.dir.is_dir() else ():
+            if not ID_RE.fullmatch(path.stem):
+                continue
+            try:
+                s = _parse(path.read_text(), int(path.stem))
+                timeless = s is None or not math.isfinite(s.created)
+                if timeless and self.clock() - path.stat().st_mtime > EXPIRES:
+                    self.close(int(path.stem))
+            except OSError:  # unreadable or gone meanwhile: left for a later purge
+                continue
 
     def _highest(self) -> int:
         """The highest id with a record file, readable or not."""
@@ -199,6 +269,23 @@ class Setups:
                 if s:
                     found.append(s)
         return sorted(found, key=lambda s: s.id)
+
+
+def _recheck(s: SetupRequest, path: Path, now: float) -> None:
+    """Refused unless the record passes, unchanged, the checks repo_setup ran before recording it, and
+    its created time is a real one no later than `now` (with FUTURE_SLACK), so it cannot dodge expiry."""
+    if not math.isfinite(s.created) or s.created > now + FUTURE_SLACK:
+        raise Refused(f"created {_show(s.created)} is not a past time.")
+    if not valid_repo(s.repo):
+        raise Refused(f"{_show(s.repo)} is not an owner/name repository.")
+    if check_description(s.description) != s.description:
+        raise Refused(f"description {_show(s.description)} is not as repo_setup checks it.")
+    check_topics(s.topics)
+    check_ruleset(json.dumps(s.ruleset).encode(), str(path))
+    if check_secrets(list(s.secrets) or None) != s.secrets:
+        raise Refused(f"secret names {_show(s.secrets)} are not as repo_setup checks them.")
+    if s.handover is not None and s.handover < 1:
+        raise Refused(f"handover {s.handover} is not a handover id.")
 
 
 def _parse(text: str, id: int) -> SetupRequest | None:

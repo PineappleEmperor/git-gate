@@ -281,7 +281,9 @@ Expect, in this order:
      `  RELEASE_TOKEN: https://github.com/<scratch>/settings/secrets/actions/new`;
    - `Signed out: GitHub revoked this run's token.`
 
-Exit status is 0. GitHub sends a notification that a credential was revoked. The repo exists with
+Exit status is 0. GitHub sends a notification that a credential was revoked (the access and the
+refresh token are revoked in two requests, so there may be one per token); no `GitHub refused`
+line appears. The repo exists with
 `main` at the pushed commit and the ruleset under Settings, Rules, and its default branch is `main`.
 `gitgatepush` with no id lists no handover for the pushed `main`.
 
@@ -292,7 +294,8 @@ created in the same run is not read. Record whether the PATCH took (no `Applying
 failed`). Whether this token can read the status shows only on step 6's re-run.
 
 6. User: run `gitgatesetup <id>` once more. Then Agent: send a new `repo_setup` for `<scratch>` with
-   the same values, with `secrets` but without `bundle`, and the user runs its id.
+   the same values, with `secrets` but without `bundle`, and the user runs its id. While that run
+   waits at its sign-in, the user runs the same `gitgatesetup <id>` in a second terminal.
 
 Expect: the first gives `No open setup <id>.` and a non-zero status, and since it never signed in it
 prints no `Signed out` line. The second signs in, lists every item as `already set`, asks no
@@ -300,6 +303,8 @@ prints no `Signed out` line. The second signs in, lists every item as `already s
 Record the second run's `dependency graph` line: `already set` means this token can read the
 status. If it shows `unknown → enabled` instead, the status is unreadable: it shows so on every run,
 `Apply?` is asked for it alone, and the setup closes in that run because GitHub accepted the PATCH.
+The run in the second terminal prints `Setup <id> is already running.` at once, shows no sign-in
+code, prints no `Signed out` line, and exits 1.
 
 7. User: the token is revoked at the end of each run and kept nowhere. Run
    `grep -rE 'gh[ur]_' ~/.config/git-gate ~/.local/state/git-gate` after a run, check that the run's

@@ -59,6 +59,14 @@ def test_an_ungranted_repo_is_refused_with_the_grant_command(scoped):
     assert f"gitgaterules grant {scoped.ws} read nobody/x" in str(e.value)
 
 
+def test_an_ungranted_repo_refused_to_a_write_tool_suggests_a_write_grant(scoped):
+    with pytest.raises(Refused) as e:
+        call(scoped, "prune", repo="nobody/x", branch="feat")
+    assert f"This session ({scoped.ws}) has no access to nobody/x" in str(e.value)
+    grant = f"Only the user can grant write access, from their own terminal:\n\ngitgaterules grant {scoped.ws} write"
+    assert f"{grant} nobody/x" in str(e.value)
+
+
 def test_a_read_grant_reads_but_does_not_write(scoped, monkeypatch):
     monkeypatch.chdir(scoped.other)
     (scoped.other / ".tmp").mkdir()
