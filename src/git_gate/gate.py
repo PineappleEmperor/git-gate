@@ -1,5 +1,6 @@
 """The gate's tools. Each call re-reads rules and token."""
 
+import contextlib
 import fcntl
 import functools
 import hashlib
@@ -24,7 +25,7 @@ from git_gate.call import RETIRED, TOOLS, audit, log_error
 from git_gate.config import REPO_RE, Rules, check_enabled, config_dir, load_rules, load_token, state_dir
 from git_gate.github import FromGitHub, GitHub
 from git_gate.gitops import MAX_STDERR, Git
-from git_gate.handover import Handovers
+from git_gate.handover import Handover, Handovers
 from git_gate.mirror import MAX_HAVE, Mirror, Protected, comparison
 from git_gate.paths import copy_in, open_dir, read_workspace_file, require_absolute, write_out
 from git_gate.setup import Setups
@@ -522,12 +523,16 @@ class Gate:
         topic_tuple = setup.check_topics(topics)
         secret_names = setup.check_secrets(secrets)
         ruleset = setup.check_ruleset(read_workspace_file(rules, ruleset_file, "ruleset"), ruleset_file)
-        handover = None
-        if bundle is not None:
-            handover = self._keep_first_push(rules, repo, bundle).id
-        request = Setups(self.state, self.clock).create(
-            repo, description, topic_tuple, ruleset, handover=handover, secrets=secret_names
-        )
+        kept = self._keep_first_push(rules, repo, bundle) if bundle is not None else None
+        handover = kept.id if kept else None
+        try:
+            request = Setups(self.state, self.clock).create(
+                repo, description, topic_tuple, ruleset, handover=handover, secrets=secret_names
+            )
+        except BaseException:
+            if kept:
+                self._discard_first_push(rules, repo, kept)
+            raise
         answer = (
             f"Setup {request.id} recorded for {repo}. Ask the user to run, in their own terminal:\n\n"
             f"gitgatesetup {request.id}\n\n"
@@ -539,21 +544,12 @@ class Gate:
             answer += f" It reminds the user to add the Actions secrets: {', '.join(secret_names)}."
         return answer
 
-    def _keep_first_push(self, rules: Rules, repo: str, bundle: str):
+    def _keep_first_push(self, rules: Rules, repo: str, bundle: str) -> Handover:
         """Keep the bundle's `main` as a handover; the repo may not exist on GitHub, so nothing is synced."""
-        howto = "git bundle create <dir>/.tmp/main.bundle main"
         with self._staged("setup") as staged:
             copy_in(rules, bundle, staged, MAX_BUNDLE, "bundle")
             with self.mirror.lock(repo):
-                verify = self.git.run(
-                    ["bundle", "verify", str(staged)], timeout=rules.git_timeout,
-                    git_dir=self.mirror.path(repo), check=False,
-                )  # fmt: skip
-                said = verify.stdout + verify.stderr
-                # Anything else that fails to verify is not a bundle at all; import_bundle says why.
-                if "complete history" not in said and (verify.returncode == 0 or "prerequisite" in said):
-                    raise Refused(f"The first-push bundle must hold main's complete history; make it with: {howto}")
-                sha = self.mirror.import_bundle(repo, staged, "main", rules)
+                sha = self.mirror.import_bundle(repo, staged, "main", rules, complete=True)
                 patterns = rules.repo(repo).handover_paths
                 found = self.mirror.protected_changes(repo, sha, None, None, patterns, rules)
                 h = self.handovers.create(
@@ -566,6 +562,13 @@ class Gate:
                     self.handovers.close(h.id)
                     raise
         return h
+
+    def _discard_first_push(self, rules: Rules, repo: str, h: Handover) -> None:
+        """Close a first push that kept but whose setup request was never recorded, and drop its ref."""
+        self.handovers.close(h.id)
+        # A failed cleanup must not hide the error that made it necessary.
+        with contextlib.suppress(Refused, OSError), self.mirror.lock(repo):
+            self.mirror.drop(repo, h.ref, rules)
 
     # --- CI status (the reading lives in ci.py) -----------------------------------------
 

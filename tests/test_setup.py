@@ -6,6 +6,7 @@ import pytest
 
 from conftest import call, commit, git, make_bundle
 from git_gate import Refused
+from git_gate.gate import InternalError
 from git_gate.handover import EXPIRES, Handovers
 from git_gate.setup import Setups, check_description, check_ruleset, check_secrets, check_topics
 
@@ -289,6 +290,30 @@ def test_repo_setup_bundle_needs_complete_history(env):
         call(env, "repo_setup", **_request(env, bundle=str(bundle)))
     assert not list((env.gate.state / "setups").glob("*.json"))
     assert Handovers(env.gate.state).open() == []
+
+
+def test_repo_setup_bundle_needs_complete_history_even_when_the_mirror_holds_the_prerequisites(env):
+    bundle, first, _ = _first_push(env)
+    call(env, "repo_setup", **_request(env, bundle=str(bundle)))  # the mirror now holds both commits
+    partial = make_bundle(env.ws / "fresh", env.ws / "partial.bundle", "main", first)
+    with pytest.raises(Refused, match="complete history"):
+        call(env, "repo_setup", **_request(env, bundle=str(partial)))
+    assert len(list((env.gate.state / "setups").glob("*.json"))) == 1
+    assert [h.id for h in Handovers(env.gate.state).open()] == [1]
+
+
+def test_repo_setup_closes_its_handover_when_the_request_cannot_be_recorded(env, monkeypatch):
+    bundle, _, _ = _first_push(env)
+
+    def broken(self, *args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Setups, "create", broken)
+    with pytest.raises(InternalError, match="disk full"):
+        call(env, "repo_setup", **_request(env, bundle=str(bundle)))
+    assert Handovers(env.gate.state).open() == []
+    refs = git("--git-dir", str(env.gate.mirror.path("me/app")), "for-each-ref", "refs/gate/handover", cwd=env.tmp)
+    assert refs == ""
 
 
 def test_repo_setup_bundle_must_hold_main(env):
