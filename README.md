@@ -269,20 +269,35 @@ gitgatesetup <id>      # an id from the repo_setup reply; with no id, lists open
 5. It reminds you of each Actions secret the request named, with its link,
    `https://github.com/<repo>/settings/secrets/actions/new`; it cannot read secrets, so you add them
    yourself and they never keep a setup open.
-6. It revokes its token at GitHub, however the run ends (Ctrl-C, a closed terminal or SIGTERM
-   included), and says `Signed out: GitHub revoked this run's token.` once GitHub confirms it. If
-   GitHub does not, it prints a warning with the page to revoke it by hand; the token expires after
-   8 hours anyway.
+6. It revokes its tokens at GitHub, however the run ends (Ctrl-C, a closed terminal or SIGTERM
+   included): the access token, then the refresh token, each in a request of its own. It says
+   `Signed out: GitHub revoked this run's token.` once GitHub confirms the access token is dead. If
+   GitHub refuses either token (`GitHub refused the revocation (<status>).` or `GitHub refused the
+   refresh token's revocation (<status>).`) or does not confirm, it prints a warning with the page to
+   revoke them by hand; the access token expires after 8 hours anyway.
 
 The setup closes only when everything verified; otherwise it stays open and says what is left.
-Exit status is 0 when closed, 1 when still open or refused, 2 for usage.
+Exit status is 0 when closed, 1 when still open, interrupted or refused, 2 for usage.
+
+Once applying has started, Ctrl-C, a closed terminal or SIGTERM ends the run with `Interrupted.` and
+`Re-run: gitgatesetup <id>`; the setup stays open, and re-running picks up what is left. Under
+`nohup`, which ignores SIGHUP, a closed terminal does not end the run. A terminal that closes late in
+a run does not stop it revoking and logging. Only one run of a setup goes at a time: a second
+`gitgatesetup <id>` while one runs is refused before sign-in with `Setup <id> is already running.`
+Each run checks the stored request again as `repo_setup` did, and refuses one that no longer passes
+with `Setup <id> is unreadable: <reason>`.
 
 The ruleset goes on after `main` is pushed, since its required checks would refuse the push that
 creates it, so a new repo with a first push closes in one run. `main` is never pushed over: if it
 already exists on GitHub, the push is `already set` and the handover stays for `gitgatepush`. Only
 when the request has no bundle and `main` does not exist yet is the ruleset deferred: push `main`
 with `gitgatepush`, then run `gitgatesetup <id>` again. If GitHub does not show a `main` that was
-just pushed yet, the run says so and asks you to re-run in a moment. GitHub records the changes as
+just pushed yet, the run says so and asks you to re-run in a moment. A request with a first push
+expires with its handover (14 days); if the handover expires unpushed, the ruleset line says
+`deferred: main does not exist yet, and handover <h> with its first push has expired; ask the agent
+for a new repo_setup`. A live ruleset of the requested name that GitHub answers in a shape
+`gitgatesetup` cannot read shows as `rules: unreadable → ...`, with `GitHub's copy has an unexpected
+shape; it is replaced whole.`, and is replaced on `Apply`. GitHub records the changes as
 made by you; the app's name shows only in your security log. Local clone settings such as
 `core.hooksPath` are left alone.
 
@@ -313,8 +328,11 @@ call's line:
 A `gitgatepush` line has `time`, `tool` (`gitgatepush`), `id`, `repo`, `branch`, `sha` and `outcome`
 (`pushed` or `failed`). When `gitgatesetup` pushes a kept first `main`, that push is logged the same way with `tool`
 `gitgatesetup`, beside the run's own line. A `gitgatesetup` line has `time`, `tool` (`gitgatesetup`), `id`, `repo`,
-`outcome` (`closed`, `open`, `declined` or `refused`) and `revoked`: `true` once GitHub confirmed the
-token dead, `false` when it did not, `null` when the run never signed in. Lines from older releases
+`outcome` (`closed`, `open`, `declined`, `interrupted` or `refused`) and `revoked`: `true` once GitHub
+confirmed the token dead, `false` when it did not, `null` when the run never signed in. `interrupted`
+means the run was stopped (Ctrl-C, a closed terminal or SIGTERM) after it had started applying, so
+GitHub may hold some of the changes; the setup stays open. A run stopped before it applied anything
+is `refused`, or `declined` at the prompt. Lines from older releases
 lack the newer fields.
 
 At 8 MiB, `audit.log` is renamed to `audit.log.<YYYYmmddTHHMMSS>`, with `.<n>` added if that name is
