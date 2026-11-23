@@ -59,6 +59,7 @@ DEFAULT_HANDOVER_PATHS = tuple(
     for p in (
         ".github/workflows/**", ".githooks/**", ".pre-commit-config.yaml", ".claude/**", ".mcp.json",
         ".vscode/**", ".idea/**", ".envrc", ".devcontainer/**",
+        ".agents/**", ".agent/**", "_agents/**", "_agent/**", ".gemini/**",
     )
 )  # fmt: skip
 

@@ -15,7 +15,7 @@ def write_rules(tmp_path, repos_toml):
 def test_default_handover_paths():
     assert DEFAULT_HANDOVER_PATHS == (
         ".github/workflows", ".githooks", ".pre-commit-config.yaml", ".claude", ".mcp.json", ".vscode", ".idea",
-        ".envrc", ".devcontainer",
+        ".envrc", ".devcontainer", ".agents", ".agent", "_agents", "_agent", ".gemini",
     )  # fmt: skip
 
 
