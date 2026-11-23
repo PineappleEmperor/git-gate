@@ -178,7 +178,8 @@ checks and may hold no `x:` word.
 The gate refuses some pushes and keeps the verified commit for the user: the default or a protected
 branch, a non-fast-forward, and any commit touching a handover path (by default
 `.github/workflows/**`, `.githooks/**`, `.pre-commit-config.yaml`, `.claude/**`, `.mcp.json`,
-`.vscode/**`, `.idea/**`, `.envrc`, `.devcontainer/**`, plus any per-repo `handover_paths`).
+`.vscode/**`, `.idea/**`, `.envrc`, `.devcontainer/**`, `.agents/**`, `.agent/**`, `_agents/**`,
+`_agent/**`, `.gemini/**`, plus any per-repo `handover_paths`).
 
 The refusal names a handover id. The skill's instruction to the agent: stop, tell the user the
 refusal's reason, and give them exactly the command in the reply:

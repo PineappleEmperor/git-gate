@@ -327,6 +327,8 @@ REFUSALS = pytest.mark.parametrize(
         _path_case(".githooks/pre-commit"),
         _path_case(".pre-commit-config.yaml"),
         _path_case(".claude/settings.json"),
+        _path_case(".agents/mcp_config.json"),
+        _path_case(".gemini/settings.json"),
         _setup_extra_path,
     ],
     ids=[
@@ -339,6 +341,8 @@ REFUSALS = pytest.mark.parametrize(
         "githooks",
         "pre-commit",
         "claude",
+        "agents",
+        "gemini",
         "extra",
     ],
 )
